@@ -233,10 +233,10 @@ func (s *serverSession[U]) loopUniStreams() {
 }
 
 func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
-	defer stream.CancelRead(0)
 	var header [2]byte
 	n, _ := stream.Peek(header[:])
 	if n > 0 && header[0] == Version && isQUICXUniCommand(header[1]) {
+		defer stream.CancelRead(0)
 		s.startAuthTimeout()
 		return s.handleQUICXUniStream(stream)
 	}
@@ -340,12 +340,19 @@ func (s *serverSession[U]) loopStreams() {
 				stream.CancelRead(0)
 				stream.Close()
 				s.logger.Error(E.Cause(err, "handle stream request"))
+				s.closeWithError(E.Cause(err, "handle stream request"))
 			}
 		}()
 	}
 }
 
 func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
+	if s.h3Conn.Draining() {
+		// After a GOAWAY frame the client must not open new request streams;
+		// reject any that raced with the GOAWAY (RFC 9114 Section 5.2).
+		s.h3Conn.RejectRequestStream(stream)
+		return nil
+	}
 	var header [2]byte
 	n, _ := stream.Peek(header[:])
 	if n > 0 && header[0] == Version && header[1] == CommandConnect {
@@ -418,10 +425,13 @@ func (s *serverSession[U]) loopHeartbeats() {
 func (s *serverSession[U]) authFailure(err error) error {
 	switch s.authFailurePolicy {
 	case AuthFailurePolicyH3Close:
-		// Graceful HTTP/3 shutdown: send GOAWAY, drain any in-flight request,
-		// then close the QUIC connection with H3_NO_ERROR. This mirrors how a
-		// standard HTTP/3 server terminates a connection.
-		s.closeGracefully()
+		// Close the connection with H3_NO_ERROR (0x100), the standard HTTP/3
+		// code for a normal connection close. This keeps the transport
+		// indistinguishable from a standard HTTP/3 server. A GOAWAY frame is
+		// intentionally not sent: this is not an HTTP/3 graceful shutdown of a
+		// connection that served requests, but the termination of an
+		// unauthenticated QUICX session before any request was served.
+		s.closeWithErrorCode(quic.ApplicationErrorCode(http3.ErrCodeNoError), "")
 	case AuthFailurePolicySilentDrop:
 		s.silentClose(err)
 	}
@@ -429,7 +439,7 @@ func (s *serverSession[U]) authFailure(err error) error {
 }
 
 func (s *serverSession[U]) closeWithError(err error) {
-	s.closeWithErrorCode(0, "")
+	s.closeWithErrorCode(quic.ApplicationErrorCode(http3.ErrCodeNoError), "")
 }
 
 func (s *serverSession[U]) closeGracefully() {
