@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"net/http"
 	"runtime"
 	"sync"
 	"time"
@@ -41,7 +40,6 @@ type ServiceOptions struct {
 	Heartbeat         time.Duration
 	UDPTimeout        time.Duration
 	Handler           ServiceHandler
-	MasqueradeHandler http.Handler
 	AuthFailurePolicy string
 }
 
@@ -61,7 +59,6 @@ type Service[U comparable] struct {
 	authTimeout       time.Duration
 	udpTimeout        time.Duration
 	handler           ServiceHandler
-	masqueradeHandler http.Handler
 	authFailurePolicy string
 
 	quicListener io.Closer
@@ -91,9 +88,6 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		DisablePathManager:      true,
 	}
 	qtls.ApplyQUICOptions(quicConfig, options.QUICOptions)
-	if options.MasqueradeHandler == nil {
-		options.MasqueradeHandler = http.NotFoundHandler()
-	}
 	if len(options.TLSConfig.NextProtos()) == 0 {
 		options.TLSConfig.SetNextProtos([]string{http3.NextProtoH3})
 	}
@@ -107,7 +101,6 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		authTimeout:       options.AuthTimeout,
 		udpTimeout:        options.UDPTimeout,
 		handler:           options.Handler,
-		masqueradeHandler: options.MasqueradeHandler,
 		authFailurePolicy: options.AuthFailurePolicy,
 	}, nil
 }
@@ -158,7 +151,7 @@ func (s *Service[U]) loopConnections(listener qtls.EarlyListener) {
 
 func (s *Service[U]) handleConnection(connection *quic.Conn) {
 	setCongestion(s.ctx, connection)
-	h3Server := http3.Server{Handler: s.masqueradeHandler}
+	h3Server := http3.Server{}
 	h3Conn, err := h3Server.NewRawServerConn(connection)
 	if err != nil {
 		_ = connection.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeNoError), "")
@@ -247,6 +240,10 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 		s.startAuthTimeout()
 		return s.handleQUICXUniStream(stream)
 	}
+	// A unidirectional stream that is not a QUICX command belongs to the
+	// standard HTTP/3 machinery (control/QPACK streams). Let the HTTP/3
+	// connection consume it so the connection stays well-formed until a
+	// graceful shutdown is triggered by request streams or auth failure.
 	s.h3Conn.HandleUnidirectionalStream(stream)
 	return nil
 }
@@ -349,19 +346,16 @@ func (s *serverSession[U]) loopStreams() {
 }
 
 func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
-	if s.h3Conn.Draining() {
-		// After a GOAWAY frame the client must not open new request streams;
-		// reject any that raced with the GOAWAY.
-		s.h3Conn.RejectRequestStream(stream)
-		return nil
-	}
 	var header [2]byte
 	n, _ := stream.Peek(header[:])
 	if n > 0 && header[0] == Version && header[1] == CommandConnect {
 		s.startAuthTimeout()
 		return s.handleQUICXStream(stream)
 	}
-	s.h3Conn.HandleRequestStream(stream)
+	// Any other bidirectional stream is a standard HTTP/3 request stream.
+	// It is not a QUICX proxy request, so there is no masquerade to serve;
+	// terminate the connection like a normal HTTP/3 server.
+	s.closeGracefully()
 	return nil
 }
 
