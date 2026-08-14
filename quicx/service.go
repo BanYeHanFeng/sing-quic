@@ -349,6 +349,12 @@ func (s *serverSession[U]) loopStreams() {
 }
 
 func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
+	if s.h3Conn.Draining() {
+		// After a GOAWAY frame the client must not open new request streams;
+		// reject any that raced with the GOAWAY.
+		s.h3Conn.RejectRequestStream(stream)
+		return nil
+	}
 	var header [2]byte
 	n, _ := stream.Peek(header[:])
 	if n > 0 && header[0] == Version && header[1] == CommandConnect {
@@ -418,7 +424,10 @@ func (s *serverSession[U]) loopHeartbeats() {
 func (s *serverSession[U]) authFailure(err error) error {
 	switch s.authFailurePolicy {
 	case AuthFailurePolicyH3Close:
-		s.closeWithErrorCode(quic.ApplicationErrorCode(http3.ErrCodeNoError), "")
+		// Graceful HTTP/3 shutdown: send GOAWAY, drain any in-flight request,
+		// then close the QUIC connection with H3_NO_ERROR. This mirrors how a
+		// standard HTTP/3 server terminates a connection.
+		s.closeGracefully()
 	case AuthFailurePolicySilentDrop:
 		s.silentClose(err)
 	}
@@ -427,6 +436,39 @@ func (s *serverSession[U]) authFailure(err error) error {
 
 func (s *serverSession[U]) closeWithError(err error) {
 	s.closeWithErrorCode(0, "")
+}
+
+func (s *serverSession[U]) closeGracefully() {
+	done := s.h3Conn.GracefulShutdown()
+	go func() {
+		<-done
+		s.finalizeClose(E.New("connection closed"))
+	}()
+}
+
+// finalizeClose tears down the session state without touching the QUIC
+// connection. It is used after a graceful HTTP/3 shutdown has already closed
+// the connection, so that session loops and blocked handlers observe the
+// closure and exit.
+func (s *serverSession[U]) finalizeClose(err error) {
+	s.connAccess.Lock()
+	defer s.connAccess.Unlock()
+	select {
+	case <-s.connDone:
+		return
+	default:
+		s.connErr = err
+		close(s.connDone)
+	}
+	s.logger.Debug(E.Cause(err, "connection closed gracefully"))
+	s.udpAccess.Lock()
+	udpConnMap := s.udpConnMap
+	s.udpConnMap = make(map[uint16]*udpPacketConn)
+	s.udpAccess.Unlock()
+	for _, udpConn := range udpConnMap {
+		udpConn.closeWithError(err)
+	}
+	s.cancel(err)
 }
 
 func (s *serverSession[U]) closeWithErrorCode(code quic.ApplicationErrorCode, desc string) {
