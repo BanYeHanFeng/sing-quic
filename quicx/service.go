@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gofrs/uuid/v5"
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
 	qtls "github.com/sagernet/sing-quic"
@@ -54,8 +53,7 @@ type Service[U comparable] struct {
 	tlsConfig         aTLS.ServerConfig
 	heartbeat         time.Duration
 	quicConfig        *quic.Config
-	userMap           map[[16]byte]U
-	passwordMap       map[U]string
+	userMap           map[string]U
 	authTimeout       time.Duration
 	udpTimeout        time.Duration
 	handler           ServiceHandler
@@ -97,7 +95,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		tlsConfig:         options.TLSConfig,
 		heartbeat:         options.Heartbeat,
 		quicConfig:        quicConfig,
-		userMap:           make(map[[16]byte]U),
+		userMap:           make(map[string]U),
 		authTimeout:       options.AuthTimeout,
 		udpTimeout:        options.UDPTimeout,
 		handler:           options.Handler,
@@ -105,15 +103,12 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	}, nil
 }
 
-func (s *Service[U]) UpdateUsers(userList []U, uuidList [][16]byte, passwordList []string) {
-	userMap := make(map[[16]byte]U)
-	passwordMap := make(map[U]string)
+func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
+	userMap := make(map[string]U)
 	for index := range userList {
-		userMap[uuidList[index]] = userList[index]
-		passwordMap[userList[index]] = passwordList[index]
+		userMap[passwordList[index]] = userList[index]
 	}
 	s.userMap = userMap
-	s.passwordMap = passwordMap
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
@@ -276,25 +271,28 @@ func (s *serverSession[U]) handleQUICXUniStream(stream *quic.ReceiveStream) erro
 			return E.New("authentication: multiple authentication requests")
 		default:
 		}
-		if buffer.Len() < AuthenticateLen {
-			_, err = buffer.ReadFullFrom(stream, AuthenticateLen-buffer.Len())
+		// Authentication request message:
+		// [version(1)][command(1)][password length(2)][password(variable)]
+		if buffer.Len() < 4 {
+			_, err = buffer.ReadFullFrom(stream, 4-buffer.Len())
 			if err != nil {
 				return E.Cause(err, "authentication: read request")
 			}
 		}
-		var userUUID [16]byte
-		copy(userUUID[:], buffer.Range(2, 2+16))
-		user, loaded := s.userMap[userUUID]
+		passwordLen := int(binary.BigEndian.Uint16(buffer.Range(2, 4)))
+		if passwordLen == 0 {
+			return E.New("authentication: empty password")
+		}
+		if buffer.Len() < 4+passwordLen {
+			_, err = buffer.ReadFullFrom(stream, 4+passwordLen-buffer.Len())
+			if err != nil {
+				return E.Cause(err, "authentication: read request")
+			}
+		}
+		password := string(buffer.Range(4, 4+passwordLen))
+		user, loaded := s.userMap[password]
 		if !loaded {
-			return s.authFailure(E.New("authentication: unknown user ", uuid.UUID(userUUID)))
-		}
-		handshakeState := s.quicConn.ConnectionState()
-		authToken, err := handshakeState.TLS.ExportKeyingMaterial(string(userUUID[:]), []byte(s.passwordMap[user]), 32)
-		if err != nil {
-			return E.Cause(err, "authentication: export keying material")
-		}
-		if !bytes.Equal(authToken, buffer.Range(2+16, 2+16+32)) {
-			return s.authFailure(E.New("authentication: token mismatch"))
+			return s.authFailure(E.New("authentication: unknown user"))
 		}
 		s.authUser = user
 		close(s.authDone)

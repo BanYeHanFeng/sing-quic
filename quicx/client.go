@@ -2,6 +2,7 @@ package quicx
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -27,7 +28,6 @@ type ClientOptions struct {
 	ServerAddress M.Socksaddr
 	TLSConfig     aTLS.Config
 	QUICOptions   qtls.QUICOptions
-	UUID          [16]byte
 	Password      string
 	Heartbeat     time.Duration
 }
@@ -38,7 +38,6 @@ type Client struct {
 	serverAddr M.Socksaddr
 	tlsConfig  aTLS.Config
 	quicConfig *quic.Config
-	uuid       [16]byte
 	password   string
 	heartbeat  time.Duration
 
@@ -66,7 +65,6 @@ func NewClient(options ClientOptions) (*Client, error) {
 		serverAddr: options.ServerAddress,
 		tlsConfig:  options.TLSConfig,
 		quicConfig: quicConfig,
-		uuid:       options.UUID,
 		password:   options.Password,
 		heartbeat:  options.Heartbeat,
 	}, nil
@@ -181,16 +179,13 @@ func (c *Client) clientHandshake(conn *quic.Conn) error {
 		return E.Cause(err, "open handshake stream")
 	}
 	defer authStream.Close()
-	handshakeState := conn.ConnectionState()
-	authToken, err := handshakeState.TLS.ExportKeyingMaterial(string(c.uuid[:]), []byte(c.password), 32)
-	if err != nil {
-		return E.Cause(err, "export keying material")
-	}
-	authRequest := buf.NewSize(AuthenticateLen)
+	authRequest := buf.NewSize(2 + 2 + len(c.password))
 	authRequest.WriteByte(Version)
 	authRequest.WriteByte(CommandAuthenticate)
-	authRequest.Write(c.uuid[:])
-	authRequest.Write(authToken)
+	var passwordLen [2]byte
+	binary.BigEndian.PutUint16(passwordLen[:], uint16(len(c.password)))
+	authRequest.Write(passwordLen[:])
+	authRequest.WriteString(c.password)
 	return common.Error(authStream.Write(authRequest.Bytes()))
 }
 

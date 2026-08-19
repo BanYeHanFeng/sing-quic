@@ -11,5 +11,3 @@ const (
 	CommandDissociate
 	CommandHeartbeat
 )
-
-const AuthenticateLen = 2 + 16 + 32
