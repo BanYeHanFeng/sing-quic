@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
 	qtls "github.com/sagernet/sing-quic"
+	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -30,6 +31,7 @@ type ClientOptions struct {
 	QUICOptions   qtls.QUICOptions
 	Password      string
 	Heartbeat     time.Duration
+	BBRProfile    string
 }
 
 type Client struct {
@@ -40,6 +42,7 @@ type Client struct {
 	quicConfig *quic.Config
 	password   string
 	heartbeat  time.Duration
+	bbrProfile congestion_meta2.Profile
 
 	connAccess sync.Mutex
 	conn       *clientQUICConnection
@@ -49,6 +52,10 @@ type Client struct {
 func NewClient(options ClientOptions) (*Client, error) {
 	if options.Heartbeat == 0 {
 		options.Heartbeat = 10 * time.Second
+	}
+	bbrProfile, err := parseBBRProfile(options.BBRProfile)
+	if err != nil {
+		return nil, err
 	}
 	quicConfig := &quic.Config{
 		DisablePathMTUDiscovery: !(runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin"),
@@ -67,6 +74,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		quicConfig: quicConfig,
 		password:   options.Password,
 		heartbeat:  options.Heartbeat,
+		bbrProfile: bbrProfile,
 	}, nil
 }
 
@@ -155,7 +163,7 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		udpConn.Close()
 		return nil, E.Cause(err, "open connection")
 	}
-	setCongestion(c.ctx, quicConn)
+	setCongestion(c.ctx, quicConn, c.bbrProfile)
 	conn := &clientQUICConnection{
 		quicConn:   quicConn,
 		rawConn:    udpConn,

@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
 	qtls "github.com/sagernet/sing-quic"
+	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
@@ -40,6 +41,7 @@ type ServiceOptions struct {
 	UDPTimeout        time.Duration
 	Handler           ServiceHandler
 	AuthFailurePolicy string
+	BBRProfile        string
 }
 
 type ServiceHandler interface {
@@ -58,6 +60,7 @@ type Service[U comparable] struct {
 	udpTimeout        time.Duration
 	handler           ServiceHandler
 	authFailurePolicy string
+	bbrProfile        congestion_meta2.Profile
 
 	quicListener io.Closer
 }
@@ -68,6 +71,10 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	}
 	if options.Heartbeat == 0 {
 		options.Heartbeat = 10 * time.Second
+	}
+	bbrProfile, err := parseBBRProfile(options.BBRProfile)
+	if err != nil {
+		return nil, err
 	}
 	if options.AuthFailurePolicy == "" {
 		options.AuthFailurePolicy = AuthFailurePolicyH3Close
@@ -100,6 +107,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		udpTimeout:        options.UDPTimeout,
 		handler:           options.Handler,
 		authFailurePolicy: options.AuthFailurePolicy,
+		bbrProfile:        bbrProfile,
 	}, nil
 }
 
@@ -145,7 +153,7 @@ func (s *Service[U]) loopConnections(listener qtls.EarlyListener) {
 }
 
 func (s *Service[U]) handleConnection(connection *quic.Conn) {
-	setCongestion(s.ctx, connection)
+	setCongestion(s.ctx, connection, s.bbrProfile)
 	h3Server := http3.Server{}
 	h3Conn, err := h3Server.NewRawServerConn(connection)
 	if err != nil {

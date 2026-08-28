@@ -6,10 +6,23 @@ import (
 
 	"github.com/sagernet/quic-go"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
+	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/ntp"
 )
 
-func setCongestion(ctx context.Context, connection *quic.Conn) {
+func parseBBRProfile(profile string) (congestion_meta2.Profile, error) {
+	if profile == "" {
+		// Keep the historical QUICX default for backwards compatibility.
+		return congestion_meta2.ProfileConservative, nil
+	}
+	parsed, err := congestion_meta2.ParseProfile(profile)
+	if err != nil {
+		return congestion_meta2.Profile{}, E.Cause(err, "parse BBR profile")
+	}
+	return parsed, nil
+}
+
+func setCongestion(ctx context.Context, connection *quic.Conn, profile congestion_meta2.Profile) {
 	timeFunc := ntp.TimeFuncFromContext(ctx)
 	if timeFunc == nil {
 		timeFunc = time.Now
@@ -17,6 +30,6 @@ func setCongestion(ctx context.Context, connection *quic.Conn) {
 	connection.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
 		congestion_meta2.DefaultClock{TimeFunc: timeFunc},
 		connection.InitialPacketSize(),
-		congestion_meta2.ProfileConservative,
+		profile,
 	))
 }
