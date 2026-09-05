@@ -25,7 +25,6 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/ntp"
 	aTLS "github.com/sagernet/sing/common/tls"
 )
 
@@ -586,14 +585,9 @@ func (c *Client) authenticateAndWrap(ctx context.Context, rawConn io.Closer, cre
 		actualTx = c.sendBPS
 	}
 	if !authResponse.RxAuto && actualTx > 0 {
-		quicConn.SetCongestionControl(hyCC.NewBrutalSender(actualTx, c.brutalDebug, c.logger))
+		quicConn.SetCongestionControl(hyCC.NewBrutalSender(actualTx, quicConn.InitialPacketSize(), c.brutalDebug, c.logger))
 	} else {
-		timeFunc := ntp.TimeFuncFromContext(c.ctx)
-		if timeFunc == nil {
-			timeFunc = time.Now
-		}
 		quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
-			congestion_meta2.DefaultClock{TimeFunc: timeFunc},
 			quicConn.InitialPacketSize(),
 			c.bbrProfile,
 		))

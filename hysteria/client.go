@@ -295,7 +295,11 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		rawConn.Close()
 		return nil, E.New("remote error: ", serverHello.Message)
 	}
-	quicConn.SetCongestionControl(hyCC.NewBrutalSender(uint64(math.Min(float64(serverHello.RecvBPS), float64(c.sendBPS))), c.brutalDebug, c.logger))
+	if serverHello.RecvBPS == 0 {
+		rawConn.Close()
+		return nil, E.New("invalid receive bandwidth from server")
+	}
+	quicConn.SetCongestionControl(hyCC.NewBrutalSender(min(serverHello.RecvBPS, c.sendBPS), quicConn.InitialPacketSize(), c.brutalDebug, c.logger))
 	conn := &clientQUICConnection{
 		quicConn:    quicConn,
 		rawConn:     rawConn,

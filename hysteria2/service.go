@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
-	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/quic-go/quicvarint"
 	qtls "github.com/sagernet/sing-quic"
@@ -27,7 +26,6 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/ntp"
 	aTLS "github.com/sagernet/sing/common/tls"
 )
 
@@ -299,15 +297,10 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if s.sendBPS > 0 && rx > s.sendBPS {
 				rx = s.sendBPS
 			}
-			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(rx, s.brutalDebug, s.logger))
+			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(rx, s.quicConn.InitialPacketSize(), s.brutalDebug, s.logger))
 		} else {
-			timeFunc := ntp.TimeFuncFromContext(s.ctx)
-			if timeFunc == nil {
-				timeFunc = time.Now
-			}
 			s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
-				congestion_meta2.DefaultClock{TimeFunc: timeFunc},
-				congestion.ByteCount(s.quicConn.Config().InitialPacketSize),
+				s.quicConn.InitialPacketSize(),
 				s.bbrProfile,
 			))
 			rxAuto = true

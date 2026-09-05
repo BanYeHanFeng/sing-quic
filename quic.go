@@ -94,13 +94,21 @@ func SetDesiredBufferSizes(conn any) {
 	}
 }
 
+var _ quic.IOActivityConn = (*syscallConn)(nil)
+
 type syscallConn struct {
 	net.Conn
-	socket syscall.Conn
+	socket  syscall.Conn
+	onRead  func(size int)
+	onWrite func(size int)
 }
 
 func (c *syscallConn) SyscallConn() (syscall.RawConn, error) {
 	return c.socket.SyscallConn()
+}
+
+func (c *syscallConn) IOActivityFuncs() (onRead func(size int), onWrite func(size int)) {
+	return c.onRead, c.onWrite
 }
 
 func (c *syscallConn) Upstream() any {
@@ -116,11 +124,29 @@ func (c *syscallConn) WriterReplaceable() bool {
 }
 
 func withSyscallConn(conn net.Conn) net.Conn {
-	socket, isSyscallConn := N.UnwrapReader(conn).(syscall.Conn)
+	reader, readCounters := N.UnwrapCountReader(conn, nil)
+	socket, isSyscallConn := reader.(syscall.Conn)
 	if !isSyscallConn {
 		return conn
 	}
-	return &syscallConn{Conn: conn, socket: socket}
+	_, writeCounters := N.UnwrapCountWriter(conn, nil)
+	return &syscallConn{
+		Conn:    conn,
+		socket:  socket,
+		onRead:  activityFunc(readCounters),
+		onWrite: activityFunc(writeCounters),
+	}
+}
+
+func activityFunc(counters []N.CountFunc) func(size int) {
+	if len(counters) == 0 {
+		return nil
+	}
+	return func(size int) {
+		for _, counter := range counters {
+			counter(int64(size))
+		}
+	}
 }
 
 func quicConfigWithHandshakeTimeout(quicConfig *quic.Config, handshakeTimeout time.Duration) *quic.Config {

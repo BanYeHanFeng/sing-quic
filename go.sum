@@ -24,10 +24,10 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/quic-go/qpack v0.6.0 h1:g7W+BMYynC1LbYLSqRt8PBg5Tgwxn214ZZR34VIOjz8=
 github.com/quic-go/qpack v0.6.0/go.mod h1:lUpLKChi8njB4ty2bFLX2x4gzDqXwUpaO1DP9qMDZII=
-github.com/sagernet/quic-go v0.61.0-sing-box-mod.4 h1:XoFf8KoBEsamWo3ePlcmS/xs8B7KDurJQfI2U7q/H1c=
-github.com/sagernet/quic-go v0.61.0-sing-box-mod.4/go.mod h1:hmLC8GJPp+BrpBgrgJnacvI4fZGIhasuy1ROJJ8GR4E=
-github.com/sagernet/sing v0.9.0-beta.1 h1:vzExFSth9/xXoFjlgdUOwyaeEBkjutRXzNpiTHEnGIk=
-github.com/sagernet/sing v0.9.0-beta.1/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+github.com/sagernet/quic-go v0.61.0-sing-box-mod.6 h1:67bgUBU2QKK6jNz46GB5919wwRHcOHSafgmhD2gVf2Y=
+github.com/sagernet/quic-go v0.61.0-sing-box-mod.6/go.mod h1:hmLC8GJPp+BrpBgrgJnacvI4fZGIhasuy1ROJJ8GR4E=
+github.com/sagernet/sing v0.9.0-beta.4 h1:DYoEzb3FeCZ9bA66hJmL0NFDXckZpa4oYF/VpbFJEkE=
+github.com/sagernet/sing v0.9.0-beta.4/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2/go.mod h1:djNgcEr1/C05ACkg1iLfiJU5Ep61QUkGW8qpdssI0+w=

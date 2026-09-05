@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"math"
 	"net"
 	"os"
 	"runtime"
@@ -194,7 +193,7 @@ func (s *serverSession[U]) handleConnection() {
 	}
 	_ = controlStream.SetDeadline(time.Time{})
 	s.authUser = user
-	s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(uint64(math.Min(float64(s.sendBPS), float64(clientHello.RecvBPS))), s.brutalDebug, s.logger))
+	s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(min(s.sendBPS, clientHello.RecvBPS), s.quicConn.InitialPacketSize(), s.brutalDebug, s.logger))
 	if !s.udpDisabled {
 		go s.loopMessages()
 	}

@@ -60,7 +60,6 @@ const (
 	// Flag.
 	defaultStartupFullLossCount  = 8
 	quicBbr2DefaultLossThreshold = 0.02
-	maxBbrBurstPackets           = 10
 )
 
 type bbrMode int
@@ -170,7 +169,6 @@ func ParseProfile(profile string) (Profile, error) {
 
 type bbrSender struct {
 	rttStats congestion.RTTStatsProvider
-	clock    Clock
 	pacer    *Pacer
 
 	mode bbrMode
@@ -320,27 +318,11 @@ type bbrSender struct {
 
 var _ congestion.CongestionControlEx = &bbrSender{}
 
-func NewBbrSender(
-	clock Clock,
-	initialMaxDatagramSize congestion.ByteCount,
-	initialCongestionWindowPackets congestion.ByteCount,
-) *bbrSender {
-	return newBbrSender(
-		clock,
-		initialMaxDatagramSize,
-		initialCongestionWindowPackets*initialMaxDatagramSize,
-		congestion.MaxCongestionWindowPackets*initialMaxDatagramSize,
-		ProfileStandard,
-	)
-}
-
 func NewBbrSenderWithProfile(
-	clock Clock,
 	initialMaxDatagramSize congestion.ByteCount,
 	profile Profile,
 ) *bbrSender {
 	return newBbrSender(
-		clock,
 		initialMaxDatagramSize,
 		initialCongestionWindowPackets*initialMaxDatagramSize,
 		congestion.MaxCongestionWindowPackets*initialMaxDatagramSize,
@@ -349,14 +331,12 @@ func NewBbrSenderWithProfile(
 }
 
 func newBbrSender(
-	clock Clock,
 	initialMaxDatagramSize,
 	initialCongestionWindow,
 	initialMaxCongestionWindow congestion.ByteCount,
 	profile Profile,
 ) *bbrSender {
 	b := &bbrSender{
-		clock:                        clock,
 		mode:                         bbrModeStartup,
 		sampler:                      newBandwidthSampler(roundTripCount(bandwidthWindowSize)),
 		lastSentPacket:               invalidPacketNumber,
@@ -381,10 +361,10 @@ func newBbrSender(
 		maxCongestionWindowWithNetworkParametersAdjusted: initialMaxCongestionWindow,
 		maxDatagramSize: initialMaxDatagramSize,
 	}
-	b.pacer = NewPacer(b.bandwidthForPacer)
+	b.pacer = NewPacer(initialMaxDatagramSize, b.bandwidthForPacer)
 	b.applyProfile(profile)
 
-	b.enterStartupMode(monotime.FromTime(b.clock.Now()))
+	b.enterStartupMode(monotime.Now())
 
 	return b
 }
@@ -462,7 +442,7 @@ func (b *bbrSender) OnPacketSent(
 	b.lastSentPacket = packetNumber
 	b.bytesInFlight = bytesInFlight
 
-	if bytesInFlight == 0 {
+	if bytesInFlight == 0 && b.sampler.IsAppLimited() {
 		b.exitingQuiescence = true
 	}
 
@@ -553,8 +533,6 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 	// packet in lost_packets.
 	var lastPacketSendState sendTimeState
 
-	b.maybeApplimited(priorInFlight)
-
 	// Update bytesInFlight
 	b.bytesInFlight = priorInFlight
 	for _, p := range ackedPackets {
@@ -622,20 +600,6 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 	b.calculatePacingRate(bytesLost)
 	b.calculateCongestionWindow(bytesAcked, excessAcked)
 	b.calculateRecoveryWindow(bytesAcked, bytesLost)
-
-	// Cleanup internal state.
-	// This is where we clean up obsolete (acked or lost) packets from the bandwidth sampler.
-	// The "least unacked" should actually be FirstOutstanding, but since we are not passing
-	// that through OnCongestionEventEx, we will only do an estimate using acked/lost packets
-	// for now. Because of fast retransmission, they should differ by no more than 2 packets.
-	// (this is controlled by packetThreshold in quic-go's sentPacketHandler)
-	var leastUnacked congestion.PacketNumber
-	if len(ackedPackets) != 0 {
-		leastUnacked = ackedPackets[len(ackedPackets)-1].PacketNumber - 2
-	} else {
-		leastUnacked = lostPackets[len(lostPackets)-1].PacketNumber + 1
-	}
-	b.sampler.RemoveObsoletePackets(leastUnacked)
 
 	if isRoundStart {
 		b.numLossEventsInRound = 0
@@ -819,18 +783,6 @@ func (b *bbrSender) checkIfFullBandwidthReached(lastPacketSendState *sendTimeSta
 	}
 }
 
-func (b *bbrSender) maybeApplimited(bytesInFlight congestion.ByteCount) {
-	congestionWindow := b.GetCongestionWindow()
-	if bytesInFlight >= congestionWindow {
-		return
-	}
-	availableBytes := congestionWindow - bytesInFlight
-	drainLimited := b.mode == bbrModeDrain && bytesInFlight > congestionWindow/2
-	if !drainLimited || availableBytes > maxBbrBurstPackets*b.maxDatagramSize {
-		b.sampler.OnAppLimited()
-	}
-}
-
 // Transitions from STARTUP to DRAIN and from DRAIN to PROBE_BW if
 // appropriate.
 func (b *bbrSender) maybeExitStartupOrDrain(now monotime.Time) {
@@ -953,7 +905,7 @@ func (b *bbrSender) calculatePacingRate(bytesLost congestion.ByteCount) {
 				// We are fairly sure overshoot happens if 1) there is at least one
 				// non app-limited bw sample or 2) half of IW gets lost. Slow pacing
 				// rate.
-				b.pacingRate = Max(targetRate, BandwidthFromDelta(b.cwndToCalculateMinPacingRate, b.rttStats.MinRTT()))
+				b.pacingRate = Max(targetRate, BandwidthFromDelta(b.cwndToCalculateMinPacingRate, b.getMinRtt()))
 				b.bytesLostWhileDetectingOvershooting = 0
 				b.detectOvershooting = false
 			}
@@ -1048,6 +1000,10 @@ func (b *bbrSender) shouldExitStartupDueToLoss(lastPacketSendState *sendTimeStat
 
 func bdpFromRttAndBandwidth(rtt time.Duration, bandwidth Bandwidth) congestion.ByteCount {
 	return congestion.ByteCount(rtt) * congestion.ByteCount(bandwidth) / congestion.ByteCount(BytesPerSecond) / congestion.ByteCount(time.Second)
+}
+
+func (b *bbrSender) OnPacketNeutered(packetNumber congestion.PacketNumber) {
+	b.sampler.OnPacketNeutered(packetNumber)
 }
 
 // OnPacketsLost is called to notify the congestion controller about the lowest unacked packet number.
