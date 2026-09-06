@@ -2,12 +2,10 @@ package quicx
 
 import (
 	"context"
-	"time"
 
 	"github.com/sagernet/quic-go"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/ntp"
 )
 
 func parseBBRProfile(profile string) (congestion_meta2.Profile, error) {
@@ -23,12 +21,7 @@ func parseBBRProfile(profile string) (congestion_meta2.Profile, error) {
 }
 
 func setCongestion(ctx context.Context, connection *quic.Conn, profile congestion_meta2.Profile) {
-	timeFunc := ntp.TimeFuncFromContext(ctx)
-	if timeFunc == nil {
-		timeFunc = time.Now
-	}
 	connection.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
-		congestion_meta2.DefaultClock{TimeFunc: timeFunc},
 		connection.InitialPacketSize(),
 		profile,
 	))
