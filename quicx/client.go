@@ -32,6 +32,7 @@ type ClientOptions struct {
 	Password      string
 	Heartbeat     time.Duration
 	BBRProfile    string
+	FEC           *FECOptions
 }
 
 type Client struct {
@@ -43,6 +44,7 @@ type Client struct {
 	password   string
 	heartbeat  time.Duration
 	bbrProfile congestion_meta2.Profile
+	fec        *FECOptions
 
 	connAccess sync.Mutex
 	conn       *clientQUICConnection
@@ -75,6 +77,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		password:   options.Password,
 		heartbeat:  options.Heartbeat,
 		bbrProfile: bbrProfile,
+		fec:        options.FEC,
 	}, nil
 }
 
@@ -178,6 +181,7 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	}()
 	go c.loopMessages(conn)
 	go c.loopHeartbeats(conn)
+	go c.loopUniStreams(conn)
 	return conn, nil
 }
 
@@ -187,13 +191,16 @@ func (c *Client) clientHandshake(conn *quic.Conn) error {
 		return E.Cause(err, "open handshake stream")
 	}
 	defer authStream.Close()
-	authRequest := buf.NewSize(2 + 2 + len(c.password))
+	// [version(1)][command(1)][password length(2)][password(variable)][fec capability(0/1)]
+	capability := fecCapability(c.fec)
+	authRequest := buf.NewSize(2 + 2 + len(c.password) + len(capability))
 	authRequest.WriteByte(Version)
 	authRequest.WriteByte(CommandAuthenticate)
 	var passwordLen [2]byte
 	binary.BigEndian.PutUint16(passwordLen[:], uint16(len(c.password)))
 	authRequest.Write(passwordLen[:])
 	authRequest.WriteString(c.password)
+	authRequest.Write(capability)
 	return common.Error(authStream.Write(authRequest.Bytes()))
 }
 

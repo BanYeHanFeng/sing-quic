@@ -42,6 +42,7 @@ type ServiceOptions struct {
 	Handler           ServiceHandler
 	AuthFailurePolicy string
 	BBRProfile        string
+	FEC               *FECOptions
 }
 
 type ServiceHandler interface {
@@ -61,6 +62,7 @@ type Service[U comparable] struct {
 	handler           ServiceHandler
 	authFailurePolicy string
 	bbrProfile        congestion_meta2.Profile
+	fec               *FECOptions
 
 	quicListener io.Closer
 }
@@ -108,6 +110,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		handler:           options.Handler,
 		authFailurePolicy: options.AuthFailurePolicy,
 		bbrProfile:        bbrProfile,
+		fec:               options.FEC,
 	}, nil
 }
 
@@ -304,6 +307,9 @@ func (s *serverSession[U]) handleQUICXUniStream(stream *quic.ReceiveStream) erro
 		}
 		s.authUser = user
 		close(s.authDone)
+		if fecRequested := s.readFECCapability(buffer, stream, 4+passwordLen); fecRequested {
+			s.startFEC()
+		}
 		return nil
 	case CommandDissociate:
 		select {

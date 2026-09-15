@@ -1,8 +1,39 @@
 package quicx
 
 import (
+	"io"
+
+	"github.com/sagernet/quic-go"
 	E "github.com/sagernet/sing/common/exceptions"
 )
+
+// loopUniStreams handles the unidirectional streams the server opens. QUICX only
+// uses them to confirm the FEC capability of the client.
+func (c *Client) loopUniStreams(conn *clientQUICConnection) {
+	for {
+		stream, err := conn.quicConn.AcceptUniStream(c.ctx)
+		if err != nil {
+			return
+		}
+		go c.handleUniStream(conn, stream)
+	}
+}
+
+func (c *Client) handleUniStream(conn *clientQUICConnection, stream *quic.ReceiveStream) {
+	defer stream.CancelRead(0)
+	var header [2]byte
+	_, err := io.ReadFull(stream, header[:])
+	if err != nil {
+		return
+	}
+	if header[0] != Version || header[1] != CommandFECAccept {
+		// Ignore anything else (e.g. HTTP/3 control streams of a standard server).
+		return
+	}
+	if err = c.enableFEC(conn); err != nil {
+		conn.closeWithError(E.Cause(err, "enable FEC"))
+	}
+}
 
 func (c *Client) loopMessages(conn *clientQUICConnection) {
 	for {
