@@ -9,6 +9,7 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
 )
 
 // FECOptions enables packet level forward error correction (FEC) for QUICX.
@@ -67,9 +68,15 @@ func parseFECCapability(data []byte) bool {
 	return len(data) > 0 && data[0]&fecCapabilityEnabled != 0
 }
 
-// enableFEC turns on packet level FEC on the client side, once both sides agreed.
+// enableFEC turns on packet level FEC on the client side, once both sides agreed. A
+// second confirmation for a connection that already has FEC enabled is ignored: the
+// negotiation happens once per connection, and re-enabling would only reset the
+// connection's FEC statistics.
 func (c *Client) enableFEC(conn *clientQUICConnection) error {
 	if c.fec == nil {
+		return nil
+	}
+	if conn.quicConn.FECStats().Enabled {
 		return nil
 	}
 	select {
@@ -81,7 +88,11 @@ func (c *Client) enableFEC(conn *clientQUICConnection) error {
 	if err != nil {
 		return err
 	}
-	c.logger.Debug("QUICX FEC enabled (client", fecLimits(c.fec), ")")
+	// FEC is negotiated per QUIC connection, so this line is written once for every
+	// connection the client establishes, not once per client. The peer address is
+	// included so that the lines can be attributed to a connection: a client that
+	// redials - also from the same UDP source port - produces one line per dial.
+	c.logger.Debug("QUICX FEC enabled (client, ", fecPeer(conn.quicConn), fecLimits(c.fec), ")")
 	go c.loopFECStats(conn)
 	return nil
 }
@@ -139,15 +150,52 @@ func (s *serverSession[U]) startFEC() {
 			s.logger.Debug(E.Cause(err, "enable FEC"))
 			return
 		}
-		s.logger.Debug("QUICX FEC enabled (server", fecLimits(options), ")")
-		go s.loopFECStats()
-		stream, err := s.quicConn.OpenUniStream()
-		if err != nil {
+		// The client only enables FEC after it received this confirmation, so it has
+		// to be written before FEC is reported as enabled. Otherwise a failed
+		// notification would be logged as a success while the client keeps running
+		// without FEC - and the server sends parity packets the client ignores.
+		if err := s.notifyFECAccept(); err != nil {
+			s.logger.Error(E.Cause(err, "notify FEC accept"))
 			return
 		}
-		defer stream.Close()
-		_, _ = stream.Write([]byte{Version, CommandFECAccept})
+		// FEC is negotiated per QUIC connection, so this line is written once for
+		// every connection a client establishes, not once per client. The peer
+		// address is included so that the lines can be attributed to a connection: a
+		// client that redials - also from the same UDP source port - produces one
+		// line per dial.
+		s.logger.Debug("QUICX FEC enabled (server, ", fecPeer(s.quicConn), fecLimits(options), ")")
+		go s.loopFECStats()
 	}()
+}
+
+// notifyFECAccept tells the client that FEC was enabled on the server side, by
+// sending CommandFECAccept on a unidirectional stream.
+func (s *serverSession[U]) notifyFECAccept() error {
+	stream, err := s.quicConn.OpenUniStream()
+	if err != nil {
+		return E.Cause(err, "open stream")
+	}
+	_, err = stream.Write([]byte{Version, CommandFECAccept})
+	closeErr := stream.Close()
+	if err != nil {
+		return E.Cause(err, "write request")
+	}
+	if closeErr != nil {
+		return E.Cause(closeErr, "close stream")
+	}
+	return nil
+}
+
+// fecPeer identifies the peer of the QUIC connection a FEC negotiation log line
+// belongs to. The source address is stable across redials, so a line per dial from
+// the same address:port is visible as such instead of looking like FEC being enabled
+// repeatedly on one connection.
+func fecPeer(conn *quic.Conn) string {
+	remoteAddr := conn.RemoteAddr()
+	if remoteAddr == nil {
+		return "unknown"
+	}
+	return M.SocksaddrFromNet(remoteAddr).Unwrap().String()
 }
 
 const (
