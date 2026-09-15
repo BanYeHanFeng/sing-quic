@@ -76,3 +76,16 @@ func TestHumanBytes(t *testing.T) {
 		}
 	}
 }
+
+func TestFECLimits(t *testing.T) {
+	if limits := fecLimits(nil); limits != "" {
+		t.Fatalf("expected no limits for nil options, got %q", limits)
+	}
+	if limits := fecLimits(&FECOptions{}); limits != "" {
+		t.Fatalf("expected no limits for the defaults, got %q", limits)
+	}
+	limits := fecLimits(&FECOptions{MaxOverheadPercent: 25, MaxGroupSize: 8, MaxParityRows: 2})
+	if limits != ", max overhead 25%, max group 8, parity rows 2" {
+		t.Fatalf("unexpected limits: %q", limits)
+	}
+}

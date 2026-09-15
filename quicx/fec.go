@@ -81,9 +81,28 @@ func (c *Client) enableFEC(conn *clientQUICConnection) error {
 	if err != nil {
 		return err
 	}
-	c.logger.Debug("QUICX FEC enabled (client, max overhead ", c.fec.MaxOverheadPercent, "%, max group ", c.fec.MaxGroupSize, ")")
+	c.logger.Debug("QUICX FEC enabled (client", fecLimits(c.fec), ")")
 	go c.loopFECStats(conn)
 	return nil
+}
+
+// fecLimits describes the explicitly configured FEC limits for the negotiation log
+// line. Limits that are left at zero use the quic-go defaults, and are omitted.
+func fecLimits(options *FECOptions) string {
+	if options == nil {
+		return ""
+	}
+	var limits string
+	if options.MaxOverheadPercent > 0 {
+		limits += fmt.Sprintf(", max overhead %d%%", options.MaxOverheadPercent)
+	}
+	if options.MaxGroupSize > 0 {
+		limits += fmt.Sprintf(", max group %d", options.MaxGroupSize)
+	}
+	if options.MaxParityRows > 1 {
+		limits += fmt.Sprintf(", parity rows %d", options.MaxParityRows)
+	}
+	return limits
 }
 
 // readFECCapability reads the FEC capability byte that FEC capable clients append to
@@ -120,7 +139,7 @@ func (s *serverSession[U]) startFEC() {
 			s.logger.Debug(E.Cause(err, "enable FEC"))
 			return
 		}
-		s.logger.Debug("QUICX FEC enabled (server, max overhead ", options.MaxOverheadPercent, "%, max group ", options.MaxGroupSize, ")")
+		s.logger.Debug("QUICX FEC enabled (server", fecLimits(options), ")")
 		go s.loopFECStats()
 		stream, err := s.quicConn.OpenUniStream()
 		if err != nil {
