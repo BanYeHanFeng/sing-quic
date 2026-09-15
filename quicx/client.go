@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
@@ -33,6 +34,7 @@ type ClientOptions struct {
 	Heartbeat     time.Duration
 	BBRProfile    string
 	FEC           *FECOptions
+	Logger        logger.Logger
 }
 
 type Client struct {
@@ -45,6 +47,7 @@ type Client struct {
 	heartbeat  time.Duration
 	bbrProfile congestion_meta2.Profile
 	fec        *FECOptions
+	logger     logger.Logger
 
 	connAccess sync.Mutex
 	conn       *clientQUICConnection
@@ -54,6 +57,9 @@ type Client struct {
 func NewClient(options ClientOptions) (*Client, error) {
 	if options.Heartbeat == 0 {
 		options.Heartbeat = 10 * time.Second
+	}
+	if options.Logger == nil {
+		options.Logger = logger.NOP()
 	}
 	bbrProfile, err := parseBBRProfile(options.BBRProfile)
 	if err != nil {
@@ -78,6 +84,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		heartbeat:  options.Heartbeat,
 		bbrProfile: bbrProfile,
 		fec:        options.FEC,
+		logger:     options.Logger,
 	}, nil
 }
 

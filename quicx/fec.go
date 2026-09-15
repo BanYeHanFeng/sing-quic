@@ -75,7 +75,12 @@ func (c *Client) enableFEC(conn *clientQUICConnection) error {
 	case <-c.ctx.Done():
 		return context.Cause(c.ctx)
 	}
-	return conn.quicConn.EnableFEC(c.fec.config())
+	err := conn.quicConn.EnableFEC(c.fec.config())
+	if err != nil {
+		return err
+	}
+	c.logger.Debug("QUICX FEC enabled (client, max overhead ", c.fec.MaxOverheadPercent, "%, max group ", c.fec.MaxGroupSize, ")")
+	return nil
 }
 
 // readFECCapability reads the FEC capability byte that FEC capable clients append to
@@ -112,6 +117,7 @@ func (s *serverSession[U]) startFEC() {
 			s.logger.Debug(E.Cause(err, "enable FEC"))
 			return
 		}
+		s.logger.Debug("QUICX FEC enabled (server, max overhead ", options.MaxOverheadPercent, "%, max group ", options.MaxGroupSize, ")")
 		stream, err := s.quicConn.OpenUniStream()
 		if err != nil {
 			return
