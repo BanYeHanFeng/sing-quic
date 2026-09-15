@@ -10,8 +10,7 @@ import (
 
 func parseBBRProfile(profile string) (congestion_meta2.Profile, error) {
 	if profile == "" {
-		// Keep the historical QUICX default for backwards compatibility.
-		return congestion_meta2.ProfileConservative, nil
+		return congestion_meta2.ProfileStandard, nil
 	}
 	parsed, err := congestion_meta2.ParseProfile(profile)
 	if err != nil {
