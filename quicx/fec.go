@@ -2,7 +2,9 @@ package quicx
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"time"
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing/common/buf"
@@ -80,6 +82,7 @@ func (c *Client) enableFEC(conn *clientQUICConnection) error {
 		return err
 	}
 	c.logger.Debug("QUICX FEC enabled (client, max overhead ", c.fec.MaxOverheadPercent, "%, max group ", c.fec.MaxGroupSize, ")")
+	go c.loopFECStats(conn)
 	return nil
 }
 
@@ -118,6 +121,7 @@ func (s *serverSession[U]) startFEC() {
 			return
 		}
 		s.logger.Debug("QUICX FEC enabled (server, max overhead ", options.MaxOverheadPercent, "%, max group ", options.MaxGroupSize, ")")
+		go s.loopFECStats()
 		stream, err := s.quicConn.OpenUniStream()
 		if err != nil {
 			return
@@ -125,4 +129,119 @@ func (s *serverSession[U]) startFEC() {
 		defer stream.Close()
 		_, _ = stream.Write([]byte{Version, CommandFECAccept})
 	}()
+}
+
+const (
+	// fecStatsInterval is how often a FEC statistics line is written for a connection
+	// while FEC is enabled. Windows without any FEC activity are not logged.
+	fecStatsInterval = 10 * time.Second
+	// fecStatsInfoInterval is the minimum interval between two info level statistics
+	// lines. Windows in which packets had to be repaired are logged at info level, so
+	// that FEC is visible without enabling debug logging - but at most once a minute
+	// per connection, to keep the noise down on lossy servers.
+	fecStatsInfoInterval = time.Minute
+)
+
+// loopFECStats periodically logs what FEC is doing: the loss rate measured on the
+// path, the resulting redundancy, and how many packets were repaired.
+func (c *Client) loopFECStats(conn *clientQUICConnection) {
+	ticker := time.NewTicker(fecStatsInterval)
+	defer ticker.Stop()
+	var last quic.FECStats
+	var lastInfo time.Time
+	for {
+		select {
+		case <-conn.connDone:
+			return
+		case <-c.ctx.Done():
+			return
+		case now := <-ticker.C:
+			stats := conn.quicConn.FECStats()
+			if !stats.Enabled {
+				return
+			}
+			line, notable := formatFECStats(last, stats)
+			last = stats
+			if line == "" {
+				continue
+			}
+			if notable && now.Sub(lastInfo) >= fecStatsInfoInterval {
+				c.logger.Info(line)
+				lastInfo = now
+			} else {
+				c.logger.Debug(line)
+			}
+		}
+	}
+}
+
+// loopFECStats periodically logs what FEC is doing (server side).
+func (s *serverSession[U]) loopFECStats() {
+	ticker := time.NewTicker(fecStatsInterval)
+	defer ticker.Stop()
+	var last quic.FECStats
+	var lastInfo time.Time
+	for {
+		select {
+		case <-s.connDone:
+			return
+		case <-s.ctx.Done():
+			return
+		case now := <-ticker.C:
+			stats := s.quicConn.FECStats()
+			if !stats.Enabled {
+				return
+			}
+			line, notable := formatFECStats(last, stats)
+			last = stats
+			if line == "" {
+				continue
+			}
+			if notable && now.Sub(lastInfo) >= fecStatsInfoInterval {
+				s.logger.Info(line)
+				lastInfo = now
+			} else {
+				s.logger.Debug(line)
+			}
+		}
+	}
+}
+
+// formatFECStats formats one statistics window. It returns an empty line if nothing
+// happened in the window, and whether packets were repaired (a notable window).
+func formatFECStats(previous, current quic.FECStats) (line string, notable bool) {
+	delta := func(prev, cur uint64) uint64 {
+		if cur < prev {
+			return 0
+		}
+		return cur - prev
+	}
+	protectedSent := delta(previous.ProtectedPacketsSent, current.ProtectedPacketsSent)
+	paritySent := delta(previous.ParityPacketsSent, current.ParityPacketsSent)
+	parityBytes := delta(previous.ParityBytesSent, current.ParityBytesSent)
+	parityReceived := delta(previous.ParityPacketsReceived, current.ParityPacketsReceived)
+	repaired := delta(previous.RecoveredPackets, current.RecoveredPackets)
+	failed := delta(previous.FailedPackets, current.FailedPackets)
+	if protectedSent == 0 && paritySent == 0 && parityBytes == 0 && parityReceived == 0 && repaired == 0 && failed == 0 {
+		return "", false
+	}
+	redundancy := "idle"
+	if current.GroupSize > 0 {
+		redundancy = fmt.Sprintf("group %d (overhead %.1f%%)", current.GroupSize, current.SendOverhead*100)
+	}
+	return fmt.Sprintf(
+		"QUICX FEC: path loss %.1f%%, %s, repaired %d, unrecoverable %d, parity %d sent / %d received, protected %d packets (%s parity data)",
+		current.LossRate*100, redundancy, repaired, failed, paritySent, parityReceived, protectedSent, humanBytes(parityBytes),
+	), repaired > 0 || failed > 0
+}
+
+func humanBytes(bytes uint64) string {
+	switch {
+	case bytes >= 1024*1024:
+		return fmt.Sprintf("%.1f MB", float64(bytes)/(1024*1024))
+	case bytes >= 1024:
+		return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
 }
