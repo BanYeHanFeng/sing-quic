@@ -30,7 +30,14 @@ func (c *Client) handleUniStream(conn *clientQUICConnection, stream *quic.Receiv
 		// Ignore anything else (e.g. HTTP/3 control streams of a standard server).
 		return
 	}
-	if err = c.enableFEC(conn); err != nil {
+	// The scheme the server selected follows the command. Servers of the first FEC
+	// version don't send it, and they only implement the block scheme.
+	scheme := byte(fecCapabilityEnabled)
+	var selected [1]byte
+	if _, err := io.ReadFull(stream, selected[:]); err == nil {
+		scheme = selected[0]
+	}
+	if err = c.enableFEC(conn, scheme); err != nil {
 		conn.closeWithError(E.Cause(err, "enable FEC"))
 	}
 }

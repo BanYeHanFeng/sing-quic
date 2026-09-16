@@ -318,8 +318,8 @@ func (s *serverSession[U]) handleQUICXUniStream(stream *quic.ReceiveStream) erro
 		}
 		s.authUser = user
 		close(s.authDone)
-		if fecRequested := s.readFECCapability(buffer, stream, 4+passwordLen); fecRequested {
-			s.startFEC()
+		if capability := s.readFECCapability(buffer, stream, 4+passwordLen); capability != 0 {
+			s.startFEC(capability)
 		}
 		return nil
 	case CommandDissociate:
