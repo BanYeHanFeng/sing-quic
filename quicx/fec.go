@@ -302,21 +302,25 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 		repaired == 0 && failed == 0 && skipped == 0 {
 		return "", false
 	}
-	redundancy := "idle"
+	state := "idle"
 	if current.GroupSize > 0 {
-		redundancy = fmt.Sprintf("group %d rows %d, overhead %.1f%% configured",
-			current.GroupSize, current.ParityRows, current.ConfiguredOverhead*100)
-		if protectedBytes > 0 {
-			// The measured value is what the overhead cap is enforced on. It stays at
-			// or below the configured value; the configured value alone used to be
-			// reported, which hid partial groups costing several times the cap.
-			redundancy += fmt.Sprintf(" / %.1f%% measured", float64(parityBytes)/float64(protectedBytes)*100)
-		}
+		state = fmt.Sprintf("group %d rows %d", current.GroupSize, current.ParityRows)
+	}
+	// The measured value is the one the cap applies to. It has to be printed even when
+	// FEC is idle at the moment of the tick: parity can have been sent earlier in the
+	// window while the group was still open, and printing only the configured value was
+	// what hid partial groups costing several times the cap.
+	overhead := ""
+	if current.ConfiguredOverhead > 0 {
+		overhead = fmt.Sprintf(", overhead %.1f%% configured", current.ConfiguredOverhead*100)
+	}
+	if protectedBytes > 0 {
+		overhead += fmt.Sprintf(" / %.1f%% measured", float64(parityBytes)/float64(protectedBytes)*100)
 	}
 	return fmt.Sprintf(
-		"QUICX FEC: tx loss %.1f%% (peer reported), %s, protected %d pkts (%s), parity %d pkts (%s), skipped %d groups; "+
+		"QUICX FEC: tx loss %.1f%% (peer reported), %s%s, protected %d pkts (%s), parity %d pkts (%s), skipped %d groups; "+
 			"rx repaired %d, unrecoverable %d, parity %d pkts, protected %d pkts",
-		current.LossRate*100, redundancy,
+		current.LossRate*100, state, overhead,
 		protectedSent, humanBytes(protectedBytes), paritySent, humanBytes(parityBytes), skipped,
 		repaired, failed, parityReceived, protectedReceived,
 	), repaired > 0 || failed > 0

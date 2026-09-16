@@ -73,6 +73,20 @@ func TestFormatFECStats(t *testing.T) {
 		t.Fatalf("expected the skipped groups to be reported: %q", line)
 	}
 
+	// A window that sent parity while FEC happened to be idle at the moment of the tick
+	// still has to report the measured overhead: that is the number the cap applies to,
+	// and the configured value alone is not available (or meaningful) when idle.
+	line, _ = formatFECStats(quic.FECStats{Enabled: true}, quic.FECStats{
+		Enabled:              true,
+		ProtectedPacketsSent: 4,
+		ProtectedBytesSent:   1000,
+		ParityPacketsSent:    1,
+		ParityBytesSent:      50,
+	})
+	if !strings.Contains(line, "idle") || !strings.Contains(line, "5.0% measured") {
+		t.Fatalf("expected the measured overhead even while idle: %q", line)
+	}
+
 	// counters that went backwards (FEC was re-enabled) must not underflow
 	line, _ = formatFECStats(quic.FECStats{Enabled: true, RecoveredPackets: 100, ParityPacketsSent: 50}, quic.FECStats{
 		Enabled:              true,
