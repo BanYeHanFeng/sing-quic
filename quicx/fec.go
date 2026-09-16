@@ -276,6 +276,12 @@ func (s *serverSession[U]) loopFECStats() {
 
 // formatFECStats formats one statistics window. It returns an empty line if nothing
 // happened in the window, and whether packets were repaired (a notable window).
+//
+// The line reports the two directions separately, because they are measured by
+// different endpoints: the loss rate is the one the *peer* observed on the path we
+// send on, while repaired and unrecoverable are what our own decoder saw on the path
+// we receive on. Mixing them made the line look self contradictory - "path loss 0.0%"
+// next to a pile of unrecoverable packets.
 func formatFECStats(previous, current quic.FECStats) (line string, notable bool) {
 	delta := func(prev, cur uint64) uint64 {
 		if cur < prev {
@@ -284,21 +290,35 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 		return cur - prev
 	}
 	protectedSent := delta(previous.ProtectedPacketsSent, current.ProtectedPacketsSent)
+	protectedBytes := delta(previous.ProtectedBytesSent, current.ProtectedBytesSent)
 	paritySent := delta(previous.ParityPacketsSent, current.ParityPacketsSent)
 	parityBytes := delta(previous.ParityBytesSent, current.ParityBytesSent)
 	parityReceived := delta(previous.ParityPacketsReceived, current.ParityPacketsReceived)
+	protectedReceived := delta(previous.ProtectedPacketsReceived, current.ProtectedPacketsReceived)
 	repaired := delta(previous.RecoveredPackets, current.RecoveredPackets)
 	failed := delta(previous.FailedPackets, current.FailedPackets)
-	if protectedSent == 0 && paritySent == 0 && parityBytes == 0 && parityReceived == 0 && repaired == 0 && failed == 0 {
+	skipped := delta(previous.SkippedGroups, current.SkippedGroups)
+	if protectedSent == 0 && paritySent == 0 && parityBytes == 0 && parityReceived == 0 &&
+		repaired == 0 && failed == 0 && skipped == 0 {
 		return "", false
 	}
 	redundancy := "idle"
 	if current.GroupSize > 0 {
-		redundancy = fmt.Sprintf("group %d (overhead %.1f%%)", current.GroupSize, current.SendOverhead*100)
+		redundancy = fmt.Sprintf("group %d rows %d, overhead %.1f%% configured",
+			current.GroupSize, current.ParityRows, current.ConfiguredOverhead*100)
+		if protectedBytes > 0 {
+			// The measured value is what the overhead cap is enforced on. It stays at
+			// or below the configured value; the configured value alone used to be
+			// reported, which hid partial groups costing several times the cap.
+			redundancy += fmt.Sprintf(" / %.1f%% measured", float64(parityBytes)/float64(protectedBytes)*100)
+		}
 	}
 	return fmt.Sprintf(
-		"QUICX FEC: path loss %.1f%%, %s, repaired %d, unrecoverable %d, parity %d sent / %d received, protected %d packets (%s parity data)",
-		current.LossRate*100, redundancy, repaired, failed, paritySent, parityReceived, protectedSent, humanBytes(parityBytes),
+		"QUICX FEC: tx loss %.1f%% (peer reported), %s, protected %d pkts (%s), parity %d pkts (%s), skipped %d groups; "+
+			"rx repaired %d, unrecoverable %d, parity %d pkts, protected %d pkts",
+		current.LossRate*100, redundancy,
+		protectedSent, humanBytes(protectedBytes), paritySent, humanBytes(parityBytes), skipped,
+		repaired, failed, parityReceived, protectedReceived,
 	), repaired > 0 || failed > 0
 }
 

@@ -240,11 +240,22 @@ func (s *serverSession[U]) loopUniStreams() {
 
 func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 	var header [2]byte
-	n, _ := stream.Peek(header[:])
-	if n > 0 && header[0] == Version && isQUICXUniCommand(header[1]) {
+	n, err := stream.Peek(header[:])
+	if n >= 2 && header[0] == Version && isQUICXUniCommand(header[1]) {
 		defer stream.CancelRead(0)
 		s.startAuthTimeout()
 		return s.handleQUICXUniStream(stream)
+	}
+	if n < 2 {
+		// An abandoned unidirectional stream - typically the authentication stream of a
+		// client that gave up before writing its request. Handing it to the HTTP/3
+		// machinery would make that machinery parse a stream that never carried a
+		// stream type, so it is cancelled on its own instead of erroring the
+		// connection.
+		stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		s.logger.Debug("abandoned unidirectional stream from ", s.quicConn.RemoteAddr(),
+			" after ", n, " byte(s): ", err)
+		return nil
 	}
 	// A unidirectional stream that is not a QUICX command belongs to the
 	// standard HTTP/3 machinery (control/QPACK streams). Let the HTTP/3
@@ -366,16 +377,36 @@ func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
 		return nil
 	}
 	var header [2]byte
-	n, _ := stream.Peek(header[:])
-	if n > 0 && header[0] == Version && header[1] == CommandConnect {
+	n, err := stream.Peek(header[:])
+	if n >= 2 && header[0] == Version && header[1] == CommandConnect {
 		s.startAuthTimeout()
 		return s.handleQUICXStream(stream)
 	}
-	// Any other bidirectional stream is a standard HTTP/3 request stream.
-	// It is not a QUICX proxy request, so there is no masquerade to serve;
-	// terminate the connection like a normal HTTP/3 server.
+	if n < 2 {
+		// The stream ended (or was cancelled) before its two byte QUICX request header
+		// arrived. This is an aborted dial - a client that opened a stream and went
+		// away before writing its request - and not an HTTP/3 request. Only this
+		// stream is torn down: closing the connection here would kill every other
+		// stream on it and force the client into a full rehandshake for its next
+		// request, which turns one abandoned dial into a connection churn.
+		cancelStream(stream)
+		s.logger.Debug("abandoned request stream from ", s.quicConn.RemoteAddr(),
+			" after ", n, " byte(s): ", err)
+		return nil
+	}
+	// A bidirectional stream that does carry data but isn't a QUICX proxy request is a
+	// standard HTTP/3 request stream. Terminate the connection like a normal HTTP/3
+	// server, so that the endpoint keeps masquerading as one.
 	s.closeGracefully()
 	return nil
+}
+
+// cancelStream tears down a single stream without touching the connection it belongs
+// to. Data that was already read stays available to the caller.
+func cancelStream(stream *quic.Stream) {
+	code := quic.StreamErrorCode(http3.ErrCodeRequestCanceled)
+	stream.CancelRead(code)
+	stream.CancelWrite(code)
 }
 
 func (s *serverSession[U]) handleQUICXStream(stream *quic.Stream) error {
@@ -443,15 +474,18 @@ func (s *serverSession[U]) authFailure(err error) error {
 		// intentionally not sent: this is not an HTTP/3 graceful shutdown of a
 		// connection that served requests, but the termination of an
 		// unauthenticated QUICX session before any request was served.
-		s.closeWithErrorCode(quic.ApplicationErrorCode(http3.ErrCodeNoError), "")
+		s.logger.Info("authentication failed from ", s.quicConn.RemoteAddr(), ": ", err)
+		s.closeWithErrorCode(quic.ApplicationErrorCode(http3.ErrCodeNoError), "", err)
 	case AuthFailurePolicySilentDrop:
 		s.silentClose(err)
 	}
 	return err
 }
 
+// closeWithError closes the session with H3_NO_ERROR and keeps the cause, so that the
+// log line says why the session ended instead of repeating a generic message.
 func (s *serverSession[U]) closeWithError(err error) {
-	s.closeWithErrorCode(quic.ApplicationErrorCode(http3.ErrCodeNoError), "")
+	s.closeWithErrorCode(quic.ApplicationErrorCode(http3.ErrCodeNoError), "", err)
 }
 
 func (s *serverSession[U]) closeGracefully() {
@@ -487,21 +521,25 @@ func (s *serverSession[U]) finalizeClose(err error) {
 	s.cancel(err)
 }
 
-func (s *serverSession[U]) closeWithErrorCode(code quic.ApplicationErrorCode, desc string) {
+// closeWithErrorCode tears down the session with the given QUIC application error code.
+// cause is the reason the session ends; it is preserved as the session error so that
+// callers and the log line can tell an intentional close from a failure. Every call
+// site is an intentional teardown, so the line is written at debug level - the earlier
+// error level made routine closes look like failures.
+func (s *serverSession[U]) closeWithErrorCode(code quic.ApplicationErrorCode, desc string, cause error) {
+	if cause == nil {
+		cause = E.New("connection closed")
+	}
 	s.connAccess.Lock()
 	defer s.connAccess.Unlock()
 	select {
 	case <-s.connDone:
 		return
 	default:
-		s.connErr = E.New("connection closed")
+		s.connErr = cause
 		close(s.connDone)
 	}
-	if E.IsClosedOrCanceled(s.connErr) {
-		s.logger.Debug(E.Cause(s.connErr, "connection failed"))
-	} else {
-		s.logger.Error(E.Cause(s.connErr, "connection failed"))
-	}
+	s.logger.Debug(E.Cause(cause, "connection closed"))
 	s.udpAccess.Lock()
 	udpConnMap := s.udpConnMap
 	s.udpConnMap = make(map[uint16]*udpPacketConn)

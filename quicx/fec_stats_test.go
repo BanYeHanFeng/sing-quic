@@ -18,9 +18,11 @@ func TestFormatFECStats(t *testing.T) {
 	current := quic.FECStats{
 		Enabled:                  true,
 		GroupSize:                13,
-		SendOverhead:             1.0 / 13,
+		ParityRows:               2,
+		ConfiguredOverhead:       2.0 / 13,
 		LossRate:                 0.05,
 		ProtectedPacketsSent:     130,
+		ProtectedBytesSent:       200000,
 		ParityPacketsSent:        10,
 		ParityBytesSent:          12000,
 		ParityPacketsReceived:    9,
@@ -32,7 +34,16 @@ func TestFormatFECStats(t *testing.T) {
 	if !notable {
 		t.Fatal("expected a notable window")
 	}
-	for _, expected := range []string{"path loss 5.0%", "group 13", "overhead 7.7%", "repaired 7", "unrecoverable 1", "10 sent / 9 received", "11.7 KB"} {
+	for _, expected := range []string{
+		"tx loss 5.0% (peer reported)",
+		"group 13 rows 2",
+		"overhead 15.4% configured",
+		"6.0% measured",
+		"protected 130 pkts (195.3 KB)",
+		"parity 10 pkts (11.7 KB)",
+		"skipped 0 groups",
+		"rx repaired 7, unrecoverable 1, parity 9 pkts, protected 40 pkts",
+	} {
 		if !strings.Contains(line, expected) {
 			t.Fatalf("expected %q in %q", expected, line)
 		}
@@ -46,8 +57,20 @@ func TestFormatFECStats(t *testing.T) {
 	if notable {
 		t.Fatal("a window without repairs is not notable")
 	}
-	if !strings.Contains(line, "idle") || !strings.Contains(line, "path loss 0.0%") {
+	if !strings.Contains(line, "idle") || !strings.Contains(line, "tx loss 0.0%") {
 		t.Fatalf("unexpected line for an idle FEC: %q", line)
+	}
+
+	// a window in which the overhead cap kept FEC from sending parity has to be
+	// visible on its own, otherwise the enforcement looks like FEC being idle
+	line, _ = formatFECStats(quic.FECStats{Enabled: true}, quic.FECStats{
+		Enabled:       true,
+		GroupSize:     32,
+		ParityRows:    1,
+		SkippedGroups: 4,
+	})
+	if !strings.Contains(line, "skipped 4 groups") {
+		t.Fatalf("expected the skipped groups to be reported: %q", line)
 	}
 
 	// counters that went backwards (FEC was re-enabled) must not underflow
@@ -57,7 +80,7 @@ func TestFormatFECStats(t *testing.T) {
 		ParityPacketsSent:    2,
 		ProtectedPacketsSent: 3,
 	})
-	if !strings.Contains(line, "repaired 0") || !strings.Contains(line, "parity 0 sent") {
+	if !strings.Contains(line, "repaired 0") || !strings.Contains(line, "parity 0 pkts") {
 		t.Fatalf("unexpected line after a counter reset: %q", line)
 	}
 }
