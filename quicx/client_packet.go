@@ -21,7 +21,9 @@ func (c *Client) loopUniStreams(conn *clientQUICConnection) {
 
 func (c *Client) handleUniStream(conn *clientQUICConnection, stream *quic.ReceiveStream) {
 	defer stream.CancelRead(0)
-	var header [2]byte
+	// The scheme the server confirmed follows the command. A server that doesn't send
+	// it only implements the removed block scheme, which this client didn't offer.
+	var header [3]byte
 	_, err := io.ReadFull(stream, header[:])
 	if err != nil {
 		return
@@ -30,14 +32,11 @@ func (c *Client) handleUniStream(conn *clientQUICConnection, stream *quic.Receiv
 		// Ignore anything else (e.g. HTTP/3 control streams of a standard server).
 		return
 	}
-	// The scheme the server selected follows the command. Servers of the first FEC
-	// version don't send it, and they only implement the block scheme.
-	scheme := byte(fecCapabilityEnabled)
-	var selected [1]byte
-	if _, err := io.ReadFull(stream, selected[:]); err == nil {
-		scheme = selected[0]
+	if header[2] != fecCapabilityWindow {
+		c.logger.Debug("QUICX FEC not enabled (client, ", fecPeer(conn.quicConn), ", peer confirmed an unsupported scheme)")
+		return
 	}
-	if err = c.enableFEC(conn, scheme); err != nil {
+	if err = c.enableFEC(conn, header[2]); err != nil {
 		conn.closeWithError(E.Cause(err, "enable FEC"))
 	}
 }

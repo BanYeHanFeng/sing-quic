@@ -17,9 +17,8 @@ func TestFormatFECStats(t *testing.T) {
 	previous := quic.FECStats{Enabled: true}
 	current := quic.FECStats{
 		Enabled:                  true,
-		GroupSize:                13,
-		ParityRows:               2,
-		ConfiguredOverhead:       2.0 / 13,
+		WindowSize:               64,
+		RedundancyRate:           0.05,
 		LossRate:                 0.05,
 		ProtectedPacketsSent:     130,
 		ProtectedBytesSent:       200000,
@@ -36,12 +35,12 @@ func TestFormatFECStats(t *testing.T) {
 	}
 	for _, expected := range []string{
 		"tx loss 5.0% (peer reported)",
-		"group 13 rows 2",
-		"overhead 15.4% configured",
+		"window 64 pkts",
+		"rate 5.0%",
 		"6.0% measured",
 		"protected 130 pkts (195.3 KB)",
 		"parity 10 pkts (11.7 KB)",
-		"skipped 0 groups, dropped 0 frames",
+		"skipped 0 rows, dropped 0 frames",
 		"rx repaired 7, unrecoverable 1, parity 9 pkts, protected 40 pkts",
 	} {
 		if !strings.Contains(line, expected) {
@@ -64,13 +63,12 @@ func TestFormatFECStats(t *testing.T) {
 	// a window in which the overhead cap kept FEC from sending parity has to be
 	// visible on its own, otherwise the enforcement looks like FEC being idle
 	line, _ = formatFECStats(quic.FECStats{Enabled: true}, quic.FECStats{
-		Enabled:       true,
-		GroupSize:     32,
-		ParityRows:    1,
-		SkippedGroups: 4,
+		Enabled:     true,
+		WindowSize:  64,
+		SkippedRows: 4,
 	})
-	if !strings.Contains(line, "skipped 4 groups") {
-		t.Fatalf("expected the skipped groups to be reported: %q", line)
+	if !strings.Contains(line, "skipped 4 rows") {
+		t.Fatalf("expected the skipped rows to be reported: %q", line)
 	}
 
 	// A window that sent parity while FEC happened to be idle at the moment of the tick
@@ -97,36 +95,7 @@ func TestFormatFECStats(t *testing.T) {
 	if !strings.Contains(line, "repaired 0") || !strings.Contains(line, "parity 0 pkts") {
 		t.Fatalf("unexpected line after a counter reset: %q", line)
 	}
-
-	// the sliding window scheme reports the window it protects and the redundancy rate
-	// it targets; skipped rows take the place of skipped groups
-	line, notable = formatFECStats(quic.FECStats{Enabled: true, Scheme: quic.FECSchemeWindow}, quic.FECStats{
-		Enabled:              true,
-		Scheme:               quic.FECSchemeWindow,
-		GroupSize:            64,
-		ConfiguredOverhead:   0.05,
-		ProtectedPacketsSent: 130,
-		ProtectedBytesSent:   200000,
-		ParityPacketsSent:    5,
-		ParityBytesSent:      6000,
-		SkippedGroups:        2,
-		RecoveredPackets:     3,
-	})
-	if !notable {
-		t.Fatal("expected a notable window")
-	}
-	for _, expected := range []string{
-		"window 64 pkts",
-		"rate 5.0%",
-		"3.0% measured",
-		"skipped 2 rows",
-		"rx repaired 3",
-	} {
-		if !strings.Contains(line, expected) {
-			t.Fatalf("expected %q in %q", expected, line)
-		}
-	}
-	if strings.Contains(line, "group 64") || strings.Contains(line, "skipped 2 groups") {
+	if strings.Contains(line, "group") {
 		t.Fatalf("the window scheme must not be reported as a group scheme: %q", line)
 	}
 }
@@ -147,20 +116,14 @@ func TestHumanBytes(t *testing.T) {
 }
 
 func TestFECLimits(t *testing.T) {
-	if limits := fecLimits(nil, fecCapabilityEnabled); limits != "" {
+	if limits := fecLimits(nil); limits != "" {
 		t.Fatalf("expected no limits for nil options, got %q", limits)
 	}
-	if limits := fecLimits(&FECOptions{}, fecCapabilityEnabled); limits != "" {
+	if limits := fecLimits(&FECOptions{}); limits != "" {
 		t.Fatalf("expected no limits for the defaults, got %q", limits)
 	}
-	limits := fecLimits(&FECOptions{MaxOverheadPercent: 25, MaxGroupSize: 8, MaxParityRows: 2}, fecCapabilityEnabled)
-	if limits != ", max overhead 25%, max group 8, parity rows 2" {
+	limits := fecLimits(&FECOptions{MaxOverheadPercent: 25, MaxGroupSize: 64, MaxParityRows: 2})
+	if limits != ", max overhead 25%, window 64, tail rows 2" {
 		t.Fatalf("unexpected limits: %q", limits)
-	}
-	// the sliding window scheme has a window instead of a group, and its row count is
-	// the number of rows sent for the idle tail, which is not a limit to log
-	limits = fecLimits(&FECOptions{MaxOverheadPercent: 25, MaxGroupSize: 64, MaxParityRows: 2}, fecCapabilityWindow)
-	if limits != ", max overhead 25%, window 64" {
-		t.Fatalf("unexpected window limits: %q", limits)
 	}
 }
