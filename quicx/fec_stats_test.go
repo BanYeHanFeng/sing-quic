@@ -41,7 +41,7 @@ func TestFormatFECStats(t *testing.T) {
 		"6.0% measured",
 		"protected 130 pkts (195.3 KB)",
 		"parity 10 pkts (11.7 KB)",
-		"skipped 0 groups",
+		"skipped 0 groups, dropped 0 frames",
 		"rx repaired 7, unrecoverable 1, parity 9 pkts, protected 40 pkts",
 	} {
 		if !strings.Contains(line, expected) {

@@ -298,8 +298,9 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 	repaired := delta(previous.RecoveredPackets, current.RecoveredPackets)
 	failed := delta(previous.FailedPackets, current.FailedPackets)
 	skipped := delta(previous.SkippedGroups, current.SkippedGroups)
+	dropped := delta(previous.DroppedFrames, current.DroppedFrames)
 	if protectedSent == 0 && paritySent == 0 && parityBytes == 0 && parityReceived == 0 &&
-		repaired == 0 && failed == 0 && skipped == 0 {
+		repaired == 0 && failed == 0 && skipped == 0 && dropped == 0 {
 		return "", false
 	}
 	state := "idle"
@@ -318,10 +319,10 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 		overhead += fmt.Sprintf(" / %.1f%% measured", float64(parityBytes)/float64(protectedBytes)*100)
 	}
 	return fmt.Sprintf(
-		"QUICX FEC: tx loss %.1f%% (peer reported), %s%s, protected %d pkts (%s), parity %d pkts (%s), skipped %d groups; "+
+		"QUICX FEC: tx loss %.1f%% (peer reported), %s%s, protected %d pkts (%s), parity %d pkts (%s), skipped %d groups, dropped %d frames; "+
 			"rx repaired %d, unrecoverable %d, parity %d pkts, protected %d pkts",
 		current.LossRate*100, state, overhead,
-		protectedSent, humanBytes(protectedBytes), paritySent, humanBytes(parityBytes), skipped,
+		protectedSent, humanBytes(protectedBytes), paritySent, humanBytes(parityBytes), skipped, dropped,
 		repaired, failed, parityReceived, protectedReceived,
 	), repaired > 0 || failed > 0
 }
