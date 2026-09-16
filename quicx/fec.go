@@ -20,13 +20,20 @@ import (
 // the congestion controller doesn't see the loss and doesn't reduce the send rate, but
 // - unlike Hysteria's "brutal" congestion control - no bandwidth is wasted either: the
 // amount of redundancy follows the loss rate measured by the peer, and no parity
-// packets are sent at all on a path that doesn't lose packets.
+// packets are sent at all on a path that doesn't lose packets. A loss rate that arrives
+// in bursts drives the redundancy through the peak of the burst rather than through a
+// smoothed estimate, so the rows a burst needs are spent while its packets are still
+// inside the window.
 //
 // The sliding window scheme implements this: one repair row protects the window of the
 // most recent packets that carry application data, and successive rows protect
 // overlapping windows, so a lost packet is covered by every row emitted while it stays
 // in the window. A burst of losses is reconstructed row by row instead of leaving a
 // whole group unprotected.
+//
+// Because a row can only reconstruct a packet that is still inside the window, and rows
+// are paid for out of the packets that follow the loss, the window size bounds the burst
+// that can be reconstructed at all: about window*cap/(1+cap) packets.
 //
 // FEC is negotiated between the two QUICX endpoints: the client announces the scheme it
 // supports in its authentication request, and the server confirms the scheme both ends
@@ -38,7 +45,10 @@ type FECOptions struct {
 	// is. Defaults to 10.
 	MaxOverheadPercent int
 	// MaxGroupSize is the number of packets one sliding window protects. Larger
-	// windows tolerate longer bursts, at the price of memory. Defaults to 64.
+	// windows tolerate longer bursts, at the price of memory. A burst can only be
+	// reconstructed while its packets are inside the window, so the window size bounds
+	// the burst the receiver can repair at all: about window*cap/(1+cap) packets.
+	// Defaults to the largest window the wire format has, 128.
 	MaxGroupSize int
 	// MaxParityRows is the number of repair rows an idle sender emits for the tail of
 	// its window, so that the packets sent last aren't left with less protection than
