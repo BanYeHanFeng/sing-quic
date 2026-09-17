@@ -54,6 +54,12 @@ type FECOptions struct {
 	// its window, so that the packets sent last aren't left with less protection than
 	// the ones before them. Defaults to 2.
 	MaxParityRows int
+	// BaselineRedundancyPercent keeps a small fixed redundancy on the wire even while
+	// the path looks lossless, so the first burst doesn't have to wait for the peer's
+	// feedback (about 0.5*RTT plus the feedback interval). It is bounded by
+	// MaxOverheadPercent. Defaults to 0: a clean path stays idle. 2-5 is a reasonable
+	// value on high-RTT or low-rate links.
+	BaselineRedundancyPercent int
 }
 
 // fecCapabilityWindow is the FEC capability flag of the sliding window scheme, the only
@@ -69,9 +75,10 @@ func (o *FECOptions) config() quic.FECConfig {
 		return quic.FECConfig{}
 	}
 	return quic.FECConfig{
-		MaxOverheadPercent: o.MaxOverheadPercent,
-		MaxGroupSize:       o.MaxGroupSize,
-		MaxParityRows:      o.MaxParityRows,
+		MaxOverheadPercent:        o.MaxOverheadPercent,
+		MaxGroupSize:              o.MaxGroupSize,
+		MaxParityRows:             o.MaxParityRows,
+		BaselineRedundancyPercent: o.BaselineRedundancyPercent,
 	}
 }
 
@@ -136,6 +143,9 @@ func fecLimits(options *FECOptions) string {
 	var limits string
 	if options.MaxOverheadPercent > 0 {
 		limits += fmt.Sprintf(", max overhead %d%%", options.MaxOverheadPercent)
+	}
+	if options.BaselineRedundancyPercent > 0 {
+		limits += fmt.Sprintf(", baseline %d%%", options.BaselineRedundancyPercent)
 	}
 	if options.MaxGroupSize > 0 {
 		limits += fmt.Sprintf(", window %d", options.MaxGroupSize)
