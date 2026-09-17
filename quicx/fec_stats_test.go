@@ -192,7 +192,7 @@ func TestFECLimits(t *testing.T) {
 		t.Fatalf("expected no limits for the defaults, got %q", limits)
 	}
 	limits := fecLimits(&FECOptions{MaxOverheadPercent: 25, MaxGroupSize: 64, MaxParityRows: 2, BaselineRedundancyPercent: 3, RecoveredPacketFeedback: true})
-	if limits != ", max overhead 25%, baseline 3%, window 64, tail rows 2, recovered feedback" {
+	if limits != ", max overhead 25%, baseline 3%, recovered feedback, window 64, tail rows 2" {
 		t.Fatalf("unexpected limits: %q", limits)
 	}
 }
