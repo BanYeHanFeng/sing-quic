@@ -58,8 +58,8 @@ type FECOptions struct {
 	// BaselineRedundancyPercent keeps a small fixed redundancy on the wire even while
 	// the path looks lossless, so the first burst doesn't have to wait for the peer's
 	// feedback (about 0.5*RTT plus the feedback interval). It is bounded by
-	// MaxOverheadPercent. Defaults to 0: a clean path stays idle. 2-5 is a reasonable
-	// value on high-RTT or low-rate links.
+	// MaxOverheadPercent. The library zero value stays 0 (a purely reactive path);
+	// sing-box sets a 5% default for links that occasionally burst to about 8% loss.
 	BaselineRedundancyPercent int
 	// RecoveredPacketFeedback reports packets this endpoint reconstructed with FEC back
 	// to the sender, so that the sender's congestion controller sees the loss without
