@@ -65,7 +65,7 @@ type FECOptions struct {
 	// to the sender, so that the sender's congestion controller sees the loss without
 	// retransmitting the packet (RFC 9265, known-lossy-path exception). It has to be
 	// enabled on the receiving side, and the sending side has to understand the frame.
-	// Defaults to false.
+	// The library zero value stays false; sing-box enables it by default.
 	RecoveredPacketFeedback bool
 }
 
