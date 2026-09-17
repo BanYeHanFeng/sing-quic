@@ -116,6 +116,24 @@ func TestFormatFECStats(t *testing.T) {
 		}
 	}
 
+	// Recovered packet reporting: the sender is told about the loss (and feeds it to
+	// its congestion controller), and the receiver reports its own recoveries back.
+	line, notable = formatFECStats(quic.FECStats{Enabled: true}, quic.FECStats{
+		Enabled:                  true,
+		ProtectedPacketsSent:     10,
+		ProtectedBytesSent:       1000,
+		RecoveredPacketsReported: 4,
+		RecoveredPacketsReceived: 2,
+	})
+	if !notable {
+		t.Fatal("recovered packet reports are notable")
+	}
+	for _, expected := range []string{"recovered losses 2", "recovered reported 4"} {
+		if !strings.Contains(line, expected) {
+			t.Fatalf("expected %q in %q", expected, line)
+		}
+	}
+
 	// RTT changes alone must not turn an otherwise quiet window into a log line.
 	if line, notable := formatFECStats(quic.FECStats{Enabled: true, SmoothedRTT: 10 * time.Millisecond},
 		quic.FECStats{Enabled: true, SmoothedRTT: 20 * time.Millisecond}); line != "" || notable {
@@ -173,8 +191,8 @@ func TestFECLimits(t *testing.T) {
 	if limits := fecLimits(&FECOptions{}); limits != "" {
 		t.Fatalf("expected no limits for the defaults, got %q", limits)
 	}
-	limits := fecLimits(&FECOptions{MaxOverheadPercent: 25, MaxGroupSize: 64, MaxParityRows: 2, BaselineRedundancyPercent: 3})
-	if limits != ", max overhead 25%, baseline 3%, window 64, tail rows 2" {
+	limits := fecLimits(&FECOptions{MaxOverheadPercent: 25, MaxGroupSize: 64, MaxParityRows: 2, BaselineRedundancyPercent: 3, RecoveredPacketFeedback: true})
+	if limits != ", max overhead 25%, baseline 3%, window 64, tail rows 2, recovered feedback" {
 		t.Fatalf("unexpected limits: %q", limits)
 	}
 }

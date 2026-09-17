@@ -60,6 +60,12 @@ type FECOptions struct {
 	// MaxOverheadPercent. Defaults to 0: a clean path stays idle. 2-5 is a reasonable
 	// value on high-RTT or low-rate links.
 	BaselineRedundancyPercent int
+	// RecoveredPacketFeedback reports packets this endpoint reconstructed with FEC back
+	// to the sender, so that the sender's congestion controller sees the loss without
+	// retransmitting the packet (RFC 9265, known-lossy-path exception). It has to be
+	// enabled on the receiving side, and the sending side has to understand the frame.
+	// Defaults to false.
+	RecoveredPacketFeedback bool
 }
 
 // fecCapabilityWindow is the FEC capability flag of the sliding window scheme, the only
@@ -79,6 +85,7 @@ func (o *FECOptions) config() quic.FECConfig {
 		MaxGroupSize:              o.MaxGroupSize,
 		MaxParityRows:             o.MaxParityRows,
 		BaselineRedundancyPercent: o.BaselineRedundancyPercent,
+		RecoveredPacketFeedback:   o.RecoveredPacketFeedback,
 	}
 }
 
@@ -146,6 +153,9 @@ func fecLimits(options *FECOptions) string {
 	}
 	if options.BaselineRedundancyPercent > 0 {
 		limits += fmt.Sprintf(", baseline %d%%", options.BaselineRedundancyPercent)
+	}
+	if options.RecoveredPacketFeedback {
+		limits += ", recovered feedback"
 	}
 	if options.MaxGroupSize > 0 {
 		limits += fmt.Sprintf(", window %d", options.MaxGroupSize)
@@ -353,10 +363,12 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 	skippedUnbuildable := delta(previous.SkippedRowsUnbuildable, current.SkippedRowsUnbuildable)
 	dropped := delta(previous.DroppedFrames, current.DroppedFrames)
 	duplicates := delta(previous.DuplicateRows, current.DuplicateRows)
+	recoveredReported := delta(previous.RecoveredPacketsReported, current.RecoveredPacketsReported)
+	recoveredReceived := delta(previous.RecoveredPacketsReceived, current.RecoveredPacketsReceived)
 	missingChanged := current.MissingPackets != previous.MissingPackets
 	if protectedSent == 0 && paritySent == 0 && parityBytes == 0 && parityReceived == 0 &&
 		repaired == 0 && failed == 0 && skipped == 0 && dropped == 0 && !missingChanged &&
-		duplicates == 0 {
+		duplicates == 0 && recoveredReported == 0 && recoveredReceived == 0 {
 		return "", false
 	}
 	state := "idle"
@@ -393,6 +405,13 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 			rttPart += fmt.Sprintf(" (+%s vs min)", current.RTTInflation.Round(100*time.Microsecond))
 		}
 	}
+	// recoveredReceived is the peer telling us that packets we sent were reconstructed:
+	// they were acknowledged, so nothing is retransmitted, but the loss is fed to our
+	// congestion controller.
+	recoveredPart := ""
+	if recoveredReceived > 0 {
+		recoveredPart = fmt.Sprintf(", recovered losses %d", recoveredReceived)
+	}
 	rxPart := fmt.Sprintf("rx repaired %d, unrecoverable %d, parity %d pkts, protected %d pkts",
 		repaired, failed, parityReceived, protectedReceived)
 	// MissingPackets is a gauge: protected packets the peer announced that this side has
@@ -404,15 +423,19 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 	if duplicates > 0 {
 		rxPart += fmt.Sprintf(", duplicate %d rows", duplicates)
 	}
+	if recoveredReported > 0 {
+		rxPart += fmt.Sprintf(", recovered reported %d", recoveredReported)
+	}
 	// Missing packets with no repair row arriving in the window are notable even
 	// without a repair or failure counter: that is the case the field logs missed.
 	notable = repaired > 0 || failed > 0 || duplicates > 0 ||
-		(current.MissingPackets > 0 && parityReceived == 0)
+		(current.MissingPackets > 0 && parityReceived == 0) ||
+		recoveredReported > 0 || recoveredReceived > 0
 	return fmt.Sprintf(
-		"QUICX FEC: tx loss %.1f%% (peer reported), %s%s, protected %d pkts (%s), parity %d pkts (%s), %s, dropped %d frames%s; %s",
+		"QUICX FEC: tx loss %.1f%% (peer reported), %s%s, protected %d pkts (%s), parity %d pkts (%s), %s, dropped %d frames%s%s; %s",
 		current.LossRate*100, state, overhead,
 		protectedSent, humanBytes(protectedBytes), paritySent, humanBytes(parityBytes),
-		skippedPart, dropped, rttPart, rxPart,
+		skippedPart, dropped, recoveredPart, rttPart, rxPart,
 	), notable
 }
 

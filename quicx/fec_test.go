@@ -41,12 +41,15 @@ func TestFECConfigFromOptions(t *testing.T) {
 	if config := (*FECOptions)(nil).config(); config.MaxOverheadPercent != 0 || config.MaxGroupSize != 0 {
 		t.Fatalf("unexpected config for nil options: %+v", config)
 	}
-	options := &FECOptions{MaxOverheadPercent: 25, MaxGroupSize: 8, MaxParityRows: 2, BaselineRedundancyPercent: 3}
+	options := &FECOptions{MaxOverheadPercent: 25, MaxGroupSize: 8, MaxParityRows: 2, BaselineRedundancyPercent: 3, RecoveredPacketFeedback: true}
 	config := options.config()
 	if config.MaxOverheadPercent != 25 || config.MaxGroupSize != 8 || config.MaxParityRows != 2 {
 		t.Fatalf("unexpected config: %+v", config)
 	}
 	if config.BaselineRedundancyPercent != 3 {
 		t.Fatalf("baseline redundancy was not passed through: %+v", config)
+	}
+	if !config.RecoveredPacketFeedback {
+		t.Fatalf("recovered packet feedback was not passed through: %+v", config)
 	}
 }
