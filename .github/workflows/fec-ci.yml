@@ -47,6 +47,6 @@ jobs:
         run: go test -count=1 -v ./quicx/...
       - name: 格式检查（仅报告）
         run: |
-          files="quicx/fec.go quicx/fec_test.go quicx/client.go quicx/client_packet.go quicx/service.go quicx/protocol.go"
+          files="quicx/fec.go quicx/fec_test.go quicx/fec_stats_test.go quicx/client.go quicx/client_packet.go quicx/service.go quicx/protocol.go"
           gofmt -l ${files} || true
           gofmt -d ${files} || true

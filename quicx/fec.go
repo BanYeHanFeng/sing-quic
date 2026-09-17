@@ -313,7 +313,10 @@ func (s *serverSession[U]) loopFECStats() {
 }
 
 // formatFECStats formats one statistics window. It returns an empty line if nothing
-// happened in the window, and whether packets were repaired (a notable window).
+// happened in the window, and whether the window is notable: packets were repaired,
+// packets were given up on, duplicate rows arrived, or protected packets are still
+// missing while no repair row arrived (the "sender went idle" signature). RTT
+// inflation is reported as context for deciding whether the loss is congestion.
 //
 // The line reports the two directions separately, because they are measured by
 // different endpoints: the loss rate is the one the *peer* observed on the path we
@@ -336,9 +339,14 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 	repaired := delta(previous.RecoveredPackets, current.RecoveredPackets)
 	failed := delta(previous.FailedPackets, current.FailedPackets)
 	skipped := delta(previous.SkippedRows, current.SkippedRows)
+	skippedBudget := delta(previous.SkippedRowsBudget, current.SkippedRowsBudget)
+	skippedUnbuildable := delta(previous.SkippedRowsUnbuildable, current.SkippedRowsUnbuildable)
 	dropped := delta(previous.DroppedFrames, current.DroppedFrames)
+	duplicates := delta(previous.DuplicateRows, current.DuplicateRows)
+	missingChanged := current.MissingPackets != previous.MissingPackets
 	if protectedSent == 0 && paritySent == 0 && parityBytes == 0 && parityReceived == 0 &&
-		repaired == 0 && failed == 0 && skipped == 0 && dropped == 0 {
+		repaired == 0 && failed == 0 && skipped == 0 && dropped == 0 && !missingChanged &&
+		duplicates == 0 {
 		return "", false
 	}
 	state := "idle"
@@ -358,13 +366,44 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 	if protectedBytes > 0 {
 		overhead += fmt.Sprintf(" / %.1f%% measured", float64(parityBytes)/float64(protectedBytes)*100)
 	}
+	// Split the skipped rows into the two causes the sender now counts separately: a
+	// growing budget part means the overhead cap - not the loss estimate - is what
+	// limits FEC, while "too large" rows are the datagram/window limit.
+	skippedPart := fmt.Sprintf("skipped %d rows", skipped)
+	if skippedBudget > 0 || skippedUnbuildable > 0 {
+		skippedPart += fmt.Sprintf(" (%d budget, %d too large)", skippedBudget, skippedUnbuildable)
+	}
+	// RTT inflation is the queueing delay the connection sees. While FEC is recovering
+	// packets, a value that grows with the redundancy is evidence of congestion rather
+	// than an intrinsically lossy path, and the operator should reduce redundancy.
+	rttPart := ""
+	if current.SmoothedRTT > 0 {
+		rttPart = fmt.Sprintf(", rtt %s", current.SmoothedRTT.Round(100*time.Microsecond))
+		if current.RTTInflation > 0 {
+			rttPart += fmt.Sprintf(" (+%s vs min)", current.RTTInflation.Round(100*time.Microsecond))
+		}
+	}
+	rxPart := fmt.Sprintf("rx repaired %d, unrecoverable %d, parity %d pkts, protected %d pkts",
+		repaired, failed, parityReceived, protectedReceived)
+	// MissingPackets is a gauge: protected packets the peer announced that this side has
+	// neither received nor reconstructed. Non-zero while parity stopped arriving is the
+	// "sender went idle while the receiver still has gaps" signature.
+	if current.MissingPackets > 0 {
+		rxPart += fmt.Sprintf(", still missing %d pkts", current.MissingPackets)
+	}
+	if duplicates > 0 {
+		rxPart += fmt.Sprintf(", duplicate %d rows", duplicates)
+	}
+	// Missing packets with no repair row arriving in the window are notable even
+	// without a repair or failure counter: that is the case the field logs missed.
+	notable = repaired > 0 || failed > 0 || duplicates > 0 ||
+		(current.MissingPackets > 0 && parityReceived == 0)
 	return fmt.Sprintf(
-		"QUICX FEC: tx loss %.1f%% (peer reported), %s%s, protected %d pkts (%s), parity %d pkts (%s), skipped %d rows, dropped %d frames; "+
-			"rx repaired %d, unrecoverable %d, parity %d pkts, protected %d pkts",
+		"QUICX FEC: tx loss %.1f%% (peer reported), %s%s, protected %d pkts (%s), parity %d pkts (%s), %s, dropped %d frames%s; %s",
 		current.LossRate*100, state, overhead,
-		protectedSent, humanBytes(protectedBytes), paritySent, humanBytes(parityBytes), skipped, dropped,
-		repaired, failed, parityReceived, protectedReceived,
-	), repaired > 0 || failed > 0
+		protectedSent, humanBytes(protectedBytes), paritySent, humanBytes(parityBytes),
+		skippedPart, dropped, rttPart, rxPart,
+	), notable
 }
 
 func humanBytes(bytes uint64) string {

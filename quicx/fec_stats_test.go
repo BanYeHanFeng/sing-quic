@@ -3,6 +3,7 @@ package quicx
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sagernet/quic-go"
 )
@@ -63,12 +64,62 @@ func TestFormatFECStats(t *testing.T) {
 	// a window in which the overhead cap kept FEC from sending parity has to be
 	// visible on its own, otherwise the enforcement looks like FEC being idle
 	line, _ = formatFECStats(quic.FECStats{Enabled: true}, quic.FECStats{
-		Enabled:     true,
-		WindowSize:  64,
-		SkippedRows: 4,
+		Enabled:           true,
+		WindowSize:        64,
+		SkippedRows:       4,
+		SkippedRowsBudget: 4,
 	})
-	if !strings.Contains(line, "skipped 4 rows") {
-		t.Fatalf("expected the skipped rows to be reported: %q", line)
+	if !strings.Contains(line, "skipped 4 rows (4 budget, 0 too large)") {
+		t.Fatalf("expected the skipped rows to be reported with their cause: %q", line)
+	}
+	line, _ = formatFECStats(quic.FECStats{Enabled: true}, quic.FECStats{
+		Enabled:                true,
+		WindowSize:             64,
+		SkippedRows:            2,
+		SkippedRowsUnbuildable: 2,
+	})
+	if !strings.Contains(line, "skipped 2 rows (0 budget, 2 too large)") {
+		t.Fatalf("expected the unbuildable rows to be reported: %q", line)
+	}
+
+	// Missing packets while no repair row arrives are the "sender idle, receiver still
+	// has gaps" signature and have to be both visible and notable.
+	line, notable = formatFECStats(quic.FECStats{Enabled: true}, quic.FECStats{
+		Enabled:              true,
+		ProtectedPacketsSent: 10,
+		ProtectedBytesSent:   1000,
+		MissingPackets:       3,
+	})
+	if !notable {
+		t.Fatal("missing packets without any repair row in the window are notable")
+	}
+	if !strings.Contains(line, "still missing 3 pkts") {
+		t.Fatalf("expected the missing gauge in the line: %q", line)
+	}
+
+	// Duplicate equations and RTT inflation are reported when they happen.
+	line, notable = formatFECStats(quic.FECStats{Enabled: true}, quic.FECStats{
+		Enabled:              true,
+		ProtectedPacketsSent: 10,
+		ProtectedBytesSent:   1000,
+		DuplicateRows:        1,
+		SmoothedRTT:          30 * time.Millisecond,
+		MinRTT:               20 * time.Millisecond,
+		RTTInflation:         10 * time.Millisecond,
+	})
+	if !notable {
+		t.Fatal("duplicate repair rows are notable")
+	}
+	for _, expected := range []string{"duplicate 1 rows", "rtt 30ms (+10ms vs min)"} {
+		if !strings.Contains(line, expected) {
+			t.Fatalf("expected %q in %q", expected, line)
+		}
+	}
+
+	// RTT changes alone must not turn an otherwise quiet window into a log line.
+	if line, notable := formatFECStats(quic.FECStats{Enabled: true, SmoothedRTT: 10 * time.Millisecond},
+		quic.FECStats{Enabled: true, SmoothedRTT: 20 * time.Millisecond}); line != "" || notable {
+		t.Fatalf("expected no log line for an RTT change alone, got %q (notable %v)", line, notable)
 	}
 
 	// A window that sent parity while FEC happened to be idle at the moment of the tick
