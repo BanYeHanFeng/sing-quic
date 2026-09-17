@@ -42,7 +42,8 @@ import (
 type FECOptions struct {
 	// MaxOverheadPercent caps the parity traffic as a percentage of the protected
 	// traffic. It bounds the bandwidth FEC may spend, no matter how lossy the path
-	// is. Defaults to 20.
+	// is. Defaults to 30: with the 1.5x-loss safety factor, the reactive rate then
+	// stays uncapped through about 20% measured random loss.
 	MaxOverheadPercent int
 	// MaxGroupSize is the number of packets one sliding window protects. Larger
 	// windows tolerate longer bursts, at the price of memory. A burst can only be
