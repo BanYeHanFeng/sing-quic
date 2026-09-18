@@ -31,9 +31,10 @@ import (
 // in the window. A burst of losses is reconstructed row by row instead of leaving a
 // whole group unprotected.
 //
-// Because a row can only reconstruct a packet that is still inside the window, and rows
-// are paid for out of the packets that follow the loss, the window size bounds the burst
-// that can be reconstructed at all: about window*cap/(1+cap) packets.
+// Because a row can only reconstruct a packet that is still inside the window, the window
+// bounds how long a lost packet stays repairable. A loss report can trigger a repair burst
+// of up to 127 extra rows from the credit accumulated while the path looked cleaner; rows
+// that would exceed the configured byte cap are skipped.
 //
 // FEC is negotiated between the two QUICX endpoints: the client announces the scheme it
 // supports in its authentication request, and the server confirms the scheme both ends
@@ -48,8 +49,9 @@ type FECOptions struct {
 	// MaxGroupSize is the number of packets one sliding window protects. Larger
 	// windows tolerate longer bursts, at the price of memory. A burst can only be
 	// reconstructed while its packets are inside the window, so the window size bounds
-	// the burst the receiver can repair at all: about window*cap/(1+cap) packets.
-	// Defaults to the largest window the wire format has, 128.
+	// the time a lost packet stays repairable; a loss report can add a repair burst of up
+	// to 127 extra rows from the accumulated credit. Defaults to the largest window the
+	// wire format has, 128.
 	MaxGroupSize int
 	// MaxParityRows is the number of repair rows an idle sender emits for the tail of
 	// its window, so that the packets sent last aren't left with less protection than
@@ -366,10 +368,14 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 	duplicates := delta(previous.DuplicateRows, current.DuplicateRows)
 	recoveredReported := delta(previous.RecoveredPacketsReported, current.RecoveredPacketsReported)
 	recoveredReceived := delta(previous.RecoveredPacketsReceived, current.RecoveredPacketsReceived)
+	repairBursts := delta(previous.RepairBursts, current.RepairBursts)
+	repairBurstRows := delta(previous.RepairBurstRowsSent, current.RepairBurstRowsSent)
+	repairBurstSkipped := delta(previous.RepairBurstRowsSkipped, current.RepairBurstRowsSkipped)
 	missingChanged := current.MissingPackets != previous.MissingPackets
 	if protectedSent == 0 && paritySent == 0 && parityBytes == 0 && parityReceived == 0 &&
 		repaired == 0 && failed == 0 && skipped == 0 && dropped == 0 && !missingChanged &&
-		duplicates == 0 && recoveredReported == 0 && recoveredReceived == 0 {
+		duplicates == 0 && recoveredReported == 0 && recoveredReceived == 0 &&
+		repairBursts == 0 && repairBurstRows == 0 && repairBurstSkipped == 0 {
 		return "", false
 	}
 	state := "idle"
@@ -395,6 +401,17 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 	skippedPart := fmt.Sprintf("skipped %d rows", skipped)
 	if skippedBudget > 0 || skippedUnbuildable > 0 {
 		skippedPart += fmt.Sprintf(" (%d budget, %d too large)", skippedBudget, skippedUnbuildable)
+	}
+	// Repair bursts are the loss-triggered rows that are sent out of the accumulated
+	// byte credit. They are reported separately from the steady-state parity because
+	// they are the direct answer to "the loss is already reported; are there enough
+	// rows to repair it before the window expires".
+	burstPart := ""
+	if repairBursts > 0 || repairBurstRows > 0 || repairBurstSkipped > 0 {
+		burstPart = fmt.Sprintf(", burst %d rows", repairBurstRows)
+		if repairBurstSkipped > 0 {
+			burstPart += fmt.Sprintf(" (%d skipped)", repairBurstSkipped)
+		}
 	}
 	// RTT inflation is the queueing delay the connection sees. While FEC is recovering
 	// packets, a value that grows with the redundancy is evidence of congestion rather
@@ -431,12 +448,13 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 	// without a repair or failure counter: that is the case the field logs missed.
 	notable = repaired > 0 || failed > 0 || duplicates > 0 ||
 		(current.MissingPackets > 0 && parityReceived == 0) ||
-		recoveredReported > 0 || recoveredReceived > 0
+		recoveredReported > 0 || recoveredReceived > 0 ||
+		repairBurstRows > 0 || repairBurstSkipped > 0
 	return fmt.Sprintf(
-		"QUICX FEC: tx loss %.1f%% (peer reported), %s%s, protected %d pkts (%s), parity %d pkts (%s), %s, dropped %d frames%s%s; %s",
+		"QUICX FEC: tx loss %.1f%% (peer reported), %s%s, protected %d pkts (%s), parity %d pkts (%s), %s, dropped %d frames%s%s%s; %s",
 		current.LossRate*100, state, overhead,
 		protectedSent, humanBytes(protectedBytes), paritySent, humanBytes(parityBytes),
-		skippedPart, dropped, recoveredPart, rttPart, rxPart,
+		skippedPart, dropped, recoveredPart, rttPart, burstPart, rxPart,
 	), notable
 }
 

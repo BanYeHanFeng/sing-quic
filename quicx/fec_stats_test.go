@@ -49,6 +49,21 @@ func TestFormatFECStats(t *testing.T) {
 		}
 	}
 
+	// Repair bursts are reported separately: a burst can be the only FEC activity in a
+	// window, and a burst that the byte budget refused still has to be visible.
+	line, notable = formatFECStats(quic.FECStats{Enabled: true}, quic.FECStats{
+		Enabled:                true,
+		RepairBursts:           1,
+		RepairBurstRowsSent:    6,
+		RepairBurstRowsSkipped: 2,
+	})
+	if !notable {
+		t.Fatal("a repair burst is notable")
+	}
+	if !strings.Contains(line, ", burst 6 rows (2 skipped)") {
+		t.Fatalf("expected the repair burst in the line: %q", line)
+	}
+
 	// FEC is idle on a clean path
 	line, notable = formatFECStats(quic.FECStats{Enabled: true}, quic.FECStats{
 		Enabled:              true,
