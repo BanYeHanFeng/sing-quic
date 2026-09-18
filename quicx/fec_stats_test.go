@@ -169,6 +169,43 @@ func TestFormatFECStats(t *testing.T) {
 		t.Fatalf("expected the measured overhead even while idle: %q", line)
 	}
 
+	// Phase 2 observation fields: missing-range feedback, scheduled burst rows,
+	// RTT-adaptive window state and the P4 experiment metrics.
+	line, notable = formatFECStats(quic.FECStats{Enabled: true}, quic.FECStats{
+		Enabled:                        true,
+		WindowSize:                     83,
+		WindowMaxSize:                  128,
+		AdaptiveWindow:                 true,
+		MissingRangesReceived:          5,
+		MissingPacketsInWindow:         4,
+		MissingPacketsRepairable:       2,
+		RepairBursts:                   1,
+		RepairBurstRowsScheduled:       10,
+		RepairBurstRowsSent:            6,
+		RepairBurstRowsSkipped:         4,
+		RepairBurstRowsSkippedBudget:   1,
+		RepairBurstRowsSkippedNoWindow: 3,
+		ProtectedPacketRate:            1234,
+		PeerLossPeak:                   0.21,
+		FeedbackLatency:                90 * time.Millisecond,
+	})
+	if !notable {
+		t.Fatal("phase 2 feedback fields are notable")
+	}
+	for _, expected := range []string{
+		"window 83/128 pkts (rtt-adaptive)",
+		"burst 6/10 rows",
+		"1 budget, 3 no-window",
+		"missing-ranges 5 (4 in window, 2 repairable)",
+		"1234 pps protected",
+		"peer loss peak 21.0%",
+		"feedback latency 90ms",
+	} {
+		if !strings.Contains(line, expected) {
+			t.Fatalf("expected %q in %q", expected, line)
+		}
+	}
+
 	// counters that went backwards (FEC was re-enabled) must not underflow
 	line, _ = formatFECStats(quic.FECStats{Enabled: true, RecoveredPackets: 100, ParityPacketsSent: 50}, quic.FECStats{
 		Enabled:              true,
@@ -203,11 +240,19 @@ func TestFECLimits(t *testing.T) {
 	if limits := fecLimits(nil); limits != "" {
 		t.Fatalf("expected no limits for nil options, got %q", limits)
 	}
-	if limits := fecLimits(&FECOptions{}); limits != "" {
-		t.Fatalf("expected no limits for the defaults, got %q", limits)
+	if limits := fecLimits(&FECOptions{}); limits != ", extended feedback" {
+		t.Fatalf("unexpected limits for the defaults: %q", limits)
 	}
 	limits := fecLimits(&FECOptions{MaxOverheadPercent: 25, MaxGroupSize: 64, MaxParityRows: 2, BaselineRedundancyPercent: 3, RecoveredPacketFeedback: true})
-	if limits != ", max overhead 25%, baseline 3%, recovered feedback, window 64, tail rows 2" {
+	if limits != ", max overhead 25%, baseline 3%, extended feedback, recovered feedback, window 64, tail rows 2" {
 		t.Fatalf("unexpected limits: %q", limits)
+	}
+	limits = fecLimits(&FECOptions{MaxGroupSize: 64, MaxParityRows: 2, AdaptiveWindow: true})
+	if limits != ", extended feedback, adaptive window, window 64, tail rows 2" {
+		t.Fatalf("unexpected adaptive limits: %q", limits)
+	}
+	limits = fecLimits(&FECOptions{MultiWindow: true, MultiWindowCount: 4})
+	if limits != ", extended feedback, multi-window 4" {
+		t.Fatalf("unexpected multi-window limits: %q", limits)
 	}
 }

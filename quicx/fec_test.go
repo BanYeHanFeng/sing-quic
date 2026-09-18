@@ -9,8 +9,15 @@ func TestFECCapability(t *testing.T) {
 		t.Fatalf("expected no capability byte without FEC options, got %v", capability)
 	}
 	capability := fecCapability(&FECOptions{})
-	if len(capability) != 1 || capability[0] != fecCapabilityWindow || parseFECCapability(capability) != fecCapabilityWindow {
+	if len(capability) != 1 || capability[0] != fecCapabilityWindow|fecCapabilityMissingRanges || parseFECCapability(capability) != fecCapabilityWindow|fecCapabilityMissingRanges {
 		t.Fatalf("unexpected capability byte: %v", capability)
+	}
+	multi := fecCapability(&FECOptions{MultiWindow: true})
+	if len(multi) != 1 || multi[0] != fecCapabilityWindow|fecCapabilityMissingRanges|fecCapabilityMultiWindow {
+		t.Fatalf("unexpected multi-window capability: %v", multi)
+	}
+	if parseFECCapability(multi) != fecCapabilityWindow|fecCapabilityMissingRanges|fecCapabilityMultiWindow {
+		t.Fatalf("multi-window capability was not preserved: %v", parseFECCapability(multi))
 	}
 	if parseFECCapability(nil) != 0 {
 		t.Fatal("expected no FEC support for an empty capability")
@@ -51,5 +58,16 @@ func TestFECConfigFromOptions(t *testing.T) {
 	}
 	if !config.RecoveredPacketFeedback {
 		t.Fatalf("recovered packet feedback was not passed through: %+v", config)
+	}
+	if !config.ExtendedFeedback {
+		t.Fatalf("phase 2 build must not fall back to the v1 feedback frame: %+v", config)
+	}
+	adaptive := (&FECOptions{AdaptiveWindow: true}).config()
+	if !adaptive.AdaptiveWindow {
+		t.Fatalf("adaptive window was not passed through: %+v", adaptive)
+	}
+	multi := (&FECOptions{MultiWindow: true, MultiWindowCount: 9}).config()
+	if !multi.MultiWindow || multi.MultiWindowCount != 4 {
+		t.Fatalf("multi-window config was not passed through/clamped: %+v", multi)
 	}
 }

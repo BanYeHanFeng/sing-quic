@@ -69,6 +69,24 @@ type FECOptions struct {
 	// enabled on the receiving side, and the sending side has to understand the frame.
 	// The library zero value stays false; sing-box enables it by default.
 	RecoveredPacketFeedback bool
+	// ExtendedFeedback is the FEC_FEEDBACK_V2 capability bit (0x08). This build always
+	// advertises and enables it; the field is kept for API compatibility and test
+	// inspection, and there is no fallback to the cumulative v1 feedback frame.
+	ExtendedFeedback bool
+	// AdaptiveWindow adjusts the working window size to RTT and packet rate without a
+	// wire format change. MaxGroupSize remains the maximum; sing-box enables it by
+	// default and an explicit false pins the fixed window.
+	AdaptiveWindow bool
+	// MultiWindow splits one connection into MultiWindowCount independent sub-windows
+	// assigned by packet number modulo the count. It is exchanged as capability 0x04;
+	// sing-box enables it by default and both ends have to confirm the bit.
+	// MultiWindowCount defaults to 2 and is bounded by quic.MaxFECMultiWindowCount.
+	MultiWindow      bool
+	MultiWindowCount int
+	// RepairBurstRowsPerLoss is an internal phase 2 experiment knob: the number of
+	// repair rows scheduled per lost packet after a feedback report. Zero keeps the
+	// quic-go default (2.0).
+	RepairBurstRowsPerLoss float64
 }
 
 // fecCapabilityWindow is the FEC capability flag of the sliding window scheme, the only
@@ -77,7 +95,22 @@ type FECOptions struct {
 // keeps interoperating. The block scheme flag (0x01) is neither offered nor accepted
 // anymore: a block-only peer runs the connection without FEC instead of being sent
 // frames it can't decode.
-const fecCapabilityWindow = 0x02
+const (
+	fecCapabilityWindow = 0x02
+	// fecCapabilityMultiWindow is reserved for the phase 2 multi-window scheme. It is
+	// advertised only when the local endpoint is explicitly configured for it; the
+	// sliding window scheme above remains the fallback.
+	fecCapabilityMultiWindow = 0x04
+	// fecCapabilityMissingRanges extends FEC_FEEDBACK with the precise missing packet
+	// ranges of FEC_FEEDBACK_V2. A peer that only knows fecCapabilityWindow keeps the
+	// cumulative-counter feedback, and the connection still runs the window scheme.
+	fecCapabilityMissingRanges = 0x08
+)
+
+// fecCapabilityImplemented is the set of capability bits this version understands.
+// The server only confirms bits from this set, and the client rejects any bit outside
+// it so that a misbehaving server can not silently change the protocol it runs.
+const fecCapabilityImplemented = fecCapabilityWindow | fecCapabilityMultiWindow | fecCapabilityMissingRanges
 
 func (o *FECOptions) config() quic.FECConfig {
 	if o == nil {
@@ -89,7 +122,33 @@ func (o *FECOptions) config() quic.FECConfig {
 		MaxParityRows:             o.MaxParityRows,
 		BaselineRedundancyPercent: o.BaselineRedundancyPercent,
 		RecoveredPacketFeedback:   o.RecoveredPacketFeedback,
+		// Phase 2 is the only protocol this build speaks: FEC_FEEDBACK_V2 and
+		// FEC_WINDOW_REPAIR_MULTI are not negotiated down for old peers.
+		ExtendedFeedback:       true,
+		AdaptiveWindow:         o.AdaptiveWindow,
+		MultiWindow:            o.MultiWindow,
+		MultiWindowCount:       o.multiWindowCount(),
+		RepairBurstRowsPerLoss: o.RepairBurstRowsPerLoss,
 	}
+}
+
+// multiWindowCount returns the configured sub-window count, defaulting to 2 and
+// clamped to the protocol bound when multi-window is enabled.
+func (o *FECOptions) multiWindowCount() int {
+	if o == nil {
+		return 1
+	}
+	count := o.MultiWindowCount
+	if count <= 0 {
+		count = 2
+	}
+	if count > quic.MaxFECMultiWindowCount {
+		count = quic.MaxFECMultiWindowCount
+	}
+	if count < 2 {
+		count = 2
+	}
+	return count
 }
 
 // FEC capability flag, sent by the client at the end of its authentication request.
@@ -99,14 +158,18 @@ func fecCapability(options *FECOptions) []byte {
 	if options == nil {
 		return nil
 	}
-	return []byte{fecCapabilityWindow}
+	capability := byte(fecCapabilityWindow | fecCapabilityMissingRanges)
+	if options.MultiWindow {
+		capability |= fecCapabilityMultiWindow
+	}
+	return []byte{capability}
 }
 
 func parseFECCapability(data []byte) byte {
 	if len(data) == 0 {
 		return 0
 	}
-	return data[0] & fecCapabilityWindow
+	return data[0] & fecCapabilityImplemented
 }
 
 // enableFEC turns on packet level FEC on the client side, once the server confirmed the
@@ -117,10 +180,11 @@ func (c *Client) enableFEC(conn *clientQUICConnection, scheme byte) error {
 	if c.fec == nil {
 		return nil
 	}
-	if scheme != fecCapabilityWindow {
-		// The server picked a scheme this client didn't offer. Without FEC the
-		// connection still works; with a scheme it didn't implement it wouldn't.
-		c.logger.Debug("QUICX FEC not enabled (client, ", fecPeer(conn.quicConn), ", peer selected an unsupported scheme)")
+	if scheme&(fecCapabilityWindow|fecCapabilityMissingRanges) != fecCapabilityWindow|fecCapabilityMissingRanges || scheme&^fecCapabilityImplemented != 0 {
+		// This build only speaks the phase 2 capability set. A peer that does not
+		// confirm FEC_FEEDBACK_V2 is not supported; FEC stays off instead of falling
+		// back to the cumulative v1 feedback frame.
+		c.logger.Debug("QUICX FEC not enabled (client, ", fecPeer(conn.quicConn), ", peer did not confirm the phase 2 capability set)")
 		return nil
 	}
 	if conn.quicConn.FECStats().Enabled {
@@ -131,7 +195,15 @@ func (c *Client) enableFEC(conn *clientQUICConnection, scheme byte) error {
 	case <-c.ctx.Done():
 		return context.Cause(c.ctx)
 	}
-	err := conn.quicConn.EnableFEC(c.fec.config())
+	config := c.fec.config()
+	// Pure phase 2: V2 feedback is mandatory, so it is always used. Multi-window is a
+	// new-feature negotiation: it runs only when both sides confirmed 0x04.
+	config.ExtendedFeedback = true
+	config.MultiWindow = scheme&fecCapabilityMultiWindow != 0
+	if config.MultiWindow {
+		config.MultiWindowCount = c.fec.multiWindowCount()
+	}
+	err := conn.quicConn.EnableFEC(config)
 	if err != nil {
 		return err
 	}
@@ -157,8 +229,18 @@ func fecLimits(options *FECOptions) string {
 	if options.BaselineRedundancyPercent > 0 {
 		limits += fmt.Sprintf(", baseline %d%%", options.BaselineRedundancyPercent)
 	}
+	limits += ", extended feedback"
 	if options.RecoveredPacketFeedback {
 		limits += ", recovered feedback"
+	}
+	if options.AdaptiveWindow {
+		limits += ", adaptive window"
+	}
+	if options.MultiWindow {
+		limits += fmt.Sprintf(", multi-window %d", options.multiWindowCount())
+	}
+	if options.RepairBurstRowsPerLoss > 0 {
+		limits += fmt.Sprintf(", repair burst %.1f rows/loss", options.RepairBurstRowsPerLoss)
 	}
 	if options.MaxGroupSize > 0 {
 		limits += fmt.Sprintf(", window %d", options.MaxGroupSize)
@@ -195,9 +277,19 @@ func (s *serverSession[U]) startFEC(clientCapability byte) {
 	if options == nil {
 		return
 	}
-	if clientCapability&fecCapabilityWindow == 0 {
-		s.logger.Debug("QUICX FEC not enabled (server, ", fecPeer(s.quicConn), ", no scheme in common with the client)")
+	// A phase 2 peer must offer both the window scheme and the precise-feedback
+	// extension. There is no fallback to the cumulative v1 feedback frame for a peer
+	// that only announces 0x02.
+	if clientCapability&(fecCapabilityWindow|fecCapabilityMissingRanges) != fecCapabilityWindow|fecCapabilityMissingRanges {
+		s.logger.Debug("QUICX FEC not enabled (server, ", fecPeer(s.quicConn), ", peer does not support the phase 2 capability set)")
 		return
+	}
+	// Multi-window is negotiated among phase 2 peers: both sides have to advertise
+	// 0x04. The base window and missing-range feedback are mandatory and always
+	// confirmed.
+	selected := clientCapability & (fecCapabilityWindow | fecCapabilityMissingRanges)
+	if options.MultiWindow && clientCapability&fecCapabilityMultiWindow != 0 {
+		selected |= fecCapabilityMultiWindow
 	}
 	go func() {
 		select {
@@ -205,7 +297,13 @@ func (s *serverSession[U]) startFEC(clientCapability byte) {
 		case <-s.ctx.Done():
 			return
 		}
-		if err := s.quicConn.EnableFEC(options.config()); err != nil {
+		config := options.config()
+		config.ExtendedFeedback = true
+		config.MultiWindow = selected&fecCapabilityMultiWindow != 0
+		if config.MultiWindow {
+			config.MultiWindowCount = options.multiWindowCount()
+		}
+		if err := s.quicConn.EnableFEC(config); err != nil {
 			s.logger.Debug(E.Cause(err, "enable FEC"))
 			return
 		}
@@ -213,7 +311,7 @@ func (s *serverSession[U]) startFEC(clientCapability byte) {
 		// to be written before FEC is reported as enabled. Otherwise a failed
 		// notification would be logged as a success while the client keeps running
 		// without FEC - and the server sends parity packets the client ignores.
-		if err := s.notifyFECAccept(); err != nil {
+		if err := s.notifyFECAccept(selected); err != nil {
 			s.logger.Error(E.Cause(err, "notify FEC accept"))
 			return
 		}
@@ -231,12 +329,12 @@ func (s *serverSession[U]) startFEC(clientCapability byte) {
 // scheme it runs, by sending CommandFECAccept on a unidirectional stream. The scheme
 // byte is the capability flag of the sliding window scheme; clients that read it
 // accept the connection only when it is a scheme they offered.
-func (s *serverSession[U]) notifyFECAccept() error {
+func (s *serverSession[U]) notifyFECAccept(capability byte) error {
 	stream, err := s.quicConn.OpenUniStream()
 	if err != nil {
 		return E.Cause(err, "open stream")
 	}
-	_, err = stream.Write([]byte{Version, CommandFECAccept, fecCapabilityWindow})
+	_, err = stream.Write([]byte{Version, CommandFECAccept, capability})
 	closeErr := stream.Close()
 	if err != nil {
 		return E.Cause(err, "write request")
@@ -371,16 +469,35 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 	repairBursts := delta(previous.RepairBursts, current.RepairBursts)
 	repairBurstRows := delta(previous.RepairBurstRowsSent, current.RepairBurstRowsSent)
 	repairBurstSkipped := delta(previous.RepairBurstRowsSkipped, current.RepairBurstRowsSkipped)
+	repairBurstRowsScheduled := delta(previous.RepairBurstRowsScheduled, current.RepairBurstRowsScheduled)
+	repairBurstSkippedBudget := delta(previous.RepairBurstRowsSkippedBudget, current.RepairBurstRowsSkippedBudget)
+	repairBurstSkippedNoWindow := delta(previous.RepairBurstRowsSkippedNoWindow, current.RepairBurstRowsSkippedNoWindow)
+	missingRanges := delta(previous.MissingRangesReceived, current.MissingRangesReceived)
+	missingInWindow := delta(previous.MissingPacketsInWindow, current.MissingPacketsInWindow)
+	missingRepairable := delta(previous.MissingPacketsRepairable, current.MissingPacketsRepairable)
 	missingChanged := current.MissingPackets != previous.MissingPackets
 	if protectedSent == 0 && paritySent == 0 && parityBytes == 0 && parityReceived == 0 &&
 		repaired == 0 && failed == 0 && skipped == 0 && dropped == 0 && !missingChanged &&
 		duplicates == 0 && recoveredReported == 0 && recoveredReceived == 0 &&
-		repairBursts == 0 && repairBurstRows == 0 && repairBurstSkipped == 0 {
+		repairBursts == 0 && repairBurstRows == 0 && repairBurstSkipped == 0 &&
+		repairBurstRowsScheduled == 0 && repairBurstSkippedBudget == 0 && repairBurstSkippedNoWindow == 0 &&
+		missingRanges == 0 && missingInWindow == 0 && missingRepairable == 0 {
 		return "", false
 	}
 	state := "idle"
 	if current.WindowSize > 0 {
 		state = fmt.Sprintf("window %d pkts", current.WindowSize)
+		if current.AdaptiveWindow && current.WindowMaxSize > 0 {
+			// The working window, not the configured protocol maximum, is what the
+			// line reports while the window follows the path. Printing both makes it
+			// possible to see when the adaptive controller has room left to grow.
+			state = fmt.Sprintf("window %d/%d pkts (rtt-adaptive)", current.WindowSize, current.WindowMaxSize)
+		}
+		if current.WindowCount > 1 {
+			// Each sub-window keeps the configured window, so the effective window is
+			// the product. Printing both keeps the phase 2 multi-window field visible.
+			state += fmt.Sprintf(", %d sub-windows (effective %d pkts)", current.WindowCount, current.EffectiveWindowSize)
+		}
 	}
 	// The measured value is the one the cap applies to. It has to be printed even when
 	// FEC is idle at the moment of the tick: parity can have been sent earlier in the
@@ -407,11 +524,32 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 	// they are the direct answer to "the loss is already reported; are there enough
 	// rows to repair it before the window expires".
 	burstPart := ""
-	if repairBursts > 0 || repairBurstRows > 0 || repairBurstSkipped > 0 {
-		burstPart = fmt.Sprintf(", burst %d rows", repairBurstRows)
-		if repairBurstSkipped > 0 {
-			burstPart += fmt.Sprintf(" (%d skipped)", repairBurstSkipped)
+	if repairBursts > 0 || repairBurstRows > 0 || repairBurstSkipped > 0 || repairBurstRowsScheduled > 0 {
+		if repairBurstRowsScheduled > repairBurstRows {
+			burstPart = fmt.Sprintf(", burst %d/%d rows", repairBurstRows, repairBurstRowsScheduled)
+		} else {
+			burstPart = fmt.Sprintf(", burst %d rows", repairBurstRows)
 		}
+		if repairBurstSkipped > 0 {
+			burstPart += fmt.Sprintf(" (%d skipped", repairBurstSkipped)
+			if repairBurstSkippedBudget > 0 || repairBurstSkippedNoWindow > 0 {
+				burstPart += fmt.Sprintf(": %d budget, %d no-window", repairBurstSkippedBudget, repairBurstSkippedNoWindow)
+			}
+			burstPart += ")"
+		}
+	}
+	// P4 observation fields: the packet rate, the highest peer loss peak and the
+	// feedback latency are printed when they are set, without changing the meaning of
+	// the decision fields above.
+	observationPart := ""
+	if current.ProtectedPacketRate > 0 {
+		observationPart += fmt.Sprintf(", %.0f pps protected", current.ProtectedPacketRate)
+	}
+	if current.PeerLossPeak > 0 {
+		observationPart += fmt.Sprintf(", peer loss peak %.1f%%", current.PeerLossPeak*100)
+	}
+	if current.FeedbackLatency > 0 {
+		observationPart += fmt.Sprintf(", feedback latency %s", current.FeedbackLatency.Round(100*time.Microsecond))
 	}
 	// RTT inflation is the queueing delay the connection sees. While FEC is recovering
 	// packets, a value that grows with the redundancy is evidence of congestion rather
@@ -444,17 +582,21 @@ func formatFECStats(previous, current quic.FECStats) (line string, notable bool)
 	if recoveredReported > 0 {
 		rxPart += fmt.Sprintf(", recovered reported %d", recoveredReported)
 	}
+	if missingRanges > 0 {
+		rxPart += fmt.Sprintf(", missing-ranges %d (%d in window, %d repairable)", missingRanges, missingInWindow, missingRepairable)
+	}
 	// Missing packets with no repair row arriving in the window are notable even
 	// without a repair or failure counter: that is the case the field logs missed.
 	notable = repaired > 0 || failed > 0 || duplicates > 0 ||
 		(current.MissingPackets > 0 && parityReceived == 0) ||
 		recoveredReported > 0 || recoveredReceived > 0 ||
-		repairBurstRows > 0 || repairBurstSkipped > 0
+		repairBurstRows > 0 || repairBurstSkipped > 0 || repairBurstRowsScheduled > 0 ||
+		repairBurstSkippedBudget > 0 || repairBurstSkippedNoWindow > 0 || missingRanges > 0
 	return fmt.Sprintf(
-		"QUICX FEC: tx loss %.1f%% (peer reported), %s%s, protected %d pkts (%s), parity %d pkts (%s), %s, dropped %d frames%s%s%s; %s",
+		"QUICX FEC: tx loss %.1f%% (peer reported), %s%s, protected %d pkts (%s), parity %d pkts (%s), %s, dropped %d frames%s%s%s%s; %s",
 		current.LossRate*100, state, overhead,
 		protectedSent, humanBytes(protectedBytes), paritySent, humanBytes(parityBytes),
-		skippedPart, dropped, recoveredPart, rttPart, burstPart, rxPart,
+		skippedPart, dropped, recoveredPart, rttPart, burstPart, observationPart, rxPart,
 	), notable
 }
 

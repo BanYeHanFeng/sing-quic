@@ -32,7 +32,7 @@ func (c *Client) handleUniStream(conn *clientQUICConnection, stream *quic.Receiv
 		// Ignore anything else (e.g. HTTP/3 control streams of a standard server).
 		return
 	}
-	if header[2] != fecCapabilityWindow {
+	if header[2]&fecCapabilityWindow == 0 || header[2]&^fecCapabilityImplemented != 0 {
 		c.logger.Debug("QUICX FEC not enabled (client, ", fecPeer(conn.quicConn), ", peer confirmed an unsupported scheme)")
 		return
 	}
