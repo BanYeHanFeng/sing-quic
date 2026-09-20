@@ -2,6 +2,7 @@ package quicx
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
+	"github.com/sagernet/quic-go/qlogwriter"
 	qtls "github.com/sagernet/sing-quic"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	"github.com/sagernet/sing/common"
@@ -32,6 +34,7 @@ type ClientOptions struct {
 	Password      string
 	Heartbeat     time.Duration
 	BBRProfile    string
+	Tracer        func(ctx context.Context, isClient bool, connID quic.ConnectionID) qlogwriter.Trace
 }
 
 type Client struct {
@@ -61,8 +64,17 @@ func NewClient(options ClientOptions) (*Client, error) {
 		DisablePathMTUDiscovery: !(runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin"),
 		EnableDatagrams:         true,
 		MaxIncomingUniStreams:   1 << 60,
+		Tracer:                  options.Tracer,
 	}
 	qtls.ApplyQUICOptions(quicConfig, options.QUICOptions)
+	// 0-RTT requires resuming a previous TLS session, which in turn requires a
+	// session ticket cache: without it the client never requests a session
+	// ticket, and quic-go has no ticket to resume from.
+	if sessionCacheSetter, isSessionCacheSetter := options.TLSConfig.(sessionCacheSetter); isSessionCacheSetter {
+		sessionCacheSetter.SetClientSessionCache(tls.NewLRUClientSessionCache(0))
+	} else if stdConfig, sErr := options.TLSConfig.STDConfig(); sErr == nil {
+		stdConfig.ClientSessionCache = tls.NewLRUClientSessionCache(0)
+	}
 	if len(options.TLSConfig.NextProtos()) == 0 {
 		options.TLSConfig.SetNextProtos([]string{http3.NextProtoH3})
 	}
@@ -76,6 +88,12 @@ func NewClient(options ClientOptions) (*Client, error) {
 		heartbeat:  options.Heartbeat,
 		bbrProfile: bbrProfile,
 	}, nil
+}
+
+// sessionCacheSetter is implemented by TLS configs which allow their underlying
+// crypto/tls or uTLS configuration to be adjusted.
+type sessionCacheSetter interface {
+	SetClientSessionCache(cache tls.ClientSessionCache)
 }
 
 func (c *Client) offer(ctx context.Context) (*clientQUICConnection, error) {
@@ -275,28 +293,34 @@ func (c *Client) CloseWithError(err error) error {
 	return nil
 }
 
-func openUniStream0RTT(ctx context.Context, conn *quic.Conn) (*quic.SendStream, error) {
-	stream, err := conn.OpenUniStream()
-	if errors.Is(err, quic.Err0RTTRejected) {
-		_, nerr := conn.NextConnection(ctx)
-		if nerr != nil {
-			return nil, nerr
-		}
-		return conn.OpenUniStream()
-	}
-	return stream, err
-}
-
+// openStream0RTT opens a bidirectional stream, recovering from a rejected 0-RTT
+// attempt. quic-go reports quic.Err0RTTRejected from OpenStream until the
+// handshake completes and the stream maps are reset, so the stream has to be
+// opened again afterwards. On a connection without a resumed session no early
+// data is sent and quic.Err0RTTRejected never occurs, in which case both helpers
+// are equivalent to a plain OpenStream / OpenUniStream call.
 func openStream0RTT(ctx context.Context, conn *quic.Conn) (*quic.Stream, error) {
 	stream, err := conn.OpenStream()
-	if errors.Is(err, quic.Err0RTTRejected) {
-		_, nerr := conn.NextConnection(ctx)
-		if nerr != nil {
-			return nil, nerr
-		}
-		return conn.OpenStream()
+	if !errors.Is(err, quic.Err0RTTRejected) {
+		return stream, err
 	}
-	return stream, err
+	_, nerr := conn.NextConnection(ctx)
+	if nerr != nil {
+		return nil, nerr
+	}
+	return conn.OpenStream()
+}
+
+func openUniStream0RTT(ctx context.Context, conn *quic.Conn) (*quic.SendStream, error) {
+	stream, err := conn.OpenUniStream()
+	if !errors.Is(err, quic.Err0RTTRejected) {
+		return stream, err
+	}
+	_, nerr := conn.NextConnection(ctx)
+	if nerr != nil {
+		return nil, nerr
+	}
+	return conn.OpenUniStream()
 }
 
 type clientOffer struct {
