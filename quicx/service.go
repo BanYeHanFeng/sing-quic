@@ -32,6 +32,12 @@ const (
 	AuthFailurePolicySilentDrop = "silent_drop"
 )
 
+// errAlreadyAuthenticated is returned for a second authentication stream on a
+// session which already completed authentication. It is not fatal: the first
+// stream authenticated the session, so a peer racing two authentication
+// streams (or a buggy client) must not tear the session down.
+var errAlreadyAuthenticated = E.New("authentication: multiple authentication requests")
+
 type ServiceOptions struct {
 	Context           context.Context
 	Logger            logger.Logger
@@ -186,6 +192,7 @@ type serverSession[U comparable] struct {
 	connAccess sync.Mutex
 	connDone   chan struct{}
 	connErr    error
+	authAccess sync.Mutex
 	authDone   chan struct{}
 	authUser   U
 	udpAccess  sync.RWMutex
@@ -229,12 +236,20 @@ func (s *serverSession[U]) loopUniStreams() {
 		if err != nil {
 			return
 		}
-		go func() {
-			err = s.handleUniStream(uniStream)
-			if err != nil {
-				s.closeWithError(E.Cause(err, "handle uni stream"))
+		go func(stream *quic.ReceiveStream) {
+			err := s.handleUniStream(stream)
+			if err == nil {
+				return
 			}
-		}()
+			if errors.Is(err, errAlreadyAuthenticated) {
+				// The session is already authenticated by another stream, so
+				// this duplicate request is a no-op instead of a session
+				// teardown.
+				s.logger.Debug(E.Cause(err, "handle uni stream"))
+				return
+			}
+			s.closeWithError(E.Cause(err, "handle uni stream"))
+		}(uniStream)
 	}
 }
 
@@ -276,11 +291,6 @@ func (s *serverSession[U]) handleQUICXUniStream(stream *quic.ReceiveStream) erro
 	command := buffer.Byte(1)
 	switch command {
 	case CommandAuthenticate:
-		select {
-		case <-s.authDone:
-			return E.New("authentication: multiple authentication requests")
-		default:
-		}
 		// Authentication request message:
 		// [version(1)][command(1)][password length(2)][password(variable)]
 		if buffer.Len() < 4 {
@@ -304,9 +314,7 @@ func (s *serverSession[U]) handleQUICXUniStream(stream *quic.ReceiveStream) erro
 		if !loaded {
 			return s.authFailure(E.New("authentication: unknown user"))
 		}
-		s.authUser = user
-		close(s.authDone)
-		return nil
+		return s.completeAuthentication(user)
 	case CommandDissociate:
 		select {
 		case <-s.connDone:
@@ -342,15 +350,15 @@ func (s *serverSession[U]) loopStreams() {
 		if err != nil {
 			return
 		}
-		go func() {
-			err = s.handleStream(stream)
+		go func(stream *quic.Stream) {
+			err := s.handleStream(stream)
 			if err != nil {
 				stream.CancelRead(0)
 				stream.Close()
 				s.logger.Error(E.Cause(err, "handle stream request"))
 				s.closeWithError(E.Cause(err, "handle stream request"))
 			}
-		}()
+		}(stream)
 	}
 }
 
@@ -429,6 +437,25 @@ func (s *serverSession[U]) loopHeartbeats() {
 func (s *serverSession[U]) authFailure(err error) error {
 	s.closeByPolicy(err)
 	return err
+}
+
+// completeAuthentication publishes the authenticated user and signals authDone
+// exactly once. The check and the state change have to be atomic: two
+// authentication streams racing on one connection would otherwise both observe
+// an unauthenticated session and execute close(s.authDone) twice, panicking with
+// "close of closed channel" and taking the whole process down. Later readers
+// observe authUser through the happens-before edge of the channel close.
+func (s *serverSession[U]) completeAuthentication(user U) error {
+	s.authAccess.Lock()
+	defer s.authAccess.Unlock()
+	select {
+	case <-s.authDone:
+		return errAlreadyAuthenticated
+	default:
+	}
+	s.authUser = user
+	close(s.authDone)
+	return nil
 }
 
 // closeByPolicy terminates a session that is not a valid authenticated QUICX
