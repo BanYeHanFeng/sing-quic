@@ -468,37 +468,44 @@ func (s *serverSession[U]) closeByPolicy(err error) {
 		// indistinguishable from a standard HTTP/3 server. A GOAWAY frame is
 		// intentionally not sent: the session ends before any request was
 		// served.
-		s.closeWithErrorCode(quic.ApplicationErrorCode(http3.ErrCodeNoError), "")
+		s.closeSession(quic.ApplicationErrorCode(http3.ErrCodeNoError), "", err)
 	case AuthFailurePolicySilentDrop:
 		s.silentClose(err)
 	}
 }
 
 func (s *serverSession[U]) closeWithError(err error) {
-	s.closeWithErrorCode(quic.ApplicationErrorCode(http3.ErrCodeNoError), "")
+	s.closeSession(quic.ApplicationErrorCode(http3.ErrCodeNoError), "", err)
 }
 
-func (s *serverSession[U]) closeWithErrorCode(code quic.ApplicationErrorCode, desc string) {
+// closeSession terminates the session exactly once and keeps cause as the
+// session error, so callers of connDone still observe why it ended. Replacing
+// it with a generic "connection closed" loses the real reason and reports
+// normal closes (canceled contexts, closed pipes, ...) as ERROR level.
+func (s *serverSession[U]) closeSession(code quic.ApplicationErrorCode, desc string, cause error) {
 	s.connAccess.Lock()
 	defer s.connAccess.Unlock()
 	select {
 	case <-s.connDone:
 		return
 	default:
-		s.connErr = E.New("connection closed")
-		close(s.connDone)
 	}
-	if E.IsClosedOrCanceled(s.connErr) {
-		s.logger.Debug(E.Cause(s.connErr, "connection failed"))
+	if cause == nil {
+		cause = E.New("connection closed")
+	}
+	s.connErr = cause
+	close(s.connDone)
+	if isNormalSessionEnd(cause) {
+		s.logger.Debug(E.Cause(cause, "connection closed"))
 	} else {
-		s.logger.Error(E.Cause(s.connErr, "connection failed"))
+		s.logger.Error(E.Cause(cause, "connection failed"))
 	}
 	s.udpAccess.Lock()
 	udpConnMap := s.udpConnMap
 	s.udpConnMap = make(map[uint16]*udpPacketConn)
 	s.udpAccess.Unlock()
 	for _, udpConn := range udpConnMap {
-		udpConn.closeWithError(s.connErr)
+		udpConn.closeWithError(cause)
 	}
 	_ = s.quicConn.CloseWithError(code, desc)
 	_ = s.h3Conn.CloseWithError(code, desc)
@@ -525,6 +532,29 @@ func (s *serverSession[U]) silentClose(err error) {
 	s.cancel(err)
 	// Do not close the QUIC connection: a probe must observe a timeout,
 	// not a protocol-identifiable CONNECTION_CLOSE.
+}
+
+// isNormalSessionEnd reports whether a session ended without a protocol or
+// transport failure, in which case it must not be reported as an error. The
+// QUIC error types below describe a peer which closed the connection on purpose,
+// an idle timeout and a stateless reset, none of which is an application error.
+func isNormalSessionEnd(err error) bool {
+	if E.IsClosedOrCanceled(err) {
+		return true
+	}
+	var applicationErr *quic.ApplicationError
+	if errors.As(err, &applicationErr) {
+		return true
+	}
+	var idleTimeoutErr *quic.IdleTimeoutError
+	if errors.As(err, &idleTimeoutErr) {
+		return true
+	}
+	var statelessResetErr *quic.StatelessResetError
+	if errors.As(err, &statelessResetErr) {
+		return true
+	}
+	return false
 }
 
 type serverConn struct {
