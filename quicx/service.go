@@ -9,6 +9,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -57,6 +58,13 @@ type ServiceOptions struct {
 	// reclamation timer a peer sending keepalives would pin the session
 	// resources until the QUIC idle timeout expires.
 	SilentDropTimeout time.Duration
+	// ReplayCacheSize is how many authentication nonces the service remembers
+	// to reject a replayed 0-RTT flight. The default is 65536 sessions.
+	ReplayCacheSize int
+	// ReplayCacheTTL is how long an authentication nonce is remembered. The
+	// default is 24 hours, which matches how long crypto/tls keeps the session
+	// ticket keys a 0-RTT attempt resumes from.
+	ReplayCacheTTL    time.Duration
 	Handler           ServiceHandler
 	AuthFailurePolicy string
 	BBRProfile        string
@@ -82,6 +90,8 @@ type Service[U comparable] struct {
 	authFailurePolicy string
 	silentDropTimeout time.Duration
 	bbrProfile        congestion_meta2.Profile
+	replayCache       *replayCache
+	sessionSeq        atomic.Uint64
 
 	quicListener io.Closer
 }
@@ -140,6 +150,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		authFailurePolicy: options.AuthFailurePolicy,
 		silentDropTimeout: options.SilentDropTimeout,
 		bbrProfile:        bbrProfile,
+		replayCache:       newReplayCache(options.ReplayCacheSize, options.ReplayCacheTTL),
 	}, nil
 }
 
@@ -214,6 +225,7 @@ func (s *Service[U]) handleConnection(connection *quic.Conn) {
 		connDone:   make(chan struct{}),
 		authDone:   make(chan struct{}),
 		udpConnMap: make(map[uint16]*udpPacketConn),
+		sessionID:  s.sessionSeq.Add(1),
 	}
 	session.handle()
 }
@@ -232,6 +244,9 @@ type serverSession[U comparable] struct {
 	authUser   U
 	udpAccess  sync.RWMutex
 	udpConnMap map[uint16]*udpPacketConn
+	// sessionID identifies this session to the replay cache: a nonce which was
+	// recorded by another session is a replayed 0-RTT flight.
+	sessionID uint64
 
 	authTimeoutOnce sync.Once
 }
@@ -328,6 +343,7 @@ func (s *serverSession[U]) handleQUICXUniStream(stream *quic.ReceiveStream) erro
 	case CommandAuthenticate:
 		// Authentication request message:
 		// [version(1)][command(1)][password length(2)][password(variable)]
+		// [nonce(AuthNonceLen)]
 		if buffer.Len() < 4 {
 			_, err = buffer.ReadFullFrom(stream, 4-buffer.Len())
 			if err != nil {
@@ -338,16 +354,28 @@ func (s *serverSession[U]) handleQUICXUniStream(stream *quic.ReceiveStream) erro
 		if passwordLen == 0 {
 			return E.New("authentication: empty password")
 		}
-		if buffer.Len() < 4+passwordLen {
-			_, err = buffer.ReadFullFrom(stream, 4+passwordLen-buffer.Len())
+		requestLen := 4 + passwordLen + AuthNonceLen
+		if buffer.Len() < requestLen {
+			_, err = buffer.ReadFullFrom(stream, requestLen-buffer.Len())
 			if err != nil {
 				return E.Cause(err, "authentication: read request")
 			}
 		}
 		password := string(buffer.Range(4, 4+passwordLen))
+		var nonce [AuthNonceLen]byte
+		copy(nonce[:], buffer.Range(4+passwordLen, requestLen))
+		if nonce == ([AuthNonceLen]byte{}) {
+			return E.New("authentication: missing nonce")
+		}
 		user, loaded := s.lookupUser(password)
 		if !loaded {
 			return s.authFailure(E.New("authentication: unknown user"))
+		}
+		// A replayed 0-RTT flight authenticates with the password it captured,
+		// so the nonce is what identifies it as a copy: it was recorded by the
+		// session it was captured from and must not be accepted for this one.
+		if s.replayCache.checkAndRecord(nonce, s.sessionID) {
+			return s.authFailure(E.New("authentication: replayed authentication request"))
 		}
 		return s.completeAuthentication(user)
 	case CommandDissociate:
