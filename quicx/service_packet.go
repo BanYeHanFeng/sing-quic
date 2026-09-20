@@ -57,12 +57,11 @@ func (s *serverSession[U]) handleUDPMessage(message *udpMessage) error {
 	udpConn, loaded := s.udpConnMap[sessionID]
 	s.udpAccess.RUnlock()
 	if !loaded || common.Done(udpConn.ctx) {
-		udpConn = newUDPPacketConn(auth.ContextWithUser(s.ctx, s.authUser), s.quicConn, true, func() {
+		udpConn = newUDPPacketConn(auth.ContextWithUser(s.ctx, s.authUser), s.quicConn, sessionID, true, func() {
 			s.udpAccess.Lock()
 			delete(s.udpConnMap, sessionID)
 			s.udpAccess.Unlock()
 		})
-		udpConn.sessionID = sessionID
 		s.udpAccess.Lock()
 		s.udpConnMap[sessionID] = udpConn
 		s.udpAccess.Unlock()
