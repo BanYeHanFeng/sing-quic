@@ -30,6 +30,10 @@ import (
 const (
 	AuthFailurePolicyH3Close    = "h3_close"
 	AuthFailurePolicySilentDrop = "silent_drop"
+
+	// defaultSilentDropTimeout is how long a silently dropped session is kept
+	// before its QUIC connection is reclaimed locally.
+	defaultSilentDropTimeout = 30 * time.Second
 )
 
 // errAlreadyAuthenticated is returned for a second authentication stream on a
@@ -39,13 +43,20 @@ const (
 var errAlreadyAuthenticated = E.New("authentication: multiple authentication requests")
 
 type ServiceOptions struct {
-	Context           context.Context
-	Logger            logger.Logger
-	TLSConfig         aTLS.ServerConfig
-	QUICOptions       qtls.QUICOptions
-	AuthTimeout       time.Duration
-	Heartbeat         time.Duration
-	UDPTimeout        time.Duration
+	Context     context.Context
+	Logger      logger.Logger
+	TLSConfig   aTLS.ServerConfig
+	QUICOptions qtls.QUICOptions
+	AuthTimeout time.Duration
+	Heartbeat   time.Duration
+	UDPTimeout  time.Duration
+	// SilentDropTimeout is how long a session closed by
+	// AuthFailurePolicySilentDrop keeps its QUIC connection before it is
+	// reclaimed locally. No CONNECTION_CLOSE is sent before that, so a probe
+	// observes a timeout instead of a protocol-identifiable close; without a
+	// reclamation timer a peer sending keepalives would pin the session
+	// resources until the QUIC idle timeout expires.
+	SilentDropTimeout time.Duration
 	Handler           ServiceHandler
 	AuthFailurePolicy string
 	BBRProfile        string
@@ -69,6 +80,7 @@ type Service[U comparable] struct {
 	udpTimeout        time.Duration
 	handler           ServiceHandler
 	authFailurePolicy string
+	silentDropTimeout time.Duration
 	bbrProfile        congestion_meta2.Profile
 
 	quicListener io.Closer
@@ -87,6 +99,9 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	}
 	if options.AuthFailurePolicy == "" {
 		options.AuthFailurePolicy = AuthFailurePolicyH3Close
+	}
+	if options.SilentDropTimeout == 0 {
+		options.SilentDropTimeout = defaultSilentDropTimeout
 	}
 	switch options.AuthFailurePolicy {
 	case AuthFailurePolicyH3Close, AuthFailurePolicySilentDrop:
@@ -117,6 +132,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		udpTimeout:        options.UDPTimeout,
 		handler:           options.Handler,
 		authFailurePolicy: options.AuthFailurePolicy,
+		silentDropTimeout: options.SilentDropTimeout,
 		bbrProfile:        bbrProfile,
 	}, nil
 }
@@ -526,14 +542,15 @@ func (s *serverSession[U]) closeSession(code quic.ApplicationErrorCode, desc str
 
 func (s *serverSession[U]) silentClose(err error) {
 	s.connAccess.Lock()
-	defer s.connAccess.Unlock()
 	select {
 	case <-s.connDone:
+		s.connAccess.Unlock()
 		return
 	default:
 		s.connErr = err
 		close(s.connDone)
 	}
+	s.connAccess.Unlock()
 	s.logger.Debug(E.Cause(err, "connection dropped silently"))
 	s.udpAccess.Lock()
 	udpConnMap := s.udpConnMap
@@ -543,8 +560,11 @@ func (s *serverSession[U]) silentClose(err error) {
 		udpConn.closeWithError(err)
 	}
 	s.cancel(err)
-	// Do not close the QUIC connection: a probe must observe a timeout,
-	// not a protocol-identifiable CONNECTION_CLOSE.
+	// Do not close the QUIC connection: a probe must observe a timeout, not a
+	// protocol-identifiable CONNECTION_CLOSE. Keep the connection open for a
+	// grace period only, so that a peer sending keepalives cannot pin the
+	// session resources until the QUIC idle timeout expires.
+	s.scheduleSilentReclaim()
 }
 
 // isNormalSessionEnd reports whether a session ended without a protocol or
@@ -568,6 +588,24 @@ func isNormalSessionEnd(err error) bool {
 		return true
 	}
 	return false
+}
+
+// scheduleSilentReclaim tears the QUIC connection down locally after
+// silentDropTimeout. It gives up as soon as the connection is gone by itself.
+func (s *serverSession[U]) scheduleSilentReclaim() {
+	timeout := s.silentDropTimeout
+	if timeout <= 0 {
+		return
+	}
+	go func() {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			_ = s.quicConn.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeNoError), "")
+		case <-s.quicConn.Context().Done():
+		}
+	}()
 }
 
 type serverConn struct {
