@@ -96,6 +96,10 @@ const (
 	// maxFragmentCount is the maximum number of fragments a UDP message may be
 	// split into: fragmentTotal is a single byte on the wire.
 	maxFragmentCount = 255
+	// maxDefragmentSize is the maximum size of a reassembled UDP message. The
+	// length field of a UDP message is a uint16, so larger messages cannot be
+	// represented on the wire.
+	maxDefragmentSize = 0xffff
 )
 
 // fragUDPMessage splits message so that every fragment fits into maxPacketSize
@@ -313,23 +317,27 @@ func (c *udpPacketConn) writeFragments(message *udpMessage, udpMTU int) error {
 	return c.writePackets(fragments)
 }
 
-func (c *udpPacketConn) inputPacket(message *udpMessage) {
+func (c *udpPacketConn) inputPacket(message *udpMessage) error {
 	if message.fragmentTotal <= 1 {
 		select {
 		case c.data <- message:
 		default:
 			message.releaseMessage()
 		}
-	} else {
-		newMessage := c.defragger.feed(message)
-		if newMessage != nil {
-			select {
-			case c.data <- newMessage:
-			default:
-				newMessage.releaseMessage()
-			}
+		return nil
+	}
+	newMessage, err := c.defragger.feed(message)
+	if err != nil {
+		return err
+	}
+	if newMessage != nil {
+		select {
+		case c.data <- newMessage:
+		default:
+			newMessage.releaseMessage()
 		}
 	}
+	return nil
 }
 
 func (c *udpPacketConn) writePackets(messages []*udpMessage) error {
@@ -412,57 +420,80 @@ type packetItem struct {
 	access   sync.Mutex
 	messages []*udpMessage
 	count    uint8
+	length   int
 }
 
-func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
+// feed adds a fragment to its reassembly buffer and returns the complete
+// message once the last fragment arrived. Every error is a protocol violation
+// reported by the peer.
+func (d *udpDefragger) feed(m *udpMessage) (*udpMessage, error) {
 	if m.fragmentTotal <= 1 {
-		return m
+		return m, nil
 	}
-	if m.fragmentID >= m.fragmentTotal {
+	// The message is returned to the pool as soon as it was buffered, so every
+	// field which is used afterwards has to be captured first.
+	packetID := m.packetID
+	fragmentID := m.fragmentID
+	fragmentTotal := m.fragmentTotal
+	if fragmentID >= fragmentTotal {
 		m.releaseMessage()
-		return nil
+		return nil, E.New("invalid fragment ", fragmentID, " of ", fragmentTotal)
 	}
-	item, _ := d.packetMap.LoadOrStore(m.packetID, newPacketItem)
+	item, _ := d.packetMap.LoadOrStore(packetID, newPacketItem)
 	item.access.Lock()
-	defer item.access.Unlock()
-	if int(m.fragmentTotal) != len(item.messages) {
+	if len(item.messages) != int(fragmentTotal) {
 		releaseMessages(item.messages)
-		item.messages = make([]*udpMessage, m.fragmentTotal)
-		item.count = 1
-		item.messages[m.fragmentID] = m
-		return nil
+		item.messages = make([]*udpMessage, fragmentTotal)
+		item.count = 0
+		item.length = 0
 	}
-	if item.messages[m.fragmentID] != nil {
+	if item.messages[fragmentID] != nil {
+		item.access.Unlock()
 		m.releaseMessage()
-		return nil
+		return nil, nil
 	}
-	item.messages[m.fragmentID] = m
+	if item.length+m.data.Len() > maxDefragmentSize {
+		// The reassembled message cannot be represented by the uint16 length
+		// field of the wire format. Drop the whole entry instead of
+		// accumulating further fragments.
+		releaseMessages(item.messages)
+		item.messages = nil
+		item.count = 0
+		item.length = 0
+		item.access.Unlock()
+		m.releaseMessage()
+		return nil, E.New("reassembled UDP message exceeds ", maxDefragmentSize, " bytes")
+	}
+	item.messages[fragmentID] = m
 	item.count++
+	item.length += m.data.Len()
 	if int(item.count) != len(item.messages) {
-		return nil
+		item.access.Unlock()
+		return nil, nil
 	}
 	newMessage := allocMessage()
 	*newMessage = *item.messages[0]
-	var dataLength uint16
+	newMessage.fragmentTotal = 1
+	newMessage.fragmentID = 0
+	// The accumulated length was bounded above, so this allocation fits every
+	// fragment.
+	newMessage.data = buf.NewSize(item.length)
+	var writeErr error
 	for _, message := range item.messages {
-		dataLength += uint16(message.data.Len())
-	}
-	if dataLength > 0 {
-		newMessage.data = buf.NewSize(int(dataLength))
-		for _, message := range item.messages {
-			common.Must1(newMessage.data.Write(message.data.Bytes()))
-			message.releaseMessage()
+		if writeErr == nil {
+			_, writeErr = newMessage.data.Write(message.data.Bytes())
 		}
-		item.messages = nil
-		return newMessage
-	} else {
-		newMessage.releaseMessage()
-		for _, message := range item.messages {
-			message.releaseMessage()
-		}
+		message.releaseMessage()
 	}
 	item.messages = nil
-	return nil
+	item.count = 0
+	item.length = 0
+	item.access.Unlock()
+	if writeErr != nil {
+		newMessage.releaseMessage()
+		return nil, E.Cause(writeErr, "reassemble UDP message")
+	}
+	return newMessage, nil
 }
 
 func newPacketItem() *packetItem {

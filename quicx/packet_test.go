@@ -84,3 +84,86 @@ func TestFragUDPMessageFragmentCountLimit(t *testing.T) {
 		}
 	}
 }
+
+func TestFragUDPMessageRoundTrip(t *testing.T) {
+	origin := make([]byte, 3000)
+	for index := range origin {
+		origin[index] = byte(index)
+	}
+	message := testUDPMessage(origin)
+	defer message.releaseMessage()
+	fragments, err := fragUDPMessage(message, 1200)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fragments) != 3 {
+		t.Fatalf("expected 3 fragments, got %d", len(fragments))
+	}
+	defragger := newUDPDefragger()
+	var assembled *udpMessage
+	for index, fragment := range fragments {
+		if fragment.fragmentID != uint8(index) {
+			t.Fatalf("expected fragment id %d, got %d", index, fragment.fragmentID)
+		}
+		if fragment.fragmentTotal != 3 {
+			t.Fatalf("expected 3 fragments in total, got %d", fragment.fragmentTotal)
+		}
+		assembled, err = defragger.feed(fragment)
+		if err != nil {
+			t.Fatalf("unexpected error on fragment %d: %v", index, err)
+		}
+		if index < len(fragments)-1 && assembled != nil {
+			t.Fatalf("reassembly completed after fragment %d", index)
+		}
+	}
+	if assembled == nil {
+		t.Fatal("reassembly did not complete")
+	}
+	defer assembled.releaseMessage()
+	if !bytes.Equal(assembled.data.Bytes(), origin) {
+		t.Fatal("reassembled message differs from the original")
+	}
+	if assembled.fragmentTotal != 1 {
+		t.Fatalf("expected the reassembled message to be marked complete, got fragmentTotal %d", assembled.fragmentTotal)
+	}
+}
+
+// TestDefraggerRejectsOversizedReassembly covers fragments whose real total
+// length exceeds the uint16 length field of the wire format: the accumulated
+// length used to wrap around and panic with "short buffer".
+func TestDefraggerRejectsOversizedReassembly(t *testing.T) {
+	const (
+		fragmentTotal = 50
+		fragmentSize  = 1350
+	)
+	defragger := newUDPDefragger()
+	var lastErr error
+	for index := 0; index < fragmentTotal; index++ {
+		fragment := testUDPMessage(bytes.Repeat([]byte{byte(index)}, fragmentSize))
+		fragment.packetID = 7
+		fragment.fragmentTotal = fragmentTotal
+		fragment.fragmentID = uint8(index)
+		var assembled *udpMessage
+		assembled, lastErr = defragger.feed(fragment)
+		if assembled != nil {
+			assembled.releaseMessage()
+			t.Fatal("reassembly completed although the total length exceeds the protocol limit")
+		}
+		if lastErr != nil {
+			break
+		}
+	}
+	if lastErr == nil {
+		t.Fatalf("expected an error for %d fragments of %d bytes", fragmentTotal, fragmentSize)
+	}
+}
+
+func TestDefraggerRejectsInvalidFragmentID(t *testing.T) {
+	defragger := newUDPDefragger()
+	message := testUDPMessage([]byte{1, 2, 3})
+	message.fragmentTotal = 2
+	message.fragmentID = 2
+	if _, err := defragger.feed(message); err == nil {
+		t.Fatal("expected an error for a fragment id outside of fragmentTotal")
+	}
+}
