@@ -126,6 +126,9 @@ func TestFragUDPMessageRoundTrip(t *testing.T) {
 	if assembled.fragmentTotal != 1 {
 		t.Fatalf("expected the reassembled message to be marked complete, got fragmentTotal %d", assembled.fragmentTotal)
 	}
+	if defragger.packetMap.Exist(1) {
+		t.Fatal("the completed reassembly is still tracked by the defragger")
+	}
 }
 
 // TestDefraggerRejectsOversizedReassembly covers fragments whose real total
@@ -165,5 +168,26 @@ func TestDefraggerRejectsInvalidFragmentID(t *testing.T) {
 	message.fragmentID = 2
 	if _, err := defragger.feed(message); err == nil {
 		t.Fatal("expected an error for a fragment id outside of fragmentTotal")
+	}
+}
+
+func TestDefraggerCacheBound(t *testing.T) {
+	defragger := newUDPDefragger()
+	for index := 0; index < maxDefragmentEntries*2; index++ {
+		message := testUDPMessage([]byte{1, 2, 3})
+		message.packetID = uint16(index)
+		message.fragmentTotal = 4
+		message.fragmentID = 0
+		_, err := defragger.feed(message)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	var tracked int
+	defragger.packetMap.Range(func(_ uint16, _ *packetItem) {
+		tracked++
+	})
+	if tracked > maxDefragmentEntries {
+		t.Fatalf("expected at most %d tracked reassemblies, got %d", maxDefragmentEntries, tracked)
 	}
 }
