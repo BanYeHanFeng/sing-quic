@@ -86,12 +86,37 @@ func (m *udpMessage) headerSize() int {
 	return 10 + AddressSerializer.AddrPortLen(m.destination)
 }
 
-func fragUDPMessage(message *udpMessage, maxPacketSize int) []*udpMessage {
-	udpMTU := maxPacketSize - message.headerSize()
-	if message.data.Len() <= udpMTU {
-		return []*udpMessage{message}
+const (
+	// initialUDPMTU is the packet size used before the peer reported its own
+	// DATAGRAM limit. It matches the QUIC minimum initial packet size.
+	initialUDPMTU = 1200 - udpMTUSafetyMargin
+	// udpMTUSafetyMargin is subtracted from the size reported by quic-go, as
+	// the reported maximum payload is only a conservative estimate.
+	udpMTUSafetyMargin = 3
+	// maxFragmentCount is the maximum number of fragments a UDP message may be
+	// split into: fragmentTotal is a single byte on the wire.
+	maxFragmentCount = 255
+)
+
+// fragUDPMessage splits message so that every fragment fits into maxPacketSize
+// bytes. maxPacketSize is derived from the peer-reported DATAGRAM limit, which
+// is attacker-controlled: a value which cannot even carry the fragment header
+// would make the slicing below panic or the loop below run forever, so it is
+// rejected instead.
+func fragUDPMessage(message *udpMessage, maxPacketSize int) ([]*udpMessage, error) {
+	headerSize := message.headerSize()
+	udpMTU := maxPacketSize - headerSize
+	if udpMTU <= 0 {
+		return nil, E.New("invalid UDP packet size ", maxPacketSize, " for header size ", headerSize)
 	}
-	var fragments []*udpMessage
+	if message.data.Len() <= udpMTU {
+		return []*udpMessage{message}, nil
+	}
+	fragmentCount := (message.data.Len() + udpMTU - 1) / udpMTU
+	if fragmentCount > maxFragmentCount {
+		return nil, E.New("UDP message of ", message.data.Len(), " bytes requires ", fragmentCount, " fragments with packet size ", maxPacketSize)
+	}
+	fragments := make([]*udpMessage, 0, fragmentCount)
 	originPacket := message.data.Bytes()
 	for remaining := len(originPacket); remaining > 0; remaining -= udpMTU {
 		fragment := allocMessage()
@@ -105,15 +130,29 @@ func fragUDPMessage(message *udpMessage, maxPacketSize int) []*udpMessage {
 		}
 		fragments = append(fragments, fragment)
 	}
-	fragmentTotal := uint16(len(fragments))
 	for index, fragment := range fragments {
 		fragment.fragmentID = uint8(index)
-		fragment.fragmentTotal = uint8(fragmentTotal)
+		fragment.fragmentTotal = uint8(len(fragments))
 		if index > 0 {
 			fragment.destination = M.Socksaddr{}
 		}
 	}
-	return fragments
+	return fragments, nil
+}
+
+// datagramMTU converts the maximum DATAGRAM payload size reported by quic-go
+// into the packet size used for fragmentation. The peer declares that limit in
+// its max_datagram_frame_size transport parameter, so it may be zero, negative
+// or too small to carry even a fragment header.
+func datagramMTU(maxDatagramPayloadSize int64, headerSize int) (int, error) {
+	if maxDatagramPayloadSize <= 0 || maxDatagramPayloadSize > math.MaxInt32 {
+		return 0, E.New("invalid datagram payload size reported by peer: ", maxDatagramPayloadSize)
+	}
+	udpMTU := int(maxDatagramPayloadSize) - udpMTUSafetyMargin
+	if udpMTU <= headerSize {
+		return 0, E.New("datagram payload size reported by peer (", maxDatagramPayloadSize, ") cannot carry the fragmentation header (", headerSize, ")")
+	}
+	return udpMTU, nil
 }
 
 var (
@@ -147,7 +186,7 @@ func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, isServer bool, o
 		isServer:     isServer,
 		defragger:    newUDPDefragger(),
 		onDestroy:    onDestroy,
-		udpMTU:       1200 - 3,
+		udpMTU:       initialUDPMTU,
 		readDeadline: pipe.MakeDeadline(),
 	}
 }
@@ -207,21 +246,7 @@ func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr)
 		data:          buffer,
 	}
 	defer message.releaseMessage()
-	var err error
-	if buffer.Len() > c.udpMTU-message.headerSize() {
-		err = c.writePackets(fragUDPMessage(message, c.udpMTU))
-	} else {
-		err = c.writePacket(message)
-	}
-	if err == nil {
-		return nil
-	}
-	var tooLargeErr *quic.DatagramTooLargeError
-	if !errors.As(err, &tooLargeErr) {
-		return err
-	}
-	c.udpMTU = int(tooLargeErr.MaxDatagramPayloadSize) - 3
-	return c.writePackets(fragUDPMessage(message, c.udpMTU))
+	return c.writeMessage(message)
 }
 
 func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
@@ -247,27 +272,45 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		data:          buf.As(p),
 	}
 	defer message.releaseMessage()
-	if len(p) > c.udpMTU-message.headerSize() {
-		err = c.writePackets(fragUDPMessage(message, c.udpMTU))
-		if err == nil {
-			return len(p), nil
-		}
+	err = c.writeMessage(message)
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// writeMessage sends message, fragmenting it when it does not fit into the
+// current MTU, and retries once with the MTU reported by quic-go when the
+// DATAGRAM was rejected as too large.
+func (c *udpPacketConn) writeMessage(message *udpMessage) error {
+	udpMTU := c.udpMTU
+	var err error
+	if message.data.Len() > udpMTU-message.headerSize() {
+		err = c.writeFragments(message, udpMTU)
 	} else {
 		err = c.writePacket(message)
 	}
 	if err == nil {
-		return len(p), nil
+		return nil
 	}
 	var tooLargeErr *quic.DatagramTooLargeError
 	if !errors.As(err, &tooLargeErr) {
-		return
+		return err
 	}
-	c.udpMTU = int(tooLargeErr.MaxDatagramPayloadSize) - 3
-	err = c.writePackets(fragUDPMessage(message, c.udpMTU))
-	if err == nil {
-		return len(p), nil
+	udpMTU, mtuErr := datagramMTU(tooLargeErr.MaxDatagramPayloadSize, message.headerSize())
+	if mtuErr != nil {
+		return E.Errors(err, mtuErr)
 	}
-	return
+	c.udpMTU = udpMTU
+	return c.writeFragments(message, udpMTU)
+}
+
+func (c *udpPacketConn) writeFragments(message *udpMessage, udpMTU int) error {
+	fragments, err := fragUDPMessage(message, udpMTU)
+	if err != nil {
+		return err
+	}
+	return c.writePackets(fragments)
 }
 
 func (c *udpPacketConn) inputPacket(message *udpMessage) {
