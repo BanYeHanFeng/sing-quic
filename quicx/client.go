@@ -17,7 +17,6 @@ import (
 	"github.com/sagernet/quic-go/qlogwriter"
 	qtls "github.com/sagernet/sing-quic"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
-	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -182,7 +181,12 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		return nil, E.Cause(err, "open connection")
 	}
 	setCongestion(c.ctx, quicConn, c.bbrProfile)
+	connCtx := c.ctx
+	if connCtx == nil {
+		connCtx = context.Background()
+	}
 	conn := &clientQUICConnection{
+		ctx:        connCtx,
 		quicConn:   quicConn,
 		rawConn:    udpConn,
 		connDone:   make(chan struct{}),
@@ -200,19 +204,15 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 }
 
 func (c *Client) clientHandshake(conn *quic.Conn) error {
-	authStream, err := openUniStream0RTT(c.ctx, conn)
-	if err != nil {
-		return E.Cause(err, "open handshake stream")
-	}
-	defer authStream.Close()
 	authRequest := buf.NewSize(2 + 2 + len(c.password))
+	defer authRequest.Release()
 	authRequest.WriteByte(Version)
 	authRequest.WriteByte(CommandAuthenticate)
 	var passwordLen [2]byte
 	binary.BigEndian.PutUint16(passwordLen[:], uint16(len(c.password)))
 	authRequest.Write(passwordLen[:])
 	authRequest.WriteString(c.password)
-	return common.Error(authStream.Write(authRequest.Bytes()))
+	return writeUniStream0RTT(c.ctx, conn, authRequest.Bytes())
 }
 
 func (c *Client) loopHeartbeats(conn *clientQUICConnection) {
@@ -236,7 +236,7 @@ func (c *Client) DialConn(ctx context.Context, destination M.Socksaddr) (net.Con
 	if err != nil {
 		return nil, err
 	}
-	stream, err := openStream0RTT(c.ctx, conn.quicConn)
+	stream, err := openStream0RTT(conn.ctx, conn.quicConn)
 	if err != nil {
 		return nil, err
 	}
@@ -293,9 +293,9 @@ func (c *Client) CloseWithError(err error) error {
 	return nil
 }
 
-// openStream0RTT opens a bidirectional stream, recovering from a rejected 0-RTT
-// attempt. quic-go reports quic.Err0RTTRejected from OpenStream until the
-// handshake completes and the stream maps are reset, so the stream has to be
+// openStream0RTT opens a bidirectional stream, recovering from an open-time
+// 0-RTT rejection. quic-go reports quic.Err0RTTRejected from OpenStream until
+// the handshake completes and the stream maps are reset, so the stream has to be
 // opened again afterwards. On a connection without a resumed session no early
 // data is sent and quic.Err0RTTRejected never occurs, in which case both helpers
 // are equivalent to a plain OpenStream / OpenUniStream call.
@@ -323,6 +323,119 @@ func openUniStream0RTT(ctx context.Context, conn *quic.Conn) (*quic.SendStream, 
 	return conn.OpenUniStream()
 }
 
+// writeUniStream0RTT opens a unidirectional stream, writes message on it and
+// closes it. A rejected 0-RTT attempt is recovered instead of failing the
+// connection, see writeEarlyMessage.
+func writeUniStream0RTT(ctx context.Context, conn *quic.Conn, message []byte) error {
+	stream, err := openUniStream0RTT(ctx, conn)
+	if err != nil {
+		return E.Cause(err, "open handshake stream")
+	}
+	rejected, err := writeEarlyMessage(ctx, conn, stream, message)
+	if err != nil {
+		stream.CancelWrite(0)
+		return E.Cause(err, "write handshake request")
+	}
+	if !rejected {
+		closeHandshakeStream(stream)
+		return nil
+	}
+	// The early data was discarded by the peer: the message has to be resent on
+	// a stream which is valid after the stream maps were reset.
+	stream.CancelWrite(0)
+	if _, err = conn.NextConnection(ctx); err != nil {
+		return E.Cause(err, "wait for handshake after 0-RTT rejection")
+	}
+	stream, err = conn.OpenUniStream()
+	if err != nil {
+		return E.Cause(err, "open handshake stream")
+	}
+	_, err = stream.Write(message)
+	if err != nil {
+		stream.CancelWrite(0)
+		return E.Cause(err, "write handshake request")
+	}
+	closeHandshakeStream(stream)
+	return nil
+}
+
+// closeHandshakeStream half-closes the send side of the authentication stream.
+// The peer only needs the message itself and stops reading the stream as soon as
+// it has it, which quic-go reports as closing a canceled stream. The message was
+// written before that happens, so the error is not fatal.
+func closeHandshakeStream(stream *quic.SendStream) {
+	_ = stream.Close()
+}
+
+// earlyStream is implemented by both quic-go stream types and gives access to
+// the context which quic-go cancels with quic.Err0RTTRejected when the server
+// rejects the early data a stream was created in.
+type earlyStream interface {
+	Write([]byte) (int, error)
+	Context() context.Context
+}
+
+// writeEarlyMessage reports whether message was discarded because the server
+// rejected a 0-RTT attempt.
+//
+// quic-go reports quic.Err0RTTRejected from Write only when the rejection was
+// already processed at the time of the call. A message which fits into a single
+// STREAM frame is buffered and reported as written, and is dropped later without
+// any further local error, so the outcome of the early data has to be checked
+// after the handshake completed.
+func writeEarlyMessage(ctx context.Context, conn *quic.Conn, stream earlyStream, message []byte) (rejected bool, err error) {
+	select {
+	case <-conn.HandshakeComplete():
+		// No early data is in flight anymore, a plain write is enough.
+		_, err = stream.Write(message)
+		return false, err
+	default:
+	}
+	_, err = stream.Write(message)
+	if err != nil {
+		if errors.Is(err, quic.Err0RTTRejected) {
+			// The rejection is already known: recover instead of failing.
+			return true, nil
+		}
+		return false, err
+	}
+	// The handshake is still running, so the message may have been sent as early
+	// data which the peer is allowed to discard. Wait for the handshake outcome,
+	// which is also the point where quic-go resets the streams of a rejected
+	// attempt.
+	select {
+	case <-conn.HandshakeComplete():
+	case <-conn.Context().Done():
+	case <-ctx.Done():
+	}
+	return errors.Is(context.Cause(stream.Context()), quic.Err0RTTRejected), nil
+}
+
+// writeStream0RTT writes message on stream and recovers from a rejected 0-RTT
+// attempt by reopening the stream after the handshake. It returns the stream the
+// message was written to, which may differ from stream.
+func writeStream0RTT(ctx context.Context, conn *quic.Conn, stream *quic.Stream, message []byte) (*quic.Stream, error) {
+	rejected, err := writeEarlyMessage(ctx, conn, stream, message)
+	if err != nil || !rejected {
+		return stream, err
+	}
+	// A stream created during 0-RTT is unusable once the server rejected the
+	// early data: quic-go resets the stream maps, so the request has to be sent
+	// again on a stream opened after the handshake.
+	if _, err = conn.NextConnection(ctx); err != nil {
+		return stream, err
+	}
+	newStream, err := conn.OpenStream()
+	if err != nil {
+		return stream, err
+	}
+	_, err = newStream.Write(message)
+	if err != nil {
+		return newStream, err
+	}
+	return newStream, nil
+}
+
 type clientOffer struct {
 	done      chan struct{}
 	cancel    func(error)
@@ -333,6 +446,7 @@ type clientOffer struct {
 }
 
 type clientQUICConnection struct {
+	ctx          context.Context
 	quicConn     *quic.Conn
 	rawConn      io.Closer
 	closeOnce    sync.Once
@@ -375,21 +489,29 @@ func (c *clientQUICConnection) closeWithError(err error) {
 
 type clientConn struct {
 	*quic.Stream
+	access         sync.Mutex
 	parent         *clientQUICConnection
 	destination    M.Socksaddr
 	requestWritten bool
 }
 
 func (c *clientConn) NeedHandshake() bool {
+	c.access.Lock()
+	defer c.access.Unlock()
 	return !c.requestWritten
 }
 
 func (c *clientConn) Read(b []byte) (n int, err error) {
-	n, err = c.Stream.Read(b)
+	c.access.Lock()
+	stream := c.Stream
+	c.access.Unlock()
+	n, err = stream.Read(b)
 	return n, qtls.WrapError(err)
 }
 
 func (c *clientConn) Write(b []byte) (n int, err error) {
+	c.access.Lock()
+	defer c.access.Unlock()
 	if !c.requestWritten {
 		request := buf.NewSize(2 + AddressSerializer.AddrPortLen(c.destination) + len(b))
 		defer request.Release()
@@ -400,11 +522,17 @@ func (c *clientConn) Write(b []byte) (n int, err error) {
 			return
 		}
 		request.Write(b)
-		_, err = c.Stream.Write(request.Bytes())
+		// The stream may have been opened while 0-RTT was still pending. When
+		// the server rejects the early data the request never arrived and this
+		// stream is invalid, so it is reopened after the handshake instead of
+		// closing the whole connection.
+		var stream *quic.Stream
+		stream, err = writeStream0RTT(c.parent.ctx, c.parent.quicConn, c.Stream, request.Bytes())
 		if err != nil {
 			c.parent.closeWithError(E.Cause(err, "create new connection"))
 			return 0, qtls.WrapError(err)
 		}
+		c.Stream = stream
 		c.requestWritten = true
 		return len(b), nil
 	}
@@ -413,11 +541,14 @@ func (c *clientConn) Write(b []byte) (n int, err error) {
 }
 
 func (c *clientConn) Close() error {
-	c.Stream.CancelRead(0)
-	err := c.Stream.Close()
+	c.access.Lock()
+	stream := c.Stream
+	c.access.Unlock()
+	stream.CancelRead(0)
+	err := stream.Close()
 	// quic-go's Stream.Close does not unblock a Write blocked on flow control,
 	// but a past write deadline does; buffered data and the FIN are unaffected.
-	c.Stream.SetWriteDeadline(time.Now())
+	stream.SetWriteDeadline(time.Now())
 	return err
 }
 
