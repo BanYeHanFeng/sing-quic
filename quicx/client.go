@@ -2,6 +2,7 @@ package quicx
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -181,6 +182,16 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		return nil, E.Cause(err, "open connection")
 	}
 	setCongestion(c.ctx, quicConn, c.bbrProfile)
+	// 0-RTT data is not replay protected, so every connection authenticates
+	// with a fresh random nonce which the server remembers: a replayed 0-RTT
+	// flight presents the nonce of the session it was captured from and is
+	// rejected. See AuthNonceLen.
+	var authNonce [AuthNonceLen]byte
+	if _, err = rand.Read(authNonce[:]); err != nil {
+		quicConn.CloseWithError(0, "")
+		udpConn.Close()
+		return nil, E.Cause(err, "generate authentication nonce")
+	}
 	connCtx := c.ctx
 	if connCtx == nil {
 		connCtx = context.Background()
@@ -191,9 +202,10 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		rawConn:    udpConn,
 		connDone:   make(chan struct{}),
 		udpConnMap: make(map[uint16]*udpPacketConn),
+		authNonce:  authNonce,
 	}
 	go func() {
-		hErr := c.clientHandshake(quicConn)
+		hErr := c.clientHandshake(conn)
 		if hErr != nil {
 			conn.closeWithError(hErr)
 		}
@@ -203,8 +215,8 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	return conn, nil
 }
 
-func (c *Client) clientHandshake(conn *quic.Conn) error {
-	authRequest := buf.NewSize(2 + 2 + len(c.password))
+func (c *Client) clientHandshake(conn *clientQUICConnection) error {
+	authRequest := buf.NewSize(2 + 2 + len(c.password) + AuthNonceLen)
 	defer authRequest.Release()
 	authRequest.WriteByte(Version)
 	authRequest.WriteByte(CommandAuthenticate)
@@ -212,7 +224,12 @@ func (c *Client) clientHandshake(conn *quic.Conn) error {
 	binary.BigEndian.PutUint16(passwordLen[:], uint16(len(c.password)))
 	authRequest.Write(passwordLen[:])
 	authRequest.WriteString(c.password)
-	return writeUniStream0RTT(c.ctx, conn, authRequest.Bytes())
+	// The nonce is sent on every connection, not only on a 0-RTT attempt: the
+	// server records it for every authenticated session. A resend after a
+	// rejected 0-RTT attempt reuses the same message, which the server accepts
+	// because it is the same session.
+	authRequest.Write(conn.authNonce[:])
+	return writeUniStream0RTT(c.ctx, conn.quicConn, authRequest.Bytes())
 }
 
 func (c *Client) loopHeartbeats(conn *clientQUICConnection) {
@@ -455,6 +472,7 @@ type clientQUICConnection struct {
 	udpAccess    sync.RWMutex
 	udpConnMap   map[uint16]*udpPacketConn
 	udpSessionID uint16
+	authNonce    [AuthNonceLen]byte
 }
 
 func (c *clientQUICConnection) active() bool {
