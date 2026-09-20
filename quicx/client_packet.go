@@ -35,8 +35,7 @@ func (c *Client) handleMessage(conn *clientQUICConnection, data []byte) error {
 			message.releaseMessage()
 			return E.Cause(err, "decode UDP message")
 		}
-		conn.handleUDPMessage(message)
-		return nil
+		return conn.handleUDPMessage(message)
 	case CommandHeartbeat:
 		return nil
 	default:
@@ -44,19 +43,19 @@ func (c *Client) handleMessage(conn *clientQUICConnection, data []byte) error {
 	}
 }
 
-func (c *clientQUICConnection) handleUDPMessage(message *udpMessage) {
+func (c *clientQUICConnection) handleUDPMessage(message *udpMessage) error {
 	c.udpAccess.RLock()
 	udpConn, loaded := c.udpConnMap[message.sessionID]
 	c.udpAccess.RUnlock()
 	if !loaded {
 		message.releaseMessage()
-		return
+		return nil
 	}
 	select {
 	case <-udpConn.ctx.Done():
 		message.releaseMessage()
-		return
+		return nil
 	default:
 	}
-	udpConn.inputPacket(message)
+	return udpConn.inputPacket(message)
 }

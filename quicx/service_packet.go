@@ -43,8 +43,7 @@ func (s *serverSession[U]) handleMessage(data []byte) error {
 			message.releaseMessage()
 			return E.Cause(err, "decode UDP message")
 		}
-		s.handleUDPMessage(message)
-		return nil
+		return s.handleUDPMessage(message)
 	case CommandHeartbeat:
 		return nil
 	default:
@@ -52,7 +51,7 @@ func (s *serverSession[U]) handleMessage(data []byte) error {
 	}
 }
 
-func (s *serverSession[U]) handleUDPMessage(message *udpMessage) {
+func (s *serverSession[U]) handleUDPMessage(message *udpMessage) error {
 	sessionID := message.sessionID
 	s.udpAccess.RLock()
 	udpConn, loaded := s.udpConnMap[sessionID]
@@ -70,5 +69,5 @@ func (s *serverSession[U]) handleUDPMessage(message *udpMessage) {
 		newCtx, newConn := canceler.NewPacketConn(udpConn.ctx, udpConn, s.udpTimeout)
 		go s.handler.NewPacketConnectionEx(newCtx, newConn, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), message.destination, nil)
 	}
-	udpConn.inputPacket(message)
+	return udpConn.inputPacket(message)
 }
