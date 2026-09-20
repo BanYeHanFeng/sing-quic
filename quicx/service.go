@@ -13,6 +13,7 @@ import (
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
+	"github.com/sagernet/quic-go/qlogwriter"
 	qtls "github.com/sagernet/sing-quic"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	"github.com/sagernet/sing/common"
@@ -42,6 +43,7 @@ type ServiceOptions struct {
 	Handler           ServiceHandler
 	AuthFailurePolicy string
 	BBRProfile        string
+	Tracer            func(ctx context.Context, isClient bool, connID quic.ConnectionID) qlogwriter.Trace
 }
 
 type ServiceHandler interface {
@@ -91,6 +93,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		MaxIncomingStreams:      1 << 60,
 		MaxIncomingUniStreams:   1 << 60,
 		DisablePathManager:      true,
+		Tracer:                  options.Tracer,
 	}
 	qtls.ApplyQUICOptions(quicConfig, options.QUICOptions)
 	if len(options.TLSConfig.NextProtos()) == 0 {
