@@ -63,6 +63,7 @@ type Service[U comparable] struct {
 	tlsConfig         aTLS.ServerConfig
 	heartbeat         time.Duration
 	quicConfig        *quic.Config
+	usersAccess       sync.RWMutex
 	userMap           map[string]U
 	authTimeout       time.Duration
 	udpTimeout        time.Duration
@@ -121,11 +122,23 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 }
 
 func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
-	userMap := make(map[string]U)
+	userMap := make(map[string]U, len(userList))
 	for index := range userList {
 		userMap[passwordList[index]] = userList[index]
 	}
+	// The map is replaced, never mutated in place, and authentication reads it
+	// under the same lock: a runtime update must not race with the
+	// authentication path, which would be a concurrent map read/write fatal.
+	s.usersAccess.Lock()
 	s.userMap = userMap
+	s.usersAccess.Unlock()
+}
+
+func (s *Service[U]) lookupUser(password string) (U, bool) {
+	s.usersAccess.RLock()
+	defer s.usersAccess.RUnlock()
+	user, loaded := s.userMap[password]
+	return user, loaded
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
@@ -310,7 +323,7 @@ func (s *serverSession[U]) handleQUICXUniStream(stream *quic.ReceiveStream) erro
 			}
 		}
 		password := string(buffer.Range(4, 4+passwordLen))
-		user, loaded := s.userMap[password]
+		user, loaded := s.lookupUser(password)
 		if !loaded {
 			return s.authFailure(E.New("authentication: unknown user"))
 		}
