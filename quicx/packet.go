@@ -100,6 +100,10 @@ const (
 	// length field of a UDP message is a uint16, so larger messages cannot be
 	// represented on the wire.
 	maxDefragmentSize = 0xffff
+	// maxDefragmentEntries bounds the number of incomplete reassemblies tracked
+	// per packet connection. Without a bound an authenticated peer could
+	// allocate unbounded state by sending fragments under many packet IDs.
+	maxDefragmentEntries = 256
 )
 
 // fragUDPMessage splits message so that every fragment fits into maxPacketSize
@@ -409,11 +413,29 @@ func newUDPDefragger() *udpDefragger {
 		packetMap: cache.New(
 			cache.WithAge[uint16, *packetItem](10),
 			cache.WithUpdateAgeOnGet[uint16, *packetItem](),
-			cache.WithEvict[uint16, *packetItem](func(key uint16, value *packetItem) {
-				releaseMessages(value.messages)
+			// Reassembly state is created from peer-controlled packet IDs, so
+			// both the number of tracked packets and the size of a single
+			// reassembly are bounded.
+			cache.WithSize[uint16, *packetItem](maxDefragmentEntries),
+			cache.WithEvict[uint16, *packetItem](func(_ uint16, value *packetItem) {
+				releasePacketItem(value)
 			}),
 		),
 	}
+}
+
+// releasePacketItem drops the messages buffered by an evicted or aborted
+// reassembly. The eviction callback runs while the cache lock is held, so it
+// must not call back into the cache, and it takes the item lock to stay safe
+// against a concurrent feed.
+func releasePacketItem(item *packetItem) {
+	item.access.Lock()
+	messages := item.messages
+	item.messages = nil
+	item.count = 0
+	item.length = 0
+	item.access.Unlock()
+	releaseMessages(messages)
 }
 
 type packetItem struct {
@@ -461,6 +483,7 @@ func (d *udpDefragger) feed(m *udpMessage) (*udpMessage, error) {
 		item.count = 0
 		item.length = 0
 		item.access.Unlock()
+		d.packetMap.Delete(packetID)
 		m.releaseMessage()
 		return nil, E.New("reassembled UDP message exceeds ", maxDefragmentSize, " bytes")
 	}
@@ -489,6 +512,8 @@ func (d *udpDefragger) feed(m *udpMessage) (*udpMessage, error) {
 	item.count = 0
 	item.length = 0
 	item.access.Unlock()
+	// The reassembly is complete: the entry is not kept until its age expires.
+	d.packetMap.Delete(packetID)
 	if writeErr != nil {
 		newMessage.releaseMessage()
 		return nil, E.Cause(writeErr, "reassemble UDP message")
