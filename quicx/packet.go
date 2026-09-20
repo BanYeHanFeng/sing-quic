@@ -174,7 +174,7 @@ type udpPacketConn struct {
 	sessionID       uint16
 	quicConn        *quic.Conn
 	data            chan *udpMessage
-	udpMTU          int
+	udpMTU          atomic.Int64
 	packetId        atomic.Uint32
 	closeOnce       sync.Once
 	isServer        bool
@@ -184,19 +184,21 @@ type udpPacketConn struct {
 	readDeadline    pipe.Deadline
 }
 
-func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, isServer bool, onDestroy func()) *udpPacketConn {
+func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, sessionID uint16, isServer bool, onDestroy func()) *udpPacketConn {
 	ctx, cancel := context.WithCancelCause(ctx)
-	return &udpPacketConn{
+	packetConn := &udpPacketConn{
 		ctx:          ctx,
 		cancel:       cancel,
+		sessionID:    sessionID,
 		quicConn:     quicConn,
 		data:         make(chan *udpMessage, 64),
 		isServer:     isServer,
 		defragger:    newUDPDefragger(),
 		onDestroy:    onDestroy,
-		udpMTU:       initialUDPMTU,
 		readDeadline: pipe.MakeDeadline(),
 	}
+	packetConn.udpMTU.Store(initialUDPMTU)
+	return packetConn
 }
 
 func (c *udpPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
@@ -291,7 +293,7 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 // current MTU, and retries once with the MTU reported by quic-go when the
 // DATAGRAM was rejected as too large.
 func (c *udpPacketConn) writeMessage(message *udpMessage) error {
-	udpMTU := c.udpMTU
+	udpMTU := int(c.udpMTU.Load())
 	var err error
 	if message.data.Len() > udpMTU-message.headerSize() {
 		err = c.writeFragments(message, udpMTU)
@@ -309,7 +311,7 @@ func (c *udpPacketConn) writeMessage(message *udpMessage) error {
 	if mtuErr != nil {
 		return E.Errors(err, mtuErr)
 	}
-	c.udpMTU = udpMTU
+	c.udpMTU.Store(int64(udpMTU))
 	return c.writeFragments(message, udpMTU)
 }
 

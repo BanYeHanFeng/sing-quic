@@ -252,12 +252,6 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	var sessionID uint16
-	clientPacketConn := newUDPPacketConn(c.ctx, conn.quicConn, false, func() {
-		conn.udpAccess.Lock()
-		delete(conn.udpConnMap, sessionID)
-		conn.udpAccess.Unlock()
-	})
 	conn.udpAccess.Lock()
 	select {
 	case <-conn.connDone:
@@ -265,11 +259,17 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 		return nil, E.Errors(conn.connErr, os.ErrClosed)
 	default:
 	}
-	sessionID = conn.udpSessionID
+	// The session ID is chosen before the connection is published, so that the
+	// destroy callback captures a value which is never reassigned afterwards.
+	sessionID := conn.udpSessionID
 	conn.udpSessionID++
+	clientPacketConn := newUDPPacketConn(c.ctx, conn.quicConn, sessionID, false, func() {
+		conn.udpAccess.Lock()
+		delete(conn.udpConnMap, sessionID)
+		conn.udpAccess.Unlock()
+	})
 	conn.udpConnMap[sessionID] = clientPacketConn
 	conn.udpAccess.Unlock()
-	clientPacketConn.sessionID = sessionID
 	return clientPacketConn, nil
 }
 
