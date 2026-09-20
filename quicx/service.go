@@ -93,6 +93,12 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	if options.Heartbeat == 0 {
 		options.Heartbeat = 10 * time.Second
 	}
+	if options.UDPTimeout == 0 {
+		// A zero UDP timeout makes the wrapped packet connection expire
+		// immediately, so every UDP message replaces its session. Fall back to
+		// the default the sing-box inbound uses.
+		options.UDPTimeout = 5 * time.Minute
+	}
 	bbrProfile, err := parseBBRProfile(options.BBRProfile)
 	if err != nil {
 		return nil, err
