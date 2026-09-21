@@ -253,12 +253,13 @@ func (c *Client) DialConn(ctx context.Context, destination M.Socksaddr) (net.Con
 	if err != nil {
 		return nil, err
 	}
-	stream, err := openStream0RTT(conn.ctx, conn.quicConn)
-	if err != nil {
-		return nil, err
-	}
+	// The bidirectional stream of the connection is opened lazily, on the
+	// first read or write, see clientConn. An application which abandons the
+	// connection before its first byte (a canceled dial, a failed handshake
+	// report) must not leave an empty request stream behind: the server cannot
+	// tell such a stream from an HTTP/3 request and used to end the whole
+	// session for it, which killed every connection multiplexed on it.
 	return &clientConn{
-		Stream:      stream,
 		parent:      conn,
 		destination: destination,
 	}, nil
@@ -505,12 +506,20 @@ func (c *clientQUICConnection) closeWithError(err error) {
 	})
 }
 
+// clientConn is one proxied connection on a QUICX session. The stream it runs
+// on is created on the first read or write instead of in DialConn: the server
+// treats a request stream without a CONNECT header as a standard HTTP/3
+// request, so an empty stream left behind by an abandoned connection used to
+// end the whole session.
 type clientConn struct {
-	*quic.Stream
 	access         sync.Mutex
+	stream         *quic.Stream
 	parent         *clientQUICConnection
 	destination    M.Socksaddr
 	requestWritten bool
+	closed         bool
+	readDeadline   time.Time
+	writeDeadline  time.Time
 }
 
 func (c *clientConn) NeedHandshake() bool {
@@ -521,7 +530,20 @@ func (c *clientConn) NeedHandshake() bool {
 
 func (c *clientConn) Read(b []byte) (n int, err error) {
 	c.access.Lock()
-	stream := c.Stream
+	if c.closed {
+		c.access.Unlock()
+		return 0, qtls.WrapError(net.ErrClosed)
+	}
+	if !c.requestWritten {
+		// The peer cannot answer before it knows the destination, so a reader
+		// which never wrote (a server-first protocol) flushes the CONNECT
+		// request on its own.
+		if err = c.writeRequestLocked(nil); err != nil {
+			c.access.Unlock()
+			return 0, qtls.WrapError(err)
+		}
+	}
+	stream := c.stream
 	c.access.Unlock()
 	n, err = stream.Read(b)
 	return n, qtls.WrapError(err)
@@ -529,45 +551,145 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 
 func (c *clientConn) Write(b []byte) (n int, err error) {
 	c.access.Lock()
-	defer c.access.Unlock()
+	if c.closed {
+		c.access.Unlock()
+		return 0, qtls.WrapError(net.ErrClosed)
+	}
 	if !c.requestWritten {
-		request := buf.NewSize(2 + AddressSerializer.AddrPortLen(c.destination) + len(b))
-		defer request.Release()
-		request.WriteByte(Version)
-		request.WriteByte(CommandConnect)
-		err = AddressSerializer.WriteAddrPort(request, c.destination)
+		err = c.writeRequestLocked(b)
+		c.access.Unlock()
 		if err != nil {
-			return
-		}
-		request.Write(b)
-		// The stream may have been opened while 0-RTT was still pending. When
-		// the server rejects the early data the request never arrived and this
-		// stream is invalid, so it is reopened after the handshake instead of
-		// closing the whole connection.
-		var stream *quic.Stream
-		stream, err = writeStream0RTT(c.parent.ctx, c.parent.quicConn, c.Stream, request.Bytes())
-		if err != nil {
-			c.parent.closeWithError(E.Cause(err, "create new connection"))
 			return 0, qtls.WrapError(err)
 		}
-		c.Stream = stream
-		c.requestWritten = true
 		return len(b), nil
 	}
-	n, err = c.Stream.Write(b)
+	stream := c.stream
+	// The stream never changes once the request was written, so the write does
+	// not have to hold the lock: a deadline set while it blocks on flow control
+	// still reaches the stream.
+	c.access.Unlock()
+	n, err = stream.Write(b)
 	return n, qtls.WrapError(err)
+}
+
+// writeRequestLocked opens the stream lazily and sends the CONNECT request
+// followed by payload, which is the first data of the proxied connection. The
+// caller holds access.
+func (c *clientConn) writeRequestLocked(payload []byte) error {
+	request := buf.NewSize(2 + AddressSerializer.AddrPortLen(c.destination) + len(payload))
+	defer request.Release()
+	request.WriteByte(Version)
+	request.WriteByte(CommandConnect)
+	err := AddressSerializer.WriteAddrPort(request, c.destination)
+	if err != nil {
+		return err
+	}
+	request.Write(payload)
+	stream, err := c.openStreamLocked()
+	if err != nil {
+		return err
+	}
+	// The stream was opened while the handshake may still be running, so the
+	// request can be part of the 0-RTT flight. When the server rejects the
+	// early data this stream is invalid, and the request is sent again on a
+	// stream opened after the handshake instead of failing the session.
+	stream, err = writeStream0RTT(c.parent.ctx, c.parent.quicConn, stream, request.Bytes())
+	if err != nil {
+		// One stream which cannot be written must not end the session: every
+		// other connection multiplexed on it would be torn down as well. The
+		// stream is reset and the failure is reported to the caller, which
+		// closes this connection only.
+		resetClientStream(stream)
+		return err
+	}
+	c.stream = stream
+	c.requestWritten = true
+	c.applyDeadlinesLocked(stream)
+	return nil
+}
+
+// openStreamLocked creates the stream the connection runs on if it does not
+// exist yet. The caller holds access.
+func (c *clientConn) openStreamLocked() (*quic.Stream, error) {
+	if c.stream != nil {
+		return c.stream, nil
+	}
+	stream, err := openStream0RTT(c.parent.ctx, c.parent.quicConn)
+	if err != nil {
+		return nil, E.Cause(err, "open stream")
+	}
+	c.applyDeadlinesLocked(stream)
+	return stream, nil
+}
+
+// applyDeadlinesLocked transfers the deadlines which were set before the stream
+// existed to it. The caller holds access.
+func (c *clientConn) applyDeadlinesLocked(stream *quic.Stream) {
+	if !c.readDeadline.IsZero() {
+		_ = stream.SetReadDeadline(c.readDeadline)
+	}
+	if !c.writeDeadline.IsZero() {
+		_ = stream.SetWriteDeadline(c.writeDeadline)
+	}
+}
+
+// resetClientStream discards one stream without touching the session it is
+// multiplexed on.
+func resetClientStream(stream *quic.Stream) {
+	stream.CancelWrite(0)
+	stream.CancelRead(0)
+	_ = stream.Close()
 }
 
 func (c *clientConn) Close() error {
 	c.access.Lock()
-	stream := c.Stream
+	c.closed = true
+	stream := c.stream
+	c.stream = nil
 	c.access.Unlock()
+	if stream == nil {
+		// The stream was never opened, so nothing was sent to the peer and
+		// there is nothing to reset: this is what keeps an abandoned dial from
+		// leaving an empty request stream behind.
+		return nil
+	}
 	stream.CancelRead(0)
 	err := stream.Close()
 	// quic-go's Stream.Close does not unblock a Write blocked on flow control,
 	// but a past write deadline does; buffered data and the FIN are unaffected.
 	stream.SetWriteDeadline(time.Now())
 	return err
+}
+
+func (c *clientConn) SetReadDeadline(t time.Time) error {
+	c.access.Lock()
+	defer c.access.Unlock()
+	c.readDeadline = t
+	if c.stream == nil {
+		return nil
+	}
+	return c.stream.SetReadDeadline(t)
+}
+
+func (c *clientConn) SetWriteDeadline(t time.Time) error {
+	c.access.Lock()
+	defer c.access.Unlock()
+	c.writeDeadline = t
+	if c.stream == nil {
+		return nil
+	}
+	return c.stream.SetWriteDeadline(t)
+}
+
+func (c *clientConn) SetDeadline(t time.Time) error {
+	c.access.Lock()
+	defer c.access.Unlock()
+	c.readDeadline = t
+	c.writeDeadline = t
+	if c.stream == nil {
+		return nil
+	}
+	return E.Errors(c.stream.SetReadDeadline(t), c.stream.SetWriteDeadline(t))
 }
 
 func (c *clientConn) LocalAddr() net.Addr {
