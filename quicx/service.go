@@ -416,29 +416,77 @@ func (s *serverSession[U]) loopStreams() {
 		go func(stream *quic.Stream) {
 			err := s.handleStream(stream)
 			if err != nil {
-				stream.CancelRead(0)
-				stream.Close()
-				s.logger.Error(E.Cause(err, "handle stream request"))
-				s.closeWithError(E.Cause(err, "handle stream request"))
+				// A request stream which cannot be served is reset, and only
+				// that stream: QUICX multiplexes every connection of a client
+				// on one session, so ending the session over a single bad
+				// stream tears down all of them at once, and the connections
+				// which are re-established while it closes produce more of the
+				// same bad stream. That loop is what turned one unreadable
+				// stream into a reconnect storm. Only protocol level
+				// violations (the DATAGRAM path, see loopMessages) and the
+				// masquerade policy for unauthenticated sessions terminate a
+				// session.
+				s.resetStream(stream)
+				s.logger.Debug(E.Cause(err, "handle stream request"))
 			}
 		}(stream)
 	}
 }
 
+// resetStream discards one request stream without touching the session. It is
+// what a standard HTTP/3 server does with a stream it cannot serve, and how
+// TUIC handles a failed request stream.
+func (s *serverSession[U]) resetStream(stream *quic.Stream) {
+	stream.CancelRead(0)
+	_ = stream.Close()
+}
+
 func (s *serverSession[U]) handleStream(stream *quic.Stream) error {
 	var header [2]byte
-	n, _ := stream.Peek(header[:])
+	n, peekErr := stream.Peek(header[:])
 	if n > 0 && header[0] == Version && header[1] == CommandConnect {
 		s.startAuthTimeout()
 		return s.handleQUICXStream(stream)
 	}
-	// Any other bidirectional stream is a standard HTTP/3 request stream.
-	// It is not a QUICX proxy request, so there is no masquerade to serve;
-	// the session is terminated following auth_failure_policy, exactly like a
-	// failed authentication, keeping the transport indistinguishable from a
-	// standard HTTP/3 server.
+	if n == 0 {
+		// The peer opened a request stream and closed or reset it before the
+		// CONNECT header was sent: an abandoned dial, a canceled request or a
+		// stream which was reset on the way. There is no request to serve and
+		// nothing to masquerade, and a standard HTTP/3 server ignores such a
+		// stream as well, so only the stream is reset.
+		// The arguments are restricted to the types the logger can format: a
+		// named type such as quic.StreamID panics format.ToString.
+		s.logger.Debug("stream ", int64(stream.StreamID()), " from ", M.SocksaddrFromNet(s.quicConn.RemoteAddr()), " sent no request (", peekErr, "), resetting the stream")
+		s.resetStream(stream)
+		return nil
+	}
+	if s.authenticated() {
+		// The session completed authentication, so a stream which is not a
+		// QUICX request is not a probe of the masquerade either: it is one
+		// broken connection of a client which is known to speak QUICX. Only
+		// the offending stream is reset, like a standard HTTP/3 server handles
+		// a single malformed request stream.
+		s.logger.Debug("stream ", int64(stream.StreamID()), " from ", M.SocksaddrFromNet(s.quicConn.RemoteAddr()), " is not a QUICX request (", int(header[0]), " ", int(header[1]), "), resetting the stream")
+		s.resetStream(stream)
+		return nil
+	}
+	// Any other bidirectional stream is a standard HTTP/3 request stream on a
+	// session which never authenticated. It is not a QUICX proxy request, so
+	// there is no masquerade to serve; the session is terminated following
+	// auth_failure_policy, exactly like a failed authentication, keeping the
+	// transport indistinguishable from a standard HTTP/3 server.
 	s.closeByPolicy(E.New("standard HTTP/3 request"))
 	return nil
+}
+
+// authenticated reports whether the session completed authentication.
+func (s *serverSession[U]) authenticated() bool {
+	select {
+	case <-s.authDone:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *serverSession[U]) handleQUICXStream(stream *quic.Stream) error {
