@@ -138,12 +138,17 @@ func fragUDPMessage(message *udpMessage, maxPacketSize int) ([]*udpMessage, erro
 		}
 		fragments = append(fragments, fragment)
 	}
+	// Every fragment keeps the destination of the message it belongs to.
+	// Fragments used to carry it in the head fragment only, while the peer
+	// creates its session — and makes the routing decision for it — from the
+	// first DATAGRAM it receives. DATAGRAM frames are neither retransmitted nor
+	// reordered back into place, so the first fragment to arrive may well be a
+	// tail one, and the session was then created with an empty destination
+	// (":0") and routed by it: with per-destination routing rules in place, such
+	// a session ends up on the wrong outbound.
 	for index, fragment := range fragments {
 		fragment.fragmentID = uint8(index)
 		fragment.fragmentTotal = uint8(len(fragments))
-		if index > 0 {
-			fragment.destination = M.Socksaddr{}
-		}
 	}
 	return fragments, nil
 }
