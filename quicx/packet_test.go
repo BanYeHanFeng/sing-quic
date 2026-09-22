@@ -131,6 +131,30 @@ func TestFragUDPMessageRoundTrip(t *testing.T) {
 	}
 }
 
+// TestFragUDPMessageKeepsDestination covers the destination every fragment has
+// to carry: the peer creates its session, and makes the routing decision for it,
+// from the first DATAGRAM it receives, while DATAGRAM frames are neither
+// retransmitted nor reordered back into place, so the first fragment to arrive
+// may well be a tail one. Fragments used to carry the destination in the head
+// fragment only, which created sessions routed to ":0" whenever the head
+// fragment arrived late or was lost.
+func TestFragUDPMessageKeepsDestination(t *testing.T) {
+	message := testUDPMessage(bytes.Repeat([]byte{1}, 3000))
+	defer message.releaseMessage()
+	fragments, err := fragUDPMessage(message, 1200)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(fragments) < 2 {
+		t.Fatalf("expected a fragmented message, got %d fragments", len(fragments))
+	}
+	for index, fragment := range fragments {
+		if fragment.destination != message.destination {
+			t.Fatalf("fragment %d of %d carries destination %v instead of %v", index, len(fragments), fragment.destination, message.destination)
+		}
+	}
+}
+
 // TestDefraggerRejectsOversizedReassembly covers fragments whose real total
 // length exceeds the uint16 length field of the wire format: the accumulated
 // length used to wrap around and panic with "short buffer".
