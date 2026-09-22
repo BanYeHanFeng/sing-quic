@@ -52,6 +52,15 @@ func (s *serverSession[U]) handleMessage(data []byte) error {
 }
 
 func (s *serverSession[U]) handleUDPMessage(message *udpMessage) error {
+	if !message.destination.IsValid() {
+		// A message without a destination cannot be routed, and the session is
+		// created from the first message of its sessionID: creating one here
+		// would route (and report) a session to ":0" and dial an outbound
+		// packet connection it can never use. Fragments of one message all
+		// carry the same destination, so the message is dropped whole.
+		message.releaseMessage()
+		return nil
+	}
 	sessionID := message.sessionID
 	s.udpAccess.RLock()
 	udpConn, loaded := s.udpConnMap[sessionID]
