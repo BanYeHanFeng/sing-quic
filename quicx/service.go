@@ -252,17 +252,32 @@ type serverSession[U comparable] struct {
 }
 
 func (s *serverSession[U]) handle() {
-	go func() {
-		select {
-		case <-s.ctx.Done():
-			s.closeWithError(s.ctx.Err())
-		case <-s.connDone:
-		}
-	}()
+	go s.loopSessionDone()
 	go s.loopUniStreams()
 	go s.loopStreams()
 	go s.loopMessages()
 	go s.loopHeartbeats()
+}
+
+// loopSessionDone ends the session when the service context is canceled or the
+// QUIC connection is gone. The connection has to be watched for the whole
+// lifetime of the session, and not only by the loops which read it: a session
+// which never authenticated has no other reader of the connection state
+// (loopMessages and loopHeartbeats wait for authentication first, and the accept
+// loops just return on error), so a connection which ended by itself — an idle
+// timeout, a stateless reset or a peer close — used to be noticed only when the
+// authentication timeout expired. The pending request streams were then released
+// with "authentication timeout" around authTimeout later, and the close of an
+// idle connection was reported as an ERROR.
+func (s *serverSession[U]) loopSessionDone() {
+	connCtx := s.quicConn.Context()
+	select {
+	case <-s.connDone:
+	case <-s.ctx.Done():
+		s.closeWithError(s.ctx.Err())
+	case <-connCtx.Done():
+		s.closeWithError(context.Cause(connCtx))
+	}
 }
 
 func (s *serverSession[U]) startAuthTimeout() {
