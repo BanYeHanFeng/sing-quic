@@ -17,6 +17,7 @@ import (
 )
 
 type QUICOptions struct {
+	DisableGSO              bool
 	IdleTimeout             time.Duration
 	KeepAlivePeriod         time.Duration
 	StreamReceiveWindow     uint64
@@ -52,6 +53,7 @@ type EarlyListener interface {
 }
 
 func ApplyQUICOptions(quicConfig *quic.Config, options QUICOptions) {
+	quicConfig.DisableGSO = quicConfig.DisableGSO || options.DisableGSO
 	if options.StreamReceiveWindow != 0 {
 		quicConfig.InitialStreamReceiveWindow = options.StreamReceiveWindow
 		quicConfig.MaxStreamReceiveWindow = options.StreamReceiveWindow
@@ -164,6 +166,7 @@ func quicConfigWithHandshakeTimeout(quicConfig *quic.Config, handshakeTimeout ti
 }
 
 func Dial(ctx context.Context, conn net.Conn, config aTLS.Config, quicConfig *quic.Config) (*quic.Conn, error) {
+	quicConfig = ConfigWithGSO(quicConfig, conn)
 	conn = withSyscallConn(conn)
 	quicConfig = quicConfigWithHandshakeTimeout(quicConfig, config.HandshakeTimeout())
 	if quicTLSConfig, isQUICConfig := config.(Config); isQUICConfig {
@@ -179,6 +182,7 @@ func Dial(ctx context.Context, conn net.Conn, config aTLS.Config, quicConfig *qu
 }
 
 func DialEarly(ctx context.Context, conn net.Conn, config aTLS.Config, quicConfig *quic.Config) (*quic.Conn, error) {
+	quicConfig = ConfigWithGSO(quicConfig, conn)
 	conn = withSyscallConn(conn)
 	quicConfig = quicConfigWithHandshakeTimeout(quicConfig, config.HandshakeTimeout())
 	if quicTLSConfig, isQUICConfig := config.(Config); isQUICConfig {
@@ -194,6 +198,7 @@ func DialEarly(ctx context.Context, conn net.Conn, config aTLS.Config, quicConfi
 }
 
 func CreateTransport(conn net.Conn, quicConnPtr **quic.Conn, config aTLS.Config, quicConfig *quic.Config) (http.RoundTripper, error) {
+	quicConfig = ConfigWithGSO(quicConfig, conn)
 	conn = withSyscallConn(conn)
 	handshakeTimeout := config.HandshakeTimeout()
 	quicConfig = quicConfigWithHandshakeTimeout(quicConfig, handshakeTimeout)
@@ -220,6 +225,7 @@ func CreateTransport(conn net.Conn, quicConnPtr **quic.Conn, config aTLS.Config,
 }
 
 func CreatePacketTransport(conn net.PacketConn, remoteAddr net.Addr, quicConnPtr **quic.Conn, config aTLS.Config, quicConfig *quic.Config) (http.RoundTripper, error) {
+	quicConfig = ConfigWithGSO(quicConfig, conn)
 	handshakeTimeout := config.HandshakeTimeout()
 	quicConfig = quicConfigWithHandshakeTimeout(quicConfig, handshakeTimeout)
 	if quicTLSConfig, isQUICConfig := config.(Config); isQUICConfig {
@@ -254,6 +260,7 @@ func Listen(conn net.PacketConn, config aTLS.ServerConfig, quicConfig *quic.Conf
 }
 
 func ListenWithOptions(conn net.PacketConn, config aTLS.ServerConfig, quicConfig *quic.Config, options ListenOptions) (Listener, error) {
+	quicConfig = ConfigWithGSO(quicConfig, conn)
 	quicConfig = quicConfigWithHandshakeTimeout(quicConfig, config.HandshakeTimeout())
 	if quicTLSConfig, isQUICConfig := config.(ServerConfig); isQUICConfig {
 		listener, err := quicTLSConfig.Listen(conn, quicConfig)
@@ -281,6 +288,7 @@ func ListenEarly(conn net.PacketConn, config aTLS.ServerConfig, quicConfig *quic
 }
 
 func ListenEarlyWithOptions(conn net.PacketConn, config aTLS.ServerConfig, quicConfig *quic.Config, options ListenOptions) (EarlyListener, error) {
+	quicConfig = ConfigWithGSO(quicConfig, conn)
 	quicConfig = quicConfigWithHandshakeTimeout(quicConfig, config.HandshakeTimeout())
 	if quicTLSConfig, isQUICConfig := config.(ServerConfig); isQUICConfig {
 		listener, err := quicTLSConfig.ListenEarly(conn, quicConfig)
@@ -328,4 +336,19 @@ func ContextWithKeepSession(ctx context.Context) context.Context {
 func KeepSessionFromContext(ctx context.Context) bool {
 	keep, _ := ctx.Value((*keepSessionKey)(nil)).(bool)
 	return keep
+}
+
+// ConfigWithGSO applies a connection or dialer's GSO restriction without
+// mutating a configuration that may be shared by other connections.
+func ConfigWithGSO(config *quic.Config, conn any) *quic.Config {
+	if !N.IsGSODisabled(conn) || config != nil && config.DisableGSO {
+		return config
+	}
+	if config == nil {
+		config = &quic.Config{}
+	} else {
+		config = config.Clone()
+	}
+	config.DisableGSO = true
+	return config
 }
