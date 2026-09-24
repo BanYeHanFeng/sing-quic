@@ -12,7 +12,10 @@ require (
 	golang.org/x/sync v0.22.0
 )
 
-replace github.com/sagernet/quic-go => github.com/reF1nd/quic-go v0.66.0-sing-box-mod.1.0.20261126073502-d4615144fb01
+replace (
+	github.com/sagernet/quic-go => github.com/reF1nd/quic-go v0.66.0-sing-box-mod.1.0.20261126073706-9ca9a0b03552
+	github.com/sagernet/sing => github.com/reF1nd/sing v0.9.7-0.20261127162537-8fb858b0e32d
+)
 
 require (
 	github.com/andybalholm/brotli v1.0.6 // indirect
