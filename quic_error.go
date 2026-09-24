@@ -36,7 +36,13 @@ func (e *quicError) Is(target error) bool {
 	case net.ErrClosed:
 		var streamErr *quic.StreamError
 		if errors.As(e.err, &streamErr) {
-			return !streamErr.Remote && streamErr.ErrorCode == 0
+			// A stream cancellation with error code 0 carries no error, no
+			// matter which side cancelled it. A peer which resets its upload
+			// (RESET_STREAM) or stops reading (STOP_SENDING) with code 0 closed
+			// the request normally, and classifying it as a failure turns every
+			// client-side connection abort into an ERROR log line. Non-zero
+			// codes stay errors and are still reported.
+			return streamErr.ErrorCode == 0
 		}
 		var transportErr *quic.TransportError
 		if errors.As(e.err, &transportErr) {
