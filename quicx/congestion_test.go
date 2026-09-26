@@ -9,7 +9,7 @@ func TestParseBBRProfile(t *testing.T) {
 		expected string
 		wantErr  bool
 	}{
-		{name: "default", expected: "standard"},
+		{name: "default", expected: "conservative"},
 		{name: "conservative", profile: "conservative", expected: "conservative"},
 		{name: "standard", profile: "standard", expected: "standard"},
 		{name: "aggressive", profile: "aggressive", expected: "aggressive"},
