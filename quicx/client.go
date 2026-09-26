@@ -20,6 +20,7 @@ import (
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
@@ -35,6 +36,11 @@ type ClientOptions struct {
 	Heartbeat     time.Duration
 	BBRProfile    string
 	Tracer        func(ctx context.Context, isClient bool, connID quic.ConnectionID) qlogwriter.Trace
+	// Logger receives the dial diagnostics. A failed dial is otherwise only
+	// visible as a generic error to the caller, which cannot tell whether the
+	// address failed to resolve, the handshake timed out, or the server
+	// rejected the authentication.
+	Logger logger.Logger
 }
 
 type Client struct {
@@ -46,6 +52,7 @@ type Client struct {
 	password   string
 	heartbeat  time.Duration
 	bbrProfile congestion_meta2.Profile
+	logger     logger.Logger
 
 	connAccess sync.Mutex
 	conn       *clientQUICConnection
@@ -55,6 +62,9 @@ type Client struct {
 func NewClient(options ClientOptions) (*Client, error) {
 	if options.Heartbeat == 0 {
 		options.Heartbeat = 10 * time.Second
+	}
+	if options.Logger == nil {
+		options.Logger = logger.NOP()
 	}
 	bbrProfile, err := parseBBRProfile(options.BBRProfile)
 	if err != nil {
@@ -87,6 +97,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		password:   options.Password,
 		heartbeat:  options.Heartbeat,
 		bbrProfile: bbrProfile,
+		logger:     options.Logger,
 	}, nil
 }
 
@@ -172,15 +183,25 @@ func (c *Client) completeOffer(pending *clientOffer, offerCtx context.Context) {
 }
 
 func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
+	dialStart := time.Now()
 	udpConn, err := c.dialer.DialContext(ctx, "udp", c.serverAddr)
 	if err != nil {
+		// The dialer resolves the configured server address itself, so this
+		// stage covers resolving the address and setting up the UDP socket;
+		// the error tells which of the two failed. It is logged because the
+		// caller only sees a generic dial failure, which is what made an
+		// unreachable path indistinguishable from a rejecting server.
+		c.logger.Error("QUICX dial failed: stage=dial transport=udp server=", c.serverAddr, " elapsed=", dialElapsed(dialStart), " error=", err)
 		return nil, err
 	}
+	remote := M.SocksaddrFromNet(udpConn.RemoteAddr())
 	quicConn, err := qtls.DialEarly(ctx, udpConn, c.tlsConfig, c.quicConfig)
 	if err != nil {
 		udpConn.Close()
+		c.logger.Error("QUICX dial failed: stage=handshake transport=quic server=", c.serverAddr, " remote=", remote, " elapsed=", dialElapsed(dialStart), " error=", err)
 		return nil, E.Cause(err, "open connection")
 	}
+	c.logger.Debug("QUICX dial: stage=handshake transport=quic server=", c.serverAddr, " remote=", remote, " elapsed=", dialElapsed(dialStart))
 	setCongestion(c.ctx, quicConn, c.bbrProfile)
 	// 0-RTT data is not replay protected, so every connection authenticates
 	// with a fresh random nonce which the server remembers: a replayed 0-RTT
@@ -207,12 +228,36 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	go func() {
 		hErr := c.clientHandshake(conn)
 		if hErr != nil {
+			c.logger.Error("QUICX dial failed: stage=auth transport=quic server=", c.serverAddr, " remote=", remote, " elapsed=", dialElapsed(dialStart), " error=", hErr)
 			conn.closeWithError(hErr)
+		}
+	}()
+	go func() {
+		// The cause is the reason the connection ended: an idle timeout, a
+		// peer CONNECTION_CLOSE, a local close, or the network change handler.
+		<-quicConn.Context().Done()
+		closeCause := context.Cause(quicConn.Context())
+		select {
+		case <-quicConn.HandshakeComplete():
+			c.logger.Debug("QUICX connection closed: server=", c.serverAddr, " remote=", remote, " elapsed=", dialElapsed(dialStart), " error=", closeCause)
+		default:
+			// DialEarly returns before the handshake completes, so a dial that
+			// never got an answer fails here, not in the call above. This is
+			// the line which separates an unreachable path (a timeout) from a
+			// server refusing the connection (a TLS or QUIC error), and the
+			// elapsed time is how long the attempt took to fail.
+			c.logger.Error("QUICX dial failed: stage=handshake transport=quic server=", c.serverAddr, " remote=", remote, " elapsed=", dialElapsed(dialStart), " error=", closeCause)
 		}
 	}()
 	go c.loopMessages(conn)
 	go c.loopHeartbeats(conn)
 	return conn, nil
+}
+
+// dialElapsed rounds a dial timing to milliseconds: the diagnostics are meant
+// to be read from a log file, where sub-millisecond precision is noise.
+func dialElapsed(start time.Time) time.Duration {
+	return time.Since(start).Round(time.Millisecond)
 }
 
 func (c *Client) clientHandshake(conn *clientQUICConnection) error {
