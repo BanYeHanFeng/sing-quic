@@ -168,6 +168,25 @@ func datagramMTU(maxDatagramPayloadSize int64, headerSize int) (int, error) {
 	return udpMTU, nil
 }
 
+// initialUDPPacketSize seeds the packet size used for fragmentation from the
+// DATAGRAM payload limit the connection reports for the peer. Without it every
+// session starts at the QUIC minimum of 1200 bytes and learns the real limit
+// only from a rejected DATAGRAM: a path which can carry 1400 bytes then keeps
+// splitting every message above ~1180 bytes into two frames for its whole
+// lifetime. A limit which cannot carry the fragment header is ignored, and the
+// per-message validation in writeMessage rejects it if the peer reported it
+// anyway.
+func initialUDPPacketSize(maxDatagramPayloadSize int64) int {
+	if maxDatagramPayloadSize <= 0 {
+		return initialUDPMTU
+	}
+	udpMTU := int(maxDatagramPayloadSize) - udpMTUSafetyMargin
+	if udpMTU <= 0 {
+		return initialUDPMTU
+	}
+	return udpMTU
+}
+
 var (
 	_ N.NetPacketConn    = (*udpPacketConn)(nil)
 	_ N.PacketReadWaiter = (*udpPacketConn)(nil)
@@ -202,8 +221,21 @@ func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, sessionID uint16
 		onDestroy:    onDestroy,
 		readDeadline: pipe.MakeDeadline(),
 	}
-	packetConn.udpMTU.Store(initialUDPMTU)
+	packetConn.udpMTU.Store(int64(initialUDPPacketSize(quicConn.MaxDatagramPayloadSize())))
 	return packetConn
+}
+
+// refreshUDPMTU adopts the DATAGRAM payload limit of the connection when it
+// grew, which is how a session follows path MTU discovery: the estimate only
+// rises while the path is probed, and a limit which shrank is still handled by
+// the DatagramTooLargeError retry in writeMessage. The peer's own DATAGRAM
+// limit is fixed for the connection, so the connection's limit never falls
+// below the value seeded at session creation unless the path changed.
+func (c *udpPacketConn) refreshUDPMTU() {
+	udpMTU := initialUDPPacketSize(c.quicConn.MaxDatagramPayloadSize())
+	if udpMTU > int(c.udpMTU.Load()) {
+		c.udpMTU.Store(int64(udpMTU))
+	}
 }
 
 func (c *udpPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
@@ -298,6 +330,7 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 // current MTU, and retries once with the MTU reported by quic-go when the
 // DATAGRAM was rejected as too large.
 func (c *udpPacketConn) writeMessage(message *udpMessage) error {
+	c.refreshUDPMTU()
 	udpMTU := int(c.udpMTU.Load())
 	var err error
 	if message.data.Len() > udpMTU-message.headerSize() {

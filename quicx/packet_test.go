@@ -56,6 +56,32 @@ func TestDatagramMTURejectsInvalidPeerLimit(t *testing.T) {
 	}
 }
 
+// TestInitialUDPPacketSize covers the seed of the fragmentation packet size
+// from the connection's DATAGRAM limit: the QUIC minimum is the fallback for a
+// limit which is missing or unusable, and a usable limit is used as-is minus
+// the safety margin instead of waiting for a rejected DATAGRAM.
+func TestInitialUDPPacketSize(t *testing.T) {
+	tests := []struct {
+		name     string
+		reported int64
+		expected int
+	}{
+		{name: "unset", reported: 0, expected: initialUDPMTU},
+		{name: "negative", reported: -1, expected: initialUDPMTU},
+		{name: "below margin", reported: udpMTUSafetyMargin, expected: initialUDPMTU},
+		{name: "quic minimum", reported: 1200, expected: 1200 - udpMTUSafetyMargin},
+		{name: "path mtu", reported: 1441, expected: 1441 - udpMTUSafetyMargin},
+		{name: "peer frame limit", reported: 16383, expected: 16383 - udpMTUSafetyMargin},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if udpMTU := initialUDPPacketSize(test.reported); udpMTU != test.expected {
+				t.Fatalf("expected MTU %d for a reported payload size of %d, got %d", test.expected, test.reported, udpMTU)
+			}
+		})
+	}
+}
+
 // TestFragUDPMessageRejectsInvalidPacketSize covers the packet size a peer can
 // force through a forged max_datagram_frame_size: a non-positive fragment size
 // used to panic with "slice bounds out of range" or to loop forever while
