@@ -29,5 +29,5 @@ require (
 
 replace (
 	github.com/sagernet/quic-go => github.com/reF1nd/quic-go v0.61.0-sing-box-mod.7.0.20260924064108-532bb9d79a9c
-	github.com/sagernet/sing => github.com/reF1nd/sing v0.9.6-0.20260924064739-a7656b438274
+	github.com/sagernet/sing => github.com/reF1nd/sing v0.9.6-0.20260927113142-c7be413e41f3
 )

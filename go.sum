@@ -28,6 +28,8 @@ github.com/reF1nd/quic-go v0.61.0-sing-box-mod.7.0.20260924064108-532bb9d79a9c h
 github.com/reF1nd/quic-go v0.61.0-sing-box-mod.7.0.20260924064108-532bb9d79a9c/go.mod h1:hmLC8GJPp+BrpBgrgJnacvI4fZGIhasuy1ROJJ8GR4E=
 github.com/reF1nd/sing v0.9.6-0.20260924064739-a7656b438274 h1:SoReXEXd85ek2SWhvuLcj6aFLvGhvUFnFwsM/Wz2lUE=
 github.com/reF1nd/sing v0.9.6-0.20260924064739-a7656b438274/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+github.com/reF1nd/sing v0.9.6-0.20260927113142-c7be413e41f3 h1:qOIl0yoqQHFdiXyTxdqccORHBpwah1pWjipqyT/RY0Q=
+github.com/reF1nd/sing v0.9.6-0.20260927113142-c7be413e41f3/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2/go.mod h1:djNgcEr1/C05ACkg1iLfiJU5Ep61QUkGW8qpdssI0+w=
