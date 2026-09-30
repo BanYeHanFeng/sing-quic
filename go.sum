@@ -24,8 +24,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/quic-go/qpack v0.6.0 h1:g7W+BMYynC1LbYLSqRt8PBg5Tgwxn214ZZR34VIOjz8=
 github.com/quic-go/qpack v0.6.0/go.mod h1:lUpLKChi8njB4ty2bFLX2x4gzDqXwUpaO1DP9qMDZII=
-github.com/reF1nd/quic-go v0.61.0-sing-box-mod.12.0.20261025115720-423101e571e1 h1:9Z+5/Hb4b3j207SvTsuRJ3K2uYZn+AIjLmAJGZH6Huo=
-github.com/reF1nd/quic-go v0.61.0-sing-box-mod.12.0.20261025115720-423101e571e1/go.mod h1:hmLC8GJPp+BrpBgrgJnacvI4fZGIhasuy1ROJJ8GR4E=
+github.com/reF1nd/quic-go v0.61.0-sing-box-mod.12.0.20261025115808-cdf6f5ebb402 h1:UMHgnbXYXhquzktiAmPKzfMrxnqXNbPpaJDLnuXCABo=
+github.com/reF1nd/quic-go v0.61.0-sing-box-mod.12.0.20261025115808-cdf6f5ebb402/go.mod h1:hmLC8GJPp+BrpBgrgJnacvI4fZGIhasuy1ROJJ8GR4E=
 github.com/reF1nd/sing v0.9.7-0.20261025115535-5e20e909a98e h1:qrooCZ4vu63S4LG5L2Ujqt+fVNRXOH7YKoMhqc97jVo=
 github.com/reF1nd/sing v0.9.7-0.20261025115535-5e20e909a98e/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
