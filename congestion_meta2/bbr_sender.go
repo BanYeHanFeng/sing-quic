@@ -9,6 +9,8 @@ import (
 
 	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/monotime"
+	"github.com/sagernet/quic-go/qlog"
+	"github.com/sagernet/quic-go/qlogwriter"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
@@ -314,9 +316,58 @@ type bbrSender struct {
 	maxDatagramSize congestion.ByteCount
 	// Recorded on packet sent. equivalent |unacked_packets_->bytes_in_flight()|
 	bytesInFlight congestion.ByteCount
+
+	// qlogger is the connection's qlog recorder, injected by
+	// Conn.SetCongestionControl when tracing is enabled. BBR's phase decides
+	// how the sending rate is computed, so without it a trace cannot explain
+	// the cwnd it shows.
+	qlogger qlogwriter.Recorder
+	// lastState is the BBR state which was last reported to qlogger, used to
+	// report every transition exactly once.
+	lastState qlog.CongestionState
 }
 
 var _ congestion.CongestionControlEx = &bbrSender{}
+
+// SetQlogger attaches the connection's qlog recorder. It is called by
+// Conn.SetCongestionControl when tracing is enabled, right after this sender
+// replaced the connection's own controller, so the trace shows the state BBR
+// starts in at that point rather than at the start of the connection.
+func (b *bbrSender) SetQlogger(qlogger qlogwriter.Recorder) {
+	b.qlogger = qlogger
+	// Clear the cached state so the current one is reported even if it equals
+	// the state a previously installed controller reported.
+	b.lastState = ""
+	b.maybeTraceStateChange(congestionStateForMode(b.mode))
+}
+
+// congestionStateForMode maps a BBR mode to the congestion state reported in
+// the qlog trace.
+func congestionStateForMode(mode bbrMode) qlog.CongestionState {
+	switch mode {
+	case bbrModeStartup:
+		return qlog.CongestionStateStartup
+	case bbrModeDrain:
+		return qlog.CongestionStateDrain
+	case bbrModeProbeBw:
+		return qlog.CongestionStateProbeBw
+	case bbrModeProbeRtt:
+		return qlog.CongestionStateProbeRtt
+	default:
+		return ""
+	}
+}
+
+// maybeTraceStateChange records a BBR state transition. Reporting the same
+// state twice is dropped: BBR re-enters a mode from several paths, and only the
+// transitions carry information.
+func (b *bbrSender) maybeTraceStateChange(state qlog.CongestionState) {
+	if b.qlogger == nil || state == "" || state == b.lastState {
+		return
+	}
+	b.qlogger.RecordEvent(qlog.CongestionStateUpdated{State: state})
+	b.lastState = state
+}
 
 func NewBbrSenderWithProfile(
 	initialMaxDatagramSize congestion.ByteCount,
@@ -689,7 +740,7 @@ func (b *bbrSender) maybeUpdateMinRtt(now monotime.Time, sampleMinRtt time.Durat
 // Enters the STARTUP mode.
 func (b *bbrSender) enterStartupMode(now monotime.Time) {
 	b.mode = bbrModeStartup
-	// b.maybeTraceStateChange(logging.CongestionStateStartup)
+	b.maybeTraceStateChange(qlog.CongestionStateStartup)
 	b.pacingGain = b.highGain
 	b.congestionWindowGain = b.highCwndGain
 }
@@ -697,7 +748,7 @@ func (b *bbrSender) enterStartupMode(now monotime.Time) {
 // Enters the PROBE_BW mode.
 func (b *bbrSender) enterProbeBandwidthMode(now monotime.Time) {
 	b.mode = bbrModeProbeBw
-	// b.maybeTraceStateChange(logging.CongestionStateProbeBw)
+	b.maybeTraceStateChange(qlog.CongestionStateProbeBw)
 	b.congestionWindowGain = b.congestionWindowGainConstant
 
 	// Pick a random offset for the gain cycle out of {0, 2..7} range. 1 is
@@ -788,7 +839,7 @@ func (b *bbrSender) checkIfFullBandwidthReached(lastPacketSendState *sendTimeSta
 func (b *bbrSender) maybeExitStartupOrDrain(now monotime.Time) {
 	if b.mode == bbrModeStartup && b.isAtFullBandwidth {
 		b.mode = bbrModeDrain
-		// b.maybeTraceStateChange(logging.CongestionStateDrain)
+		b.maybeTraceStateChange(qlog.CongestionStateDrain)
 		b.pacingGain = b.drainGain
 		b.congestionWindowGain = b.highCwndGain
 	}
@@ -801,7 +852,7 @@ func (b *bbrSender) maybeExitStartupOrDrain(now monotime.Time) {
 func (b *bbrSender) maybeEnterOrExitProbeRtt(now monotime.Time, isRoundStart, minRttExpired bool) {
 	if minRttExpired && !b.exitingQuiescence && b.mode != bbrModeProbeRtt {
 		b.mode = bbrModeProbeRtt
-		// b.maybeTraceStateChange(logging.CongestionStateProbRtt)
+		b.maybeTraceStateChange(qlog.CongestionStateProbeRtt)
 		b.pacingGain = 1.0
 		// Do not decide on the time to exit PROBE_RTT until the |bytes_in_flight|
 		// is at the target small value.
@@ -810,7 +861,11 @@ func (b *bbrSender) maybeEnterOrExitProbeRtt(now monotime.Time, isRoundStart, mi
 
 	if b.mode == bbrModeProbeRtt {
 		b.sampler.OnAppLimited()
-		// b.maybeTraceStateChange(logging.CongestionStateApplicationLimited)
+		// quiche marks the sampler app-limited here (its
+		// CongestionStateApplicationLimited). It is deliberately not reported:
+		// it is not a BBR phase change, and emitting it would interleave the
+		// application_limited state with probe_rtt, hiding the probe_rtt
+		// intervals the trace is meant to show.
 
 		if b.exitProbeRttAt.IsZero() {
 			// If the window has reached the appropriate size, schedule exiting
