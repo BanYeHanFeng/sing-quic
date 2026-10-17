@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -631,4 +632,53 @@ func decodeUDPMessage(message *udpMessage, data []byte) error {
 	}
 	message.data = buf.As(data[len(data)-reader.Len():])
 	return nil
+}
+
+// Address family bytes of AddressSerializer, see the serializer options in
+// address.go.
+const (
+	addressFamilyFqdn  = 0x00
+	addressFamilyIPv4  = 0x01
+	addressFamilyIPv6  = 0x02
+	addressFamilyEmpty = 0xff
+)
+
+// decodeAddrPort parses a serialized destination and reports how many bytes it
+// consumed. The encoding is the one AddressSerializer writes: an address family
+// byte, the address, and a port when the address is valid.
+func decodeAddrPort(data []byte) (M.Socksaddr, int, error) {
+	if len(data) < 1 {
+		return M.Socksaddr{}, 0, io.ErrUnexpectedEOF
+	}
+	switch data[0] {
+	case addressFamilyIPv4:
+		if len(data) < 1+4+2 {
+			return M.Socksaddr{}, 0, io.ErrUnexpectedEOF
+		}
+		var address [4]byte
+		copy(address[:], data[1:5])
+		return M.Socksaddr{Addr: netip.AddrFrom4(address), Port: binary.BigEndian.Uint16(data[5:7])}, 7, nil
+	case addressFamilyIPv6:
+		if len(data) < 1+16+2 {
+			return M.Socksaddr{}, 0, io.ErrUnexpectedEOF
+		}
+		var address [16]byte
+		copy(address[:], data[1:17])
+		return M.Socksaddr{Addr: netip.AddrFrom16(address), Port: binary.BigEndian.Uint16(data[17:19])}.Unwrap(), 19, nil
+	case addressFamilyFqdn:
+		if len(data) < 2 {
+			return M.Socksaddr{}, 0, io.ErrUnexpectedEOF
+		}
+		fqdnLen := int(data[1])
+		if len(data) < 2+fqdnLen+2 {
+			return M.Socksaddr{}, 0, io.ErrUnexpectedEOF
+		}
+		fqdn := string(data[2 : 2+fqdnLen])
+		port := binary.BigEndian.Uint16(data[2+fqdnLen : 4+fqdnLen])
+		return M.ParseSocksaddrHostPort(fqdn, port), 4 + fqdnLen, nil
+	case addressFamilyEmpty:
+		return M.Socksaddr{}, 1, nil
+	default:
+		return M.Socksaddr{}, 0, E.New("unknown address family ", data[0])
+	}
 }
