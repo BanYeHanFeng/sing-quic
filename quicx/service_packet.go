@@ -1,6 +1,7 @@
 package quicx
 
 import (
+	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/canceler"
@@ -15,12 +16,12 @@ func (s *serverSession[U]) loopMessages() {
 	case <-s.authDone:
 	}
 	for {
-		message, err := s.quicConn.ReceiveDatagram(s.ctx)
+		message, owner, err := s.quicConn.ReceiveDatagramOwned(s.ctx)
 		if err != nil {
 			s.closeWithError(E.Cause(err, "receive message"))
 			return
 		}
-		hErr := s.handleMessage(message)
+		hErr := s.handleMessage(message, owner)
 		if hErr != nil {
 			s.closeWithError(E.Cause(hErr, "handle message"))
 			return
@@ -28,25 +29,29 @@ func (s *serverSession[U]) loopMessages() {
 	}
 }
 
-func (s *serverSession[U]) handleMessage(data []byte) error {
+func (s *serverSession[U]) handleMessage(data []byte, owner quic.DatagramBufferOwner) error {
 	if len(data) < 2 {
+		releaseDatagramOwner(owner)
 		return E.New("invalid message")
 	}
 	if data[0] != Version {
+		releaseDatagramOwner(owner)
 		return E.New("unknown version ", data[0])
 	}
 	switch data[1] {
 	case CommandPacket:
 		message := allocMessage()
-		err := decodeUDPMessage(message, data[2:])
+		err := decodeUDPMessage(message, data[2:], owner)
 		if err != nil {
 			message.releaseMessage()
 			return E.Cause(err, "decode UDP message")
 		}
 		return s.handleUDPMessage(message)
 	case CommandHeartbeat:
+		releaseDatagramOwner(owner)
 		return nil
 	default:
+		releaseDatagramOwner(owner)
 		return E.New("unknown command ", data[1])
 	}
 }

@@ -20,7 +20,7 @@ func (c *udpPacketConn) WaitReadPacket() (buffer *buf.Buffer, destination M.Sock
 		destination = p.destination
 		if c.readWaitOptions.NeedHeadroom() {
 			buffer = c.readWaitOptions.NewPacketBuffer()
-			_, err = buffer.Write(p.data.Bytes())
+			_, err = buffer.Write(p.data)
 			p.releaseMessage()
 			if err != nil {
 				buffer.Release()
@@ -28,8 +28,16 @@ func (c *udpPacketConn) WaitReadPacket() (buffer *buf.Buffer, destination M.Sock
 			}
 			c.readWaitOptions.PostReturn(buffer)
 		} else {
-			buffer = p.data
-			p.release()
+			// The caller takes the buffer over and releases it, so the payload
+			// has to be copied out of the message: the payload itself is
+			// recycled together with the message.
+			buffer = buf.NewSize(len(p.data))
+			_, err = buffer.Write(p.data)
+			p.releaseMessage()
+			if err != nil {
+				buffer.Release()
+				return nil, M.Socksaddr{}, err
+			}
 		}
 		return
 	case <-c.ctx.Done():
