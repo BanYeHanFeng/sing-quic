@@ -42,18 +42,30 @@ func (c *Client) handleUniStream(conn *clientQUICConnection, stream *quic.Receiv
 	defer stream.CancelRead(0)
 	var header [2]byte
 	n, _ := stream.Peek(header[:])
-	if n < 2 || header[0] != Version || header[1] != CommandCapability {
+	if n < 2 || header[0] != Version {
 		return
 	}
-	var message [3]byte
-	_, err := io.ReadFull(stream, message[:])
-	if err != nil {
-		return
+	switch header[1] {
+	case CommandCapability:
+		var message [3]byte
+		if _, err := io.ReadFull(stream, message[:]); err != nil {
+			return
+		}
+		conn.fec.setPeerCapabilities(message[2])
+		capabilities := c.fec.capabilities()
+		if capabilities == 0 {
+			return
+		}
+		_ = writeFECCapabilities(conn.ctx, conn.quicConn, capabilities)
+	case CommandFECReport:
+		var message [6]byte
+		if _, err := io.ReadFull(stream, message[:]); err != nil {
+			return
+		}
+		sessionID, lossPerMille, err := decodeFECReport(message[:])
+		if err != nil {
+			return
+		}
+		conn.setFECParity(sessionID, lossPerMille)
 	}
-	conn.fec.setPeerCapabilities(message[2])
-	capabilities := c.fec.capabilities()
-	if capabilities == 0 {
-		return
-	}
-	_ = writeFECCapabilities(conn.ctx, conn.quicConn, capabilities)
 }

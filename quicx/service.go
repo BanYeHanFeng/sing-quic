@@ -340,7 +340,7 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 
 func isQUICXUniCommand(command byte) bool {
 	switch command {
-	case CommandAuthenticate, CommandDissociate, CommandCapability:
+	case CommandAuthenticate, CommandDissociate, CommandCapability, CommandFECReport:
 		return true
 	default:
 		return false
@@ -411,6 +411,19 @@ func (s *serverSession[U]) handleQUICXUniStream(stream *quic.ReceiveStream) erro
 			}
 		}
 		s.fec.setPeerCapabilities(buffer.Byte(2))
+		return nil
+	case CommandFECReport:
+		if buffer.Len() < 6 {
+			_, err = buffer.ReadFullFrom(stream, 6-buffer.Len())
+			if err != nil {
+				return E.Cause(err, "read FEC report")
+			}
+		}
+		sessionID, lossPerMille, reportErr := decodeFECReport(buffer.Bytes())
+		if reportErr != nil {
+			return reportErr
+		}
+		s.setFECParity(sessionID, lossPerMille)
 		return nil
 	case CommandDissociate:
 		select {
