@@ -3,6 +3,7 @@ package quicx
 import (
 	"context"
 	"io"
+	"time"
 
 	"github.com/sagernet/quic-go"
 )
@@ -39,7 +40,7 @@ func (c *Client) loopUniStreams(conn *clientQUICConnection) {
 }
 
 func (c *Client) handleUniStream(conn *clientQUICConnection, stream *quic.ReceiveStream) {
-	defer stream.CancelRead(0)
+	_ = stream.SetReadDeadline(time.Now().Add(time.Second))
 	var header [2]byte
 	n, _ := stream.Peek(header[:])
 	if n < 2 || header[0] != Version {
@@ -47,6 +48,7 @@ func (c *Client) handleUniStream(conn *clientQUICConnection, stream *quic.Receiv
 	}
 	switch header[1] {
 	case CommandCapability:
+		defer stream.CancelRead(0)
 		var message [3]byte
 		if _, err := io.ReadFull(stream, message[:]); err != nil {
 			return
@@ -58,6 +60,7 @@ func (c *Client) handleUniStream(conn *clientQUICConnection, stream *quic.Receiv
 		}
 		_ = writeFECCapabilities(conn.ctx, conn.quicConn, capabilities)
 	case CommandFECReport:
+		defer stream.CancelRead(0)
 		var message [6]byte
 		if _, err := io.ReadFull(stream, message[:]); err != nil {
 			return
