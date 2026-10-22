@@ -51,6 +51,7 @@ type ServiceOptions struct {
 	AuthTimeout time.Duration
 	Heartbeat   time.Duration
 	UDPTimeout  time.Duration
+	FEC         FECOptions
 	// SilentDropTimeout is how long a session closed by
 	// AuthFailurePolicySilentDrop keeps its QUIC connection before it is
 	// reclaimed locally. No CONNECTION_CLOSE is sent before that, so a probe
@@ -90,6 +91,7 @@ type Service[U comparable] struct {
 	authFailurePolicy string
 	silentDropTimeout time.Duration
 	bbrProfile        congestion_meta2.Profile
+	fec               fecConfig
 	replayCache       *replayCache
 	sessionSeq        atomic.Uint64
 
@@ -150,6 +152,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		authFailurePolicy: options.AuthFailurePolicy,
 		silentDropTimeout: options.SilentDropTimeout,
 		bbrProfile:        bbrProfile,
+		fec:               options.FEC.build(),
 		replayCache:       newReplayCache(options.ReplayCacheSize, options.ReplayCacheTTL),
 	}, nil
 }
@@ -225,6 +228,7 @@ func (s *Service[U]) handleConnection(connection *quic.Conn) {
 		connDone:   make(chan struct{}),
 		authDone:   make(chan struct{}),
 		udpConnMap: make(map[uint16]*udpPacketConn),
+		fec:        newFECState(s.fec),
 		sessionID:  s.sessionSeq.Add(1),
 	}
 	session.handle()
@@ -244,6 +248,7 @@ type serverSession[U comparable] struct {
 	authUser   U
 	udpAccess  sync.RWMutex
 	udpConnMap map[uint16]*udpPacketConn
+	fec        *fecState
 	// sessionID identifies this session to the replay cache: a nonce which was
 	// recorded by another session is a replayed 0-RTT flight.
 	sessionID uint64
@@ -335,7 +340,7 @@ func (s *serverSession[U]) handleUniStream(stream *quic.ReceiveStream) error {
 
 func isQUICXUniCommand(command byte) bool {
 	switch command {
-	case CommandAuthenticate, CommandDissociate:
+	case CommandAuthenticate, CommandDissociate, CommandCapability:
 		return true
 	default:
 		return false
@@ -392,7 +397,21 @@ func (s *serverSession[U]) handleQUICXUniStream(stream *quic.ReceiveStream) erro
 		if s.replayCache.checkAndRecord(nonce, s.sessionID) {
 			return s.authFailure(E.New("authentication: replayed authentication request"))
 		}
-		return s.completeAuthentication(user)
+		authErr := s.completeAuthentication(user)
+		if authErr != nil {
+			return authErr
+		}
+		s.announceFECCapabilities()
+		return nil
+	case CommandCapability:
+		if buffer.Len() < 3 {
+			_, err = buffer.ReadFullFrom(stream, 3-buffer.Len())
+			if err != nil {
+				return E.Cause(err, "read FEC capability")
+			}
+		}
+		s.fec.setPeerCapabilities(buffer.Byte(2))
+		return nil
 	case CommandDissociate:
 		select {
 		case <-s.connDone:

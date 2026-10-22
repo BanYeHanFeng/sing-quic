@@ -53,6 +53,7 @@ type udpMessage struct {
 	packetID      uint16
 	fragmentTotal uint8
 	fragmentID    uint8
+	fec           bool
 	destination   M.Socksaddr
 	// data is the payload of the message.
 	//
@@ -133,6 +134,9 @@ func (m *udpMessage) pack() *wireBuffer {
 	binary.BigEndian.PutUint16(data[2:4], m.sessionID)
 	binary.BigEndian.PutUint16(data[4:6], m.packetID)
 	data[6] = m.fragmentTotal
+	if m.fec {
+		data[6] |= fecFragmentFlag
+	}
 	data[7] = m.fragmentID
 	binary.BigEndian.PutUint16(data[8:10], uint16(len(m.data)))
 	addressLen := writeAddrPort(data[udpMessageHeaderLen:], m.destination)
@@ -276,6 +280,7 @@ type udpPacketConn struct {
 	packetId        atomic.Uint32
 	closeOnce       sync.Once
 	isServer        bool
+	fec             *fecState
 	defragger       *udpDefragger
 	onDestroy       func()
 	readWaitOptions N.ReadWaitOptions
@@ -291,7 +296,7 @@ type udpPacketConn struct {
 	}
 }
 
-func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, sessionID uint16, isServer bool, onDestroy func()) *udpPacketConn {
+func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, sessionID uint16, isServer bool, fec *fecState, onDestroy func()) *udpPacketConn {
 	ctx, cancel := context.WithCancelCause(ctx)
 	packetConn := &udpPacketConn{
 		ctx:          ctx,
@@ -300,6 +305,7 @@ func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, sessionID uint16
 		quicConn:     quicConn,
 		data:         make(chan *udpMessage, 64),
 		isServer:     isServer,
+		fec:          fec,
 		defragger:    newUDPDefragger(),
 		onDestroy:    onDestroy,
 		readDeadline: pipe.MakeDeadline(),
@@ -454,15 +460,29 @@ func (c *udpPacketConn) writeMessage(message *udpMessage) error {
 }
 
 func (c *udpPacketConn) writeFragments(message *udpMessage, udpMTU int) error {
-	fragments, err := fragUDPMessage(message, udpMTU)
+	fragSize := udpMTU
+	if c.fec.intraMessageEnabled() {
+		fragSize -= fecParityLengthLen
+	}
+	fragments, err := fragUDPMessage(message, fragSize)
 	if err != nil {
 		return err
+	}
+	if c.fec.intraMessageEnabled() {
+		parity, parityErr := buildParityFragment(fragments)
+		if parityErr != nil {
+			releaseMessages(fragments)
+			return parityErr
+		}
+		if parity != nil {
+			fragments = append(fragments, parity)
+		}
 	}
 	return c.writePackets(fragments)
 }
 
 func (c *udpPacketConn) inputPacket(message *udpMessage) error {
-	if message.fragmentTotal <= 1 {
+	if !message.fec && message.fragmentTotal <= 1 {
 		select {
 		case c.data <- message:
 		default:
@@ -572,42 +592,86 @@ func releasePacketItem(item *packetItem) {
 	item.access.Lock()
 	messages := item.messages
 	item.messages = nil
+	parity := item.parity
+	item.parity = nil
 	item.count = 0
 	item.length = 0
 	item.access.Unlock()
 	releaseMessages(messages)
+	if parity != nil {
+		parity.releaseMessage()
+	}
 }
 
 type packetItem struct {
 	access   sync.Mutex
 	messages []*udpMessage
+	parity   *udpMessage
+	fec      bool
 	count    uint8
 	length   int
 }
 
+func (i *packetItem) resetLocked() {
+	releaseMessages(i.messages)
+	i.messages = nil
+	if i.parity != nil {
+		i.parity.releaseMessage()
+		i.parity = nil
+	}
+	i.count = 0
+	i.length = 0
+}
+
 // feed adds a fragment to its reassembly buffer and returns the complete
-// message once the last fragment arrived. Every error is a protocol violation
+// message once the last fragment arrived, or the repaired message once a
+// parity fragment filled the single hole. Every error is a protocol violation
 // reported by the peer.
 func (d *udpDefragger) feed(m *udpMessage) (*udpMessage, error) {
-	if m.fragmentTotal <= 1 {
+	dataTotal := m.fragmentTotal
+	fec := m.fec
+	if !fec && dataTotal <= 1 {
 		return m, nil
 	}
-	// The message is returned to the pool as soon as it was buffered, so every
-	// field which is used afterwards has to be captured first.
 	packetID := m.packetID
 	fragmentID := m.fragmentID
-	fragmentTotal := m.fragmentTotal
-	if fragmentID >= fragmentTotal {
+	if fec {
+		if dataTotal < 2 || dataTotal > fecMaxDataFragments {
+			m.releaseMessage()
+			return nil, E.New("invalid fec fragment count ", dataTotal)
+		}
+		if fragmentID > dataTotal {
+			m.releaseMessage()
+			return nil, E.New("invalid fec fragment ", fragmentID, " of ", dataTotal)
+		}
+	} else if fragmentID >= dataTotal {
 		m.releaseMessage()
-		return nil, E.New("invalid fragment ", fragmentID, " of ", fragmentTotal)
+		return nil, E.New("invalid fragment ", fragmentID, " of ", dataTotal)
 	}
 	item, _ := d.packetMap.LoadOrStore(packetID, newPacketItem)
 	item.access.Lock()
-	if len(item.messages) != int(fragmentTotal) {
-		releaseMessages(item.messages)
-		item.messages = make([]*udpMessage, fragmentTotal)
-		item.count = 0
-		item.length = 0
+	if item.fec != fec || len(item.messages) != int(dataTotal) {
+		item.resetLocked()
+		item.fec = fec
+		item.messages = make([]*udpMessage, dataTotal)
+	}
+	if fragmentID == dataTotal {
+		if item.parity != nil {
+			item.access.Unlock()
+			m.releaseMessage()
+			return nil, nil
+		}
+		if len(m.data) < fecParityLengthLen {
+			item.access.Unlock()
+			m.releaseMessage()
+			return nil, E.New("invalid fec parity fragment")
+		}
+		item.parity = m
+		if int(item.count) != int(dataTotal)-1 {
+			item.access.Unlock()
+			return nil, nil
+		}
+		return d.recoverLocked(item, packetID)
 	}
 	if item.messages[fragmentID] != nil {
 		item.access.Unlock()
@@ -615,13 +679,7 @@ func (d *udpDefragger) feed(m *udpMessage) (*udpMessage, error) {
 		return nil, nil
 	}
 	if item.length+len(m.data) > maxDefragmentSize {
-		// The reassembled message cannot be represented by the uint16 length
-		// field of the wire format. Drop the whole entry instead of
-		// accumulating further fragments.
-		releaseMessages(item.messages)
-		item.messages = nil
-		item.count = 0
-		item.length = 0
+		item.resetLocked()
 		item.access.Unlock()
 		d.packetMap.Delete(packetID)
 		m.releaseMessage()
@@ -630,39 +688,118 @@ func (d *udpDefragger) feed(m *udpMessage) (*udpMessage, error) {
 	item.messages[fragmentID] = m
 	item.count++
 	item.length += len(m.data)
-	if int(item.count) != len(item.messages) {
-		item.access.Unlock()
-		return nil, nil
+	if int(item.count) == len(item.messages) {
+		return d.completeLocked(item, packetID)
 	}
+	if fec && item.parity != nil && int(item.count) == len(item.messages)-1 {
+		return d.recoverLocked(item, packetID)
+	}
+	item.access.Unlock()
+	return nil, nil
+}
+
+func (d *udpDefragger) completeLocked(item *packetItem, packetID uint16) (*udpMessage, error) {
 	newMessage := allocMessage()
 	*newMessage = *item.messages[0]
 	newMessage.fragmentTotal = 1
 	newMessage.fragmentID = 0
-	// The payload of the first fragment is not what the reassembled message
-	// carries, and the fragments release their own payloads below.
+	newMessage.fec = false
 	newMessage.buffer = nil
-	// The accumulated length was bounded above, so this buffer fits every
-	// fragment.
 	reassembled := getWireBuffer(item.length)
 	newMessage.owner = reassembled
 	newMessage.data = reassembled.data[:0]
-	var writeErr error
 	for _, message := range item.messages {
-		if writeErr == nil {
-			newMessage.data = append(newMessage.data, message.data...)
-		}
+		newMessage.data = append(newMessage.data, message.data...)
 		message.releaseMessage()
 	}
+	parity := item.parity
 	item.messages = nil
+	item.parity = nil
 	item.count = 0
 	item.length = 0
 	item.access.Unlock()
-	// The reassembly is complete: the entry is not kept until its age expires.
-	d.packetMap.Delete(packetID)
-	if writeErr != nil {
-		newMessage.releaseMessage()
-		return nil, E.Cause(writeErr, "reassemble UDP message")
+	if parity != nil {
+		parity.releaseMessage()
 	}
+	d.packetMap.Delete(packetID)
+	return newMessage, nil
+}
+
+func (d *udpDefragger) recoverLocked(item *packetItem, packetID uint16) (*udpMessage, error) {
+	parity := item.parity
+	if parity == nil || len(parity.data) < fecParityLengthLen {
+		item.resetLocked()
+		item.access.Unlock()
+		d.packetMap.Delete(packetID)
+		return nil, E.New("invalid fec parity fragment")
+	}
+	totalLen := int(binary.BigEndian.Uint16(parity.data[:fecParityLengthLen]))
+	body := parity.data[fecParityLengthLen:]
+	missing := -1
+	presentLen := 0
+	var template *udpMessage
+	for index, message := range item.messages {
+		if message == nil {
+			if missing >= 0 {
+				item.resetLocked()
+				item.access.Unlock()
+				d.packetMap.Delete(packetID)
+				return nil, nil
+			}
+			missing = index
+			continue
+		}
+		if template == nil {
+			template = message
+		}
+		presentLen += len(message.data)
+	}
+	if template == nil {
+		item.resetLocked()
+		item.access.Unlock()
+		d.packetMap.Delete(packetID)
+		return nil, E.New("fec reassembly has no buffered fragment")
+	}
+	missingLen := totalLen - presentLen
+	if missingLen <= 0 || missingLen > len(body) {
+		item.resetLocked()
+		item.access.Unlock()
+		d.packetMap.Delete(packetID)
+		return nil, E.New("fec parity does not match the buffered fragments")
+	}
+	recovered := getWireBuffer(missingLen)
+	copy(recovered.data, body[:missingLen])
+	for _, message := range item.messages {
+		if message != nil {
+			xorBytes(recovered.data, message.data)
+		}
+	}
+	reassembled := getWireBuffer(totalLen)
+	reassembled.data = reassembled.data[:0]
+	for index, message := range item.messages {
+		if index == missing {
+			reassembled.data = append(reassembled.data, recovered.data...)
+			continue
+		}
+		reassembled.data = append(reassembled.data, message.data...)
+	}
+	recovered.ReleaseDatagramBuffer()
+	newMessage := allocMessage()
+	*newMessage = *template
+	newMessage.fragmentTotal = 1
+	newMessage.fragmentID = 0
+	newMessage.fec = false
+	newMessage.buffer = nil
+	newMessage.owner = reassembled
+	newMessage.data = reassembled.data
+	releaseMessages(item.messages)
+	item.messages = nil
+	item.parity = nil
+	item.count = 0
+	item.length = 0
+	item.access.Unlock()
+	parity.releaseMessage()
+	d.packetMap.Delete(packetID)
 	return newMessage, nil
 }
 
@@ -686,7 +823,7 @@ func decodeUDPMessage(message *udpMessage, data []byte, owner quic.DatagramBuffe
 	}
 	message.sessionID = binary.BigEndian.Uint16(data[0:2])
 	message.packetID = binary.BigEndian.Uint16(data[2:4])
-	message.fragmentTotal = data[4]
+	message.fragmentTotal, message.fec = fecDataFragmentCount(data[4])
 	message.fragmentID = data[5]
 	dataLength := int(binary.BigEndian.Uint16(data[6:8]))
 	destination, addressLen, err := decodeAddrPort(data[udpMessageBodyHeaderLen:])

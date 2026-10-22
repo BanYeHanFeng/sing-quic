@@ -24,4 +24,5 @@ const (
 	CommandPacket
 	CommandDissociate
 	CommandHeartbeat
+	CommandCapability
 )

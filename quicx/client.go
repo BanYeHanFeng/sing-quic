@@ -35,6 +35,7 @@ type ClientOptions struct {
 	Password      string
 	Heartbeat     time.Duration
 	BBRProfile    string
+	FEC           FECOptions
 	Tracer        func(ctx context.Context, isClient bool, connID quic.ConnectionID) qlogwriter.Trace
 	// Logger receives the dial diagnostics. A failed dial is otherwise only
 	// visible as a generic error to the caller, which cannot tell whether the
@@ -52,6 +53,7 @@ type Client struct {
 	password   string
 	heartbeat  time.Duration
 	bbrProfile congestion_meta2.Profile
+	fec        fecConfig
 	logger     logger.Logger
 
 	connAccess sync.Mutex
@@ -97,6 +99,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		password:   options.Password,
 		heartbeat:  options.Heartbeat,
 		bbrProfile: bbrProfile,
+		fec:        options.FEC.build(),
 		logger:     options.Logger,
 	}, nil
 }
@@ -224,6 +227,7 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		connDone:   make(chan struct{}),
 		udpConnMap: make(map[uint16]*udpPacketConn),
 		authNonce:  authNonce,
+		fec:        newFECState(c.fec),
 	}
 	go func() {
 		hErr := c.clientHandshake(conn)
@@ -251,6 +255,7 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	}()
 	go c.loopMessages(conn)
 	go c.loopHeartbeats(conn)
+	go c.loopUniStreams(conn)
 	return conn, nil
 }
 
@@ -326,7 +331,7 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 	// destroy callback captures a value which is never reassigned afterwards.
 	sessionID := conn.udpSessionID
 	conn.udpSessionID++
-	clientPacketConn := newUDPPacketConn(c.ctx, conn.quicConn, sessionID, false, func() {
+	clientPacketConn := newUDPPacketConn(c.ctx, conn.quicConn, sessionID, false, conn.fec, func() {
 		conn.udpAccess.Lock()
 		delete(conn.udpConnMap, sessionID)
 		conn.udpAccess.Unlock()
@@ -519,6 +524,7 @@ type clientQUICConnection struct {
 	udpConnMap   map[uint16]*udpPacketConn
 	udpSessionID uint16
 	authNonce    [AuthNonceLen]byte
+	fec          *fecState
 }
 
 func (c *clientQUICConnection) active() bool {
