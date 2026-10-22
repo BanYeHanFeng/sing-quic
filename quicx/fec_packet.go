@@ -87,6 +87,10 @@ func (c *udpPacketConn) deliverFECBody(body []byte) error {
 		message.releaseMessage()
 		return E.Cause(err, "decode fec message")
 	}
+	if message.sessionID != c.sessionID {
+		message.releaseMessage()
+		return nil
+	}
 	buffer := getWireBuffer(len(message.data))
 	copy(buffer.data, message.data)
 	message.data = buffer.data
