@@ -47,6 +47,12 @@ func (s *serverSession[U]) handleMessage(data []byte, owner quic.DatagramBufferO
 			return E.Cause(err, "decode UDP message")
 		}
 		return s.handleUDPMessage(message)
+	case CommandFECPacket:
+		packet, err := decodeFECPacket(data[2:], owner)
+		if err != nil {
+			return E.Cause(err, "decode fec packet")
+		}
+		return s.handleFECPacket(packet)
 	case CommandHeartbeat:
 		releaseDatagramOwner(owner)
 		return nil
@@ -83,4 +89,24 @@ func (s *serverSession[U]) handleUDPMessage(message *udpMessage) error {
 		go s.handler.NewPacketConnectionEx(newCtx, newConn, M.SocksaddrFromNet(s.quicConn.RemoteAddr()).Unwrap(), message.destination, nil)
 	}
 	return udpConn.inputPacket(message)
+}
+
+func (s *serverSession[U]) handleFECPacket(packet fecPacket) error {
+	s.udpAccess.RLock()
+	udpConn, loaded := s.udpConnMap[packet.sessionID]
+	s.udpAccess.RUnlock()
+	if !loaded || common.Done(udpConn.ctx) {
+		return nil
+	}
+	return udpConn.inputFECPacket(packet)
+}
+
+func (s *serverSession[U]) setFECParity(sessionID uint16, lossPerMille uint16) {
+	s.udpAccess.RLock()
+	udpConn, loaded := s.udpConnMap[sessionID]
+	s.udpAccess.RUnlock()
+	if !loaded {
+		return
+	}
+	udpConn.setFECParity(lossPerMille)
 }

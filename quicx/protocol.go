@@ -25,4 +25,6 @@ const (
 	CommandDissociate
 	CommandHeartbeat
 	CommandCapability
+	CommandFECPacket
+	CommandFECReport
 )

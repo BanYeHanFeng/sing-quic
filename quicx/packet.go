@@ -124,24 +124,30 @@ func (b *wireBuffer) ReleaseDatagramBuffer() {
 }
 
 func (m *udpMessage) pack() *wireBuffer {
-	buffer := getWireBuffer(m.headerSize() + len(m.data))
+	buffer := getWireBuffer(2 + m.bodySize())
 	data := buffer.data
-	// The fixed part of the header is written in one go: binary.Write goes
-	// through reflection and a separate io.Writer call per field, and this
-	// function runs once per forwarded datagram.
 	data[0] = Version
 	data[1] = CommandPacket
-	binary.BigEndian.PutUint16(data[2:4], m.sessionID)
-	binary.BigEndian.PutUint16(data[4:6], m.packetID)
-	data[6] = m.fragmentTotal
-	if m.fec {
-		data[6] |= fecFragmentFlag
-	}
-	data[7] = m.fragmentID
-	binary.BigEndian.PutUint16(data[8:10], uint16(len(m.data)))
-	addressLen := writeAddrPort(data[udpMessageHeaderLen:], m.destination)
-	copy(data[udpMessageHeaderLen+addressLen:], m.data)
+	m.writeBody(data[2:])
 	return buffer
+}
+
+func (m *udpMessage) bodySize() int {
+	return udpMessageBodyHeaderLen + AddressSerializer.AddrPortLen(m.destination) + len(m.data)
+}
+
+func (m *udpMessage) writeBody(data []byte) int {
+	binary.BigEndian.PutUint16(data[0:2], m.sessionID)
+	binary.BigEndian.PutUint16(data[2:4], m.packetID)
+	total := m.fragmentTotal
+	if m.fec {
+		total |= fecFragmentFlag
+	}
+	data[4] = total
+	data[5] = m.fragmentID
+	binary.BigEndian.PutUint16(data[6:8], uint16(len(m.data)))
+	addressLen := writeAddrPort(data[udpMessageBodyHeaderLen:], m.destination)
+	return udpMessageBodyHeaderLen + addressLen + copy(data[udpMessageBodyHeaderLen+addressLen:], m.data)
 }
 
 // udpMessageBodyHeaderLen is the size of the fixed part of a packet message
@@ -281,6 +287,9 @@ type udpPacketConn struct {
 	closeOnce       sync.Once
 	isServer        bool
 	fec             *fecState
+	fecBlock        *fecBlockEncoder
+	fecAccess       sync.Mutex
+	fecDecoder      *fecBlockDecoder
 	defragger       *udpDefragger
 	onDestroy       func()
 	readWaitOptions N.ReadWaitOptions
@@ -311,6 +320,9 @@ func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, sessionID uint16
 		readDeadline: pipe.MakeDeadline(),
 	}
 	packetConn.udpMTU.Store(int64(initialUDPPacketSize(quicConn.MaxDatagramPayloadSize())))
+	if fec != nil && fec.config.block {
+		packetConn.fecBlock = newFECBlockEncoder(fec.config)
+	}
 	return packetConn
 }
 
@@ -438,6 +450,9 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 func (c *udpPacketConn) writeMessage(message *udpMessage) error {
 	c.refreshUDPMTU()
 	udpMTU := int(c.udpMTU.Load())
+	if c.fec.blockEnabled() && c.fecBlock != nil && c.fecBlock.currentParity() > 0 && len(message.data)+message.headerSize()+fecBlockHeaderLen <= udpMTU {
+		return c.writeFECBlockMessage(message)
+	}
 	var err error
 	if len(message.data) > udpMTU-message.headerSize() {
 		err = c.writeFragments(message, udpMTU)
