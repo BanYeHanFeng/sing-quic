@@ -152,8 +152,12 @@ type handshakeResult struct {
 	localConnID connectionID
 	// peerConnID is the id this end addresses the peer by.
 	peerConnID connectionID
-	send       keyRing
-	recv       keyRing
+	// keyID is the key the client authenticated with. It is the client's own
+	// on both ends, which is what lets the server tell which account a
+	// connection belongs to without the password ever being sent.
+	keyID [keyIDLen]byte
+	send  keyRing
+	recv  keyRing
 }
 
 // clientHandshake is the client side of the handshake. It builds the hello once
@@ -164,6 +168,7 @@ type clientHandshake struct {
 	// connID is the id this end receives on, and the one its hello is addressed
 	// to.
 	connID     connectionID
+	keyID      [keyIDLen]byte
 	random     [randomLen]byte
 	privateKey *ecdh.PrivateKey
 	// transcript is the ClientHello up to its MAC, starting with the clear
@@ -187,13 +192,13 @@ func newClientHandshake(credential Credential) (*clientHandshake, error) {
 	if err != nil {
 		return nil, err
 	}
-	keyID := credential.KeyID()
+	h.keyID = credential.KeyID()
 	h.packet = header{ConnectionID: h.connID, Type: packetTypeHandshake}.appendTo(nil)
 	h.transcript = make([]byte, 0, headerLen+clientHelloBodyLen-macLen)
 	h.transcript = append(h.transcript, h.packet...)
 	h.transcript = append(h.transcript, handshakeTagClient)
 	h.transcript = append(h.transcript, versionBytes()...)
-	h.transcript = append(h.transcript, keyID[:]...)
+	h.transcript = append(h.transcript, h.keyID[:]...)
 	h.transcript = append(h.transcript, h.random[:]...)
 	h.transcript = append(h.transcript, privateKey.PublicKey().Bytes()...)
 	h.authKey = credential.AuthKey(h.transcript)
@@ -252,6 +257,7 @@ func (h *clientHandshake) handleResponse(packet []byte) (handshakeResult, error)
 	return handshakeResult{
 		localConnID: h.connID,
 		peerConnID:  packetHeader.ConnectionID,
+		keyID:       h.keyID,
 		send:        send,
 		recv:        recv,
 	}, nil
@@ -263,6 +269,7 @@ func (h *clientHandshake) handleResponse(packet []byte) (handshakeResult, error)
 type serverHandshake struct {
 	clientConnID    connectionID
 	connID          connectionID
+	keyID           [keyIDLen]byte
 	clientRandom    []byte
 	serverRandom    [randomLen]byte
 	clientPublicKey *ecdh.PublicKey
@@ -313,6 +320,7 @@ func newServerHandshake(clientHello []byte, verifier Verifier) (*serverHandshake
 	}
 	h := &serverHandshake{
 		clientConnID:    packetHeader.ConnectionID,
+		keyID:           keyID,
 		clientRandom:    clientHello[headerLen+3+keyIDLen : headerLen+3+keyIDLen+randomLen],
 		clientPublicKey: clientPublicKey,
 		privateKey:      privateKey,
@@ -360,6 +368,7 @@ func (h *serverHandshake) keys() (handshakeResult, error) {
 	return handshakeResult{
 		localConnID: h.connID,
 		peerConnID:  h.clientConnID,
+		keyID:       h.keyID,
 		send:        send,
 		recv:        recv,
 	}, nil

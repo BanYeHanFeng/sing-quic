@@ -38,6 +38,10 @@ type Association interface {
 	OpenStream(ctx context.Context) (*Stream, error)
 	// AcceptStream returns the next stream the peer opened.
 	AcceptStream(ctx context.Context) (*Stream, error)
+	// KeyID is the key the client authenticated with. A server uses it to find
+	// the account of a connection it just accepted, and a client to know which
+	// of its credentials was used.
+	KeyID() [keyIDLen]byte
 	// SendDatagram sends one message to the peer on a channel of the caller's
 	// choosing. The message is not retransmitted: a datagram is a datagram.
 	SendDatagram(channel uint32, data []byte) error
@@ -120,6 +124,7 @@ func (o Options) withDefaults() Options {
 type association struct {
 	localConnID connectionID
 	peerConnID  connectionID
+	keyID       [keyIDLen]byte
 	conn        net.PacketConn
 	options     Options
 	ctx         context.Context
@@ -214,6 +219,7 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 	a := &association{
 		localConnID:  result.localConnID,
 		peerConnID:   result.peerConnID,
+		keyID:        result.keyID,
 		conn:         conn,
 		options:      options.withDefaults(),
 		ctx:          ctx,
@@ -257,6 +263,10 @@ func (a *association) RemoteAddr() net.Addr {
 
 func (a *association) Context() context.Context {
 	return a.ctx
+}
+
+func (a *association) KeyID() [keyIDLen]byte {
+	return a.keyID
 }
 
 func (a *association) CloseWithError(err error) error {

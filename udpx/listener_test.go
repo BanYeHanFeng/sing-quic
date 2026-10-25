@@ -59,6 +59,20 @@ func testSetup(t *testing.T, clientOptions, serverOptions Options) (Association,
 	return client, server, listener
 }
 
+// TestKeyID requires both ends to report the key the client authenticated with,
+// which is what lets a server find the account of a connection it accepted
+// without the password ever being on the wire.
+func TestKeyID(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	password := NewPassword("password")
+	if client.KeyID() != password.KeyID() {
+		t.Fatalf("the client reports key %x", client.KeyID())
+	}
+	if server.KeyID() != password.KeyID() {
+		t.Fatalf("the server reports key %x", server.KeyID())
+	}
+}
+
 func TestHandshakeOverSocket(t *testing.T) {
 	client, server, listener := testSetup(t, Options{}, Options{})
 	if client.RemoteAddr().String() != listener.conn.LocalAddr().String() {
