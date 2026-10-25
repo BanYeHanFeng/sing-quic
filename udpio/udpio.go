@@ -7,10 +7,12 @@
 //
 //   - UDP_SEGMENT (GSO) takes one buffer and cuts it into datagrams of a fixed
 //     size, so a run of equal packets leaves in one call.
+//   - sendmmsg takes several datagrams in one call whatever their sizes are, so
+//     what a segmented send cannot take leaves in one call too.
 //   - UDP_GRO hands several datagrams up in one buffer, so a run that arrived
 //     back to back is read once.
 //
-// Neither is guaranteed. An old kernel, a socket that did not come from the
+// None of them is guaranteed. An old kernel, a socket that did not come from the
 // network stack, or a device driver that cannot segment all make the fast path
 // unavailable, and the same code then moves one datagram per call. That is why
 // the caller hands over a list of packets either way: whether the list becomes
