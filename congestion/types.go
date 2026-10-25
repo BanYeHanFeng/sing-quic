@@ -52,10 +52,17 @@ type LostPacketInfo struct {
 // Controller is what a transport asks a congestion controller: it is told what
 // left, what arrived and what was given up on, and it answers how much may be in
 // flight and when the next packet may leave.
+//
+// An acknowledgement is reported as one event with everything it covered rather
+// than as one call per packet: a controller that reacts to loss needs the losses
+// of the same acknowledgement together with the bytes that arrived despite them,
+// and a transport cannot know which of them a controller considers one event.
 type Controller interface {
 	OnPacketSent(sentTime time.Time, bytesInFlight ByteCount, packetNumber PacketNumber, bytes ByteCount, isRetransmittable bool)
-	OnPacketAcked(packetNumber PacketNumber, ackedBytes, priorInFlight ByteCount, eventTime time.Time)
-	OnPacketLost(packetNumber PacketNumber, lostBytes, priorInFlight ByteCount)
+	// OnCongestionEvent reports what one acknowledgement settled: the packets it
+	// covered and the packets that were declared lost by the same answer, with
+	// what was in flight before either of them left the flight table.
+	OnCongestionEvent(priorInFlight ByteCount, eventTime time.Time, ackedPackets []AckedPacketInfo, lostPackets []LostPacketInfo)
 	CanSend(bytesInFlight ByteCount) bool
 	TimeUntilSend(bytesInFlight ByteCount) time.Time
 	HasPacingBudget(now time.Time) bool

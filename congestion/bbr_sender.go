@@ -455,16 +455,6 @@ func (b *bbrSender) MaybeExitSlowStart() {
 	// Do nothing
 }
 
-// OnPacketAcked implements the SendAlgorithm interface.
-func (b *bbrSender) OnPacketAcked(number PacketNumber, ackedBytes, priorInFlight ByteCount, eventTime time.Time) {
-	// Do nothing.
-}
-
-// OnPacketLost implements the SendAlgorithm interface.
-func (b *bbrSender) OnPacketLost(number PacketNumber, lostBytes, priorInFlight ByteCount) {
-	// Do nothing.
-}
-
 // OnRetransmissionTimeout implements the SendAlgorithm interface.
 func (b *bbrSender) OnRetransmissionTimeout(packetsRetransmitted bool) {
 	// Do nothing.
@@ -513,11 +503,11 @@ func (b *bbrSender) GetCongestionWindow() ByteCount {
 	return b.congestionWindow
 }
 
-func (b *bbrSender) OnCongestionEvent(number PacketNumber, lostBytes, priorInFlight ByteCount) {
-	// Do nothing.
-}
-
-func (b *bbrSender) OnCongestionEventEx(priorInFlight ByteCount, eventTime time.Time, ackedPackets []AckedPacketInfo, lostPackets []LostPacketInfo) {
+// OnCongestionEvent implements the SendAlgorithm interface. Everything BBR does
+// with an answer happens here: the window, the pacing rate and the round trip
+// counter only move when an acknowledgement and the losses it implies arrive
+// together, which is why the event is one call and not one call per packet.
+func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Time, ackedPackets []AckedPacketInfo, lostPackets []LostPacketInfo) {
 	totalBytesAckedBefore := b.sampler.TotalBytesAcked()
 	totalBytesLostBefore := b.sampler.TotalBytesLost()
 

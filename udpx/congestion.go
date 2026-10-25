@@ -91,26 +91,35 @@ func (a *association) congestionSent(packetNumber uint32, size int, priorInFligh
 	a.cc.OnPacketSent(time.Now(), congestion.ByteCount(priorInFlight), congestion.PacketNumber(packetNumber), congestion.ByteCount(size), retransmittable)
 }
 
-// congestionAcked records the packets an acknowledgement covered, and records the
-// packets that were given up on at the same time.
+// congestionAcked reports what one acknowledgement settled: the packets it
+// acknowledged, and the packets that were declared lost by the same answer.
+//
+// Both go to the controller in one event, because that is the shape of the
+// decision it makes: a window that grows by what arrived and falls by what was
+// lost, where the two only mean something next to each other.
 func (a *association) congestionAcked(acked, lost []*sentPacket, priorInFlight int, now time.Time) {
+	if len(acked) == 0 && len(lost) == 0 {
+		return
+	}
+	acknowledged := make([]congestion.AckedPacketInfo, 0, len(acked))
+	for _, packet := range acked {
+		acknowledged = append(acknowledged, congestion.AckedPacketInfo{
+			TimeSent:     packet.sentAt,
+			BytesAcked:   congestion.ByteCount(packet.size),
+			PacketNumber: congestion.PacketNumber(packet.packetNumber),
+		})
+	}
+	lostPackets := make([]congestion.LostPacketInfo, 0, len(lost))
+	for _, packet := range lost {
+		lostPackets = append(lostPackets, congestion.LostPacketInfo{
+			TimeSent:     packet.sentAt,
+			BytesLost:    congestion.ByteCount(packet.size),
+			PacketNumber: congestion.PacketNumber(packet.packetNumber),
+		})
+	}
 	a.ccMu.Lock()
 	defer a.ccMu.Unlock()
-	for _, packet := range acked {
-		a.cc.OnPacketAcked(
-			congestion.PacketNumber(packet.packetNumber),
-			congestion.ByteCount(packet.size),
-			congestion.ByteCount(priorInFlight),
-			now,
-		)
-	}
-	for _, packet := range lost {
-		a.cc.OnPacketLost(
-			congestion.PacketNumber(packet.packetNumber),
-			congestion.ByteCount(packet.size),
-			congestion.ByteCount(priorInFlight),
-		)
-	}
+	a.cc.OnCongestionEvent(congestion.ByteCount(priorInFlight), now, acknowledged, lostPackets)
 }
 
 // rttEstimate returns a copy of the round trip estimate.
