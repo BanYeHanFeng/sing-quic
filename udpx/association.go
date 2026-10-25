@@ -109,10 +109,12 @@ type association struct {
 	// atomic rather than a field under sendMu.
 	peerAddr atomic.Pointer[net.Addr]
 
-	sendMu     sync.Mutex
-	sendRing   keyRing
-	sendPacket uint32
-	sendBuffer []byte
+	sendMu      sync.Mutex
+	sendRing    keyRing
+	sendPacket  uint32
+	sendBuffer  []byte
+	buildBuffer []byte
+	queue       frameQueue
 
 	recvRing keyRing
 
@@ -127,12 +129,14 @@ type association struct {
 	ack      ackScheduler
 	ackTimer *time.Timer
 
-	// statsMu guards the send history and the round trip estimate: the send path
-	// records when a packet left, and the receive path turns an acknowledgement
-	// into a sample.
-	statsMu sync.Mutex
-	sent    sentHistory
-	rtt     rttEstimator
+	// flightMu guards the packets in flight and the round trip estimate. The
+	// send path records a packet as it leaves and the receive path takes it out
+	// again when an acknowledgement covers it, so both sides need the lock; it is
+	// never held while a packet is being sent, because sending takes sendMu and
+	// holding both in the other order is how two paths deadlock.
+	flightMu sync.Mutex
+	inFlight sentPackets
+	rtt      rttEstimator
 
 	// ownsConn says whether closing the association closes the socket. A client
 	// owns the socket it dialled on; a server association writes on the socket
@@ -142,11 +146,6 @@ type association struct {
 	onClose   func()
 	closeOnce sync.Once
 }
-
-// sentHistorySize is how many send times are remembered. A packet older than
-// that is either lost already or acknowledged long ago, and neither needs a
-// sample.
-const sentHistorySize = 256
 
 func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, options Options, ownsConn bool) *association {
 	ctx, cancel := context.WithCancelCause(context.Background())
@@ -160,7 +159,6 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		sendRing:    result.send,
 		recvRing:    result.recv,
 		sendBuffer:  make([]byte, 0, maxPacketSize),
-		sent:        newSentHistory(sentHistorySize),
 		ownsConn:    ownsConn,
 	}
 	a.peerAddr.Store(&peer)
@@ -199,7 +197,7 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 			cause = net.ErrClosed
 		}
 		if notifyPeer {
-			_ = a.sendPayload(appendClose(nil, closeCodeOf(cause)))
+			_ = a.send(appendClose(nil, closeCodeOf(cause)))
 		}
 		a.idleTimer.Stop()
 		a.ackTimer.Stop()
@@ -213,39 +211,27 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 	})
 }
 
-// sendPayload sends payload in a packet of its own.
-func (a *association) sendPayload(payload []byte) error {
+// send queues one encoded frame and sends what can go out now.
+func (a *association) send(frame []byte) error {
 	select {
 	case <-a.ctx.Done():
 		return context.Cause(a.ctx)
 	default:
 	}
-	if headerLen+len(payload)+tagLen > maxPacketSize {
-		return E.New("payload of ", len(payload), " bytes does not fit in a packet")
-	}
+	a.queueFrame(frame)
+	return a.flush()
+}
+
+// queueFrame places a frame at the end of the send queue, which takes its bytes
+// over. Frames queued before a flush share a packet, which is what keeps an
+// acknowledgement from costing a packet next to data that is going out anyway.
+func (a *association) queueFrame(frame []byte) {
 	a.sendMu.Lock()
-	defer a.sendMu.Unlock()
-	h := header{
-		ConnectionID: a.peerConnID,
-		Type:         packetTypeData,
-		Epoch:        a.sendRing.epoch(),
-		PacketNumber: a.sendPacket,
-	}
-	a.sendPacket++
-	packet, err := a.sendRing.seal(a.sendBuffer[:0], h, nil, payload)
-	if err != nil {
-		return err
-	}
-	a.sendBuffer = packet
-	a.statsMu.Lock()
-	a.sent.record(h.PacketNumber, time.Now())
-	a.statsMu.Unlock()
-	_, err = a.conn.WriteTo(packet, a.RemoteAddr())
-	if err != nil {
-		return E.Cause(err, "write packet")
-	}
-	a.resetIdle()
-	return nil
+	a.queue.push(outFrame{
+		payload:      frame,
+		ackEliciting: frameType(frame[0]) != frameTypeAck,
+	})
+	a.sendMu.Unlock()
 }
 
 // handlePacket processes a packet the demultiplexer routed to this association.
@@ -307,7 +293,7 @@ func (a *association) scheduleAck(packetNumber uint32, now time.Time) {
 	a.ackMu.Unlock()
 	if immediate {
 		if len(acknowledgement) > 0 {
-			_ = a.sendPayload(acknowledgement)
+			_ = a.send(acknowledgement)
 		}
 		return
 	}
@@ -322,31 +308,34 @@ func (a *association) flushAck() {
 	if len(acknowledgement) == 0 {
 		return
 	}
-	_ = a.sendPayload(acknowledgement)
+	_ = a.send(acknowledgement)
 }
 
-// handleAck turns an acknowledgement into a round trip sample. The sample comes
-// from the largest acknowledged packet, because that is the one the peer's delay
-// refers to; the delay is subtracted because it is time the peer held the
-// acknowledgement rather than time the packet spent in flight.
+// handleAck takes the acknowledged packets out of flight and turns the newest of
+// them into a round trip sample. The sample comes from the largest acknowledged
+// packet, because that is the one the peer's delay refers to; the delay is
+// subtracted because it is time the peer held the acknowledgement rather than
+// time the packet spent in flight.
 func (a *association) handleAck(body []byte, now time.Time) {
 	acknowledgement, err := parseAck(body)
 	if err != nil {
 		return
 	}
-	a.statsMu.Lock()
-	defer a.statsMu.Unlock()
-	sentAt, loaded := a.sent.sentAt(acknowledgement.largest)
-	if !loaded {
-		return
+	a.flightMu.Lock()
+	acked := a.inFlight.acked(acknowledgement.ranges[:acknowledgement.count])
+	for _, packet := range acked {
+		if packet.packetNumber != acknowledgement.largest {
+			continue
+		}
+		a.rtt.sample(now.Sub(packet.sentAt) - acknowledgement.delay)
 	}
-	a.rtt.sample(now.Sub(sentAt) - acknowledgement.delay)
+	a.flightMu.Unlock()
 }
 
 // roundTrip returns the current round trip estimate.
 func (a *association) roundTrip() (time.Duration, bool) {
-	a.statsMu.Lock()
-	defer a.statsMu.Unlock()
+	a.flightMu.Lock()
+	defer a.flightMu.Unlock()
 	if !a.rtt.sampled {
 		return 0, false
 	}
@@ -384,7 +373,7 @@ func (a *association) keepAliveLoop() {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
-			err := a.sendPayload(appendPing(nil))
+			err := a.send(appendPing(nil))
 			if err != nil {
 				return
 			}

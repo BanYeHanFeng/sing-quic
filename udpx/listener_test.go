@@ -295,7 +295,7 @@ func TestAcknowledgementOverSocket(t *testing.T) {
 	serverAssociation := server.(*association)
 
 	start := time.Now()
-	err := clientAssociation.sendPayload(appendPing(nil))
+	err := clientAssociation.send(appendPing(nil))
 	if err != nil {
 		t.Fatal(err)
 	}

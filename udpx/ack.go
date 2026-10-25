@@ -258,42 +258,6 @@ func (s *ackScheduler) pack(now time.Time) []byte {
 	return built.appendTo(nil)
 }
 
-// sentHistory remembers when each packet number was sent, so that an
-// acknowledgement can be turned into a round trip sample. It is a ring: an entry
-// that old is either lost or already accounted for, and keeping every one of
-// them would make the send path allocate.
-type sentHistory struct {
-	entries []sentPacket
-}
-
-type sentPacket struct {
-	sentAt       time.Time
-	packetNumber uint32
-}
-
-func newSentHistory(size int) sentHistory {
-	return sentHistory{entries: make([]sentPacket, size)}
-}
-
-func (h *sentHistory) record(pn uint32, now time.Time) {
-	if len(h.entries) == 0 {
-		return
-	}
-	h.entries[pn%uint32(len(h.entries))] = sentPacket{packetNumber: pn, sentAt: now}
-}
-
-// sentAt returns when pn was sent, if it is still remembered.
-func (h *sentHistory) sentAt(pn uint32) (time.Time, bool) {
-	if len(h.entries) == 0 {
-		return time.Time{}, false
-	}
-	entry := h.entries[pn%uint32(len(h.entries))]
-	if entry.packetNumber != pn || entry.sentAt.IsZero() {
-		return time.Time{}, false
-	}
-	return entry.sentAt, true
-}
-
 // rttEstimator is the round trip estimate a retransmission timeout is built
 // from: a smoothed value and its variation, so a timeout can be generous on a
 // jittery path and tight on a steady one.

@@ -271,27 +271,6 @@ func TestAckDelayBudget(t *testing.T) {
 	}
 }
 
-func TestSentHistory(t *testing.T) {
-	history := newSentHistory(4)
-	now := time.Now()
-	history.record(9, now)
-	if _, loaded := history.sentAt(9); !loaded {
-		t.Fatal("a recorded packet is not remembered")
-	}
-	if _, loaded := history.sentAt(10); loaded {
-		t.Fatal("a packet that was never sent is remembered")
-	}
-	// The entry for a packet number is overwritten by the packet a full ring
-	// later, and the lookup tells them apart instead of returning the wrong time.
-	history.record(13, now.Add(time.Second))
-	if sentAt, loaded := history.sentAt(9); loaded {
-		t.Fatalf("an overwritten packet is still remembered: %v", sentAt)
-	}
-	if sentAt, loaded := history.sentAt(13); !loaded || !sentAt.Equal(now.Add(time.Second)) {
-		t.Fatal("the newer packet is not remembered")
-	}
-}
-
 func TestRTTEstimator(t *testing.T) {
 	var estimator rttEstimator
 	estimator.sample(100 * time.Millisecond)
