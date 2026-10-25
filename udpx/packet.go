@@ -89,6 +89,7 @@ var (
 	errUnknownType    = errors.New("packet has unknown type")
 	errUnknownEpoch   = errors.New("packet epoch has no key")
 	errAuthentication = errors.New("packet failed authentication")
+	errShortFrame     = errors.New("frame is truncated")
 )
 
 // connectionID identifies an association on the side that receives it. Each
