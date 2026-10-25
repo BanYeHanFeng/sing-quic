@@ -9,48 +9,67 @@ import (
 	"time"
 )
 
-// lossyLink is a pair of sockets that carries datagrams between a client and a
-// server and drops a fraction of them in each direction. It is what makes a
-// retransmission test a test of the transport rather than of a mock: the client
-// and the server both run for real, and only the path between them loses packets.
-type lossyLink struct {
-	front     net.PacketConn
-	back      net.PacketConn
-	server    net.Addr
+// simulatedLink is a pair of sockets that carries datagrams between a client and a
+// server along a path that loses, delays, reorders and duplicates them. It is what
+// makes a retransmission test a test of the transport rather than of a mock: the
+// client and the server both run for real, and only the path between them behaves
+// like a path.
+//
+// Everything the path decides comes from one seeded source, so a failure is a
+// failure that happens again. The delay is applied per packet and independently in
+// each direction, which is what turns a fixed delay plus a jitter into reordering
+// without a separate rule for it.
+type simulatedLink struct {
+	front   net.PacketConn
+	back    net.PacketConn
+	server  net.Addr
+	options linkOptions
+
+	randomMu sync.Mutex
+	random   *rand.Rand
+
 	mu        sync.Mutex
 	client    net.Addr
 	closeOnce sync.Once
 	closing   chan struct{}
 }
 
-func newLossyLink(t *testing.T, server net.Addr, loss float64) *lossyLink {
+// linkOptions is what the path between the two ends does to a datagram.
+type linkOptions struct {
+	// loss is the fraction of datagrams that never arrive.
+	loss float64
+	// duplicate is the fraction of datagrams that arrive twice.
+	duplicate float64
+	// delay is how long a datagram spends on the way, each direction.
+	delay time.Duration
+	// jitter is how much shorter or longer than delay a datagram may spend, which
+	// is what reorders them.
+	jitter time.Duration
+}
+
+func newSimulatedLink(t *testing.T, server net.Addr, options linkOptions) *simulatedLink {
 	t.Helper()
-	link := &lossyLink{
+	link := &simulatedLink{
 		front:   udpConn(t),
 		back:    udpConn(t),
 		server:  server,
+		options: options,
+		random:  rand.New(rand.NewSource(1)),
 		closing: make(chan struct{}),
 	}
-	random := rand.New(rand.NewSource(1))
-	var randomMu sync.Mutex
-	drop := func() bool {
-		randomMu.Lock()
-		defer randomMu.Unlock()
-		return random.Float64() < loss
-	}
 	t.Cleanup(link.close)
-	go link.forward(link.front, link.back, func() net.Addr { return link.server }, drop)
+	go link.forward(link.front, link.back, func() net.Addr { return link.server })
 	go link.forward(link.back, link.front, func() net.Addr {
 		link.mu.Lock()
 		defer link.mu.Unlock()
 		return link.client
-	}, drop)
+	})
 	return link
 }
 
-// forward copies datagrams from one socket to the other, dropping some of them and
-// remembering where the client is.
-func (l *lossyLink) forward(from, to net.PacketConn, destination func() net.Addr, drop func() bool) {
+// forward copies datagrams from one socket to the other, handing each of them to
+// the path and remembering where the client is.
+func (l *simulatedLink) forward(from, to net.PacketConn, destination func() net.Addr) {
 	buffer := make([]byte, maxPacketSize)
 	for {
 		n, source, err := from.ReadFrom(buffer)
@@ -62,22 +81,74 @@ func (l *lossyLink) forward(from, to net.PacketConn, destination func() net.Addr
 			l.client = source
 			l.mu.Unlock()
 		}
-		if drop() {
-			continue
+		// The buffer is reused for the next datagram, so what the path decided to
+		// keep has to be its own copy.
+		packet := append([]byte(nil), buffer[:n]...)
+		l.send(packet, to, destination)
+		if l.roll(l.options.duplicate) {
+			l.send(packet, to, destination)
 		}
-		target := destination()
-		if target == nil {
-			continue
-		}
-		_, _ = to.WriteTo(buffer[:n], target)
 	}
 }
 
-func (l *lossyLink) clientAddr() net.Addr {
+// send puts one datagram on the path, which either drops it or arrives after the
+// delay the path picked for it.
+func (l *simulatedLink) send(packet []byte, to net.PacketConn, destination func() net.Addr) {
+	if l.roll(l.options.loss) {
+		return
+	}
+	delay := l.options.delay
+	if l.options.jitter > 0 {
+		jitter := l.options.jitter
+		// A delay below zero is not a delay: a datagram never overtakes the
+		// decision to send it.
+		delay += time.Duration(l.randomValue()*2-1) * jitter
+		if delay < 0 {
+			delay = 0
+		}
+	}
+	if delay == 0 {
+		l.write(packet, to, destination)
+		return
+	}
+	time.AfterFunc(delay, func() {
+		l.write(packet, to, destination)
+	})
+}
+
+// write hands one datagram to the socket, unless the link was closed meanwhile.
+func (l *simulatedLink) write(packet []byte, to net.PacketConn, destination func() net.Addr) {
+	select {
+	case <-l.closing:
+		return
+	default:
+	}
+	target := destination()
+	if target == nil {
+		return
+	}
+	_, _ = to.WriteTo(packet, target)
+}
+
+// roll reports whether something that happens with the given probability happens.
+func (l *simulatedLink) roll(probability float64) bool {
+	if probability <= 0 {
+		return false
+	}
+	return l.randomValue() < probability
+}
+
+func (l *simulatedLink) randomValue() float64 {
+	l.randomMu.Lock()
+	defer l.randomMu.Unlock()
+	return l.random.Float64()
+}
+
+func (l *simulatedLink) clientAddr() net.Addr {
 	return l.front.LocalAddr()
 }
 
-func (l *lossyLink) close() {
+func (l *simulatedLink) close() {
 	l.closeOnce.Do(func() {
 		close(l.closing)
 		_ = l.front.Close()
@@ -95,7 +166,7 @@ func TestTransferUnderLoss(t *testing.T) {
 			listenerConn := udpConn(t)
 			listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
 			defer listener.Close()
-			link := newLossyLink(t, listenerConn.LocalAddr(), loss)
+			link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: loss})
 
 			ctx := testContext(t, 60*time.Second)
 			client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{})
