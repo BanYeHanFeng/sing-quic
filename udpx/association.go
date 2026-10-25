@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sagernet/sing-quic/congestion"
+
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
@@ -84,6 +86,10 @@ type Options struct {
 	// ping. Zero means never, which leaves the association to the NAT mapping it
 	// was created through.
 	KeepAlivePeriod time.Duration
+
+	// Congestion is the BBR profile of the congestion controller. The zero value
+	// is the conservative one.
+	Congestion congestion.Profile
 }
 
 func (o Options) withDefaults() Options {
@@ -92,6 +98,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.KeepAlivePeriod < 0 {
 		o.KeepAlivePeriod = 0
+	}
+	if o.Congestion == (congestion.Profile{}) {
+		o.Congestion = congestion.ProfileConservative
 	}
 	return o
 }
@@ -146,6 +155,13 @@ type association struct {
 	// before the next one doubles with.
 	probes   int
 	ptoTimer *time.Timer
+
+	// ccMu is the innermost lock: the congestion controller is called with it held,
+	// after the send lock or the flight lock, never around them.
+	ccMu      sync.Mutex
+	cc        congestion.Controller
+	rttStats  rttSnapshot
+	paceTimer *time.Timer
 
 	// streamsMu guards the streams of the association. The table is what turns a
 	// stream id on the wire into a stream, and what bounds how many the peer may
@@ -203,6 +219,10 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 	a.ackTimer = time.AfterFunc(maxAckDelay, a.flushAck)
 	a.ptoTimer = time.AfterFunc(initialPTO, a.probe)
 	a.ptoTimer.Stop()
+	a.cc = newCongestionController(a.options)
+	a.cc.SetRTTStatsProvider(&a.rttStats)
+	a.paceTimer = time.AfterFunc(time.Hour, func() { _ = a.flush() })
+	a.paceTimer.Stop()
 	if a.options.KeepAlivePeriod > 0 {
 		go a.keepAliveLoop()
 	}
@@ -239,6 +259,7 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 		a.idleTimer.Stop()
 		a.ackTimer.Stop()
 		a.ptoTimer.Stop()
+		a.paceTimer.Stop()
 		a.cancel(cause)
 		a.closeStreams(cause)
 		if a.ownsConn {

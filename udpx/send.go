@@ -231,11 +231,23 @@ func isLost(packet *sentPacket, now time.Time, largestAcked uint32, lossDelay ti
 	return now.Sub(packet.sentAt) >= lossDelay
 }
 
-// flush packs the frames waiting to be sent into packets and sends them.
+// flush packs the frames waiting to be sent into packets and sends them, as far
+// as the congestion window and the pacing rate allow. What does not fit stays
+// queued: an acknowledgement opens the window again and calls this.
 func (a *association) flush() error {
 	a.sendMu.Lock()
 	defer a.sendMu.Unlock()
 	for a.queue.len() > 0 {
+		allowed, waitUntil := a.congestionBudget()
+		if !allowed {
+			if waitUntil.IsZero() {
+				// The window is full: it opens when an acknowledgement arrives, and
+				// nothing before that can change it.
+				return nil
+			}
+			a.paceTimer.Reset(time.Until(waitUntil))
+			return nil
+		}
 		frames := a.queue.take(maxPacketSize - headerLen - tagLen)
 		if len(frames) == 0 {
 			return E.New("frame of ", len(a.queue.frames[0].payload), " bytes does not fit in a packet")
@@ -297,6 +309,7 @@ func (a *association) sendFramesLocked(frames []outFrame) error {
 	}
 	a.flightMu.Lock()
 	wasEmpty := a.inFlight.len() == 0
+	priorInFlight := a.inFlight.bytes
 	a.inFlight.append(sent)
 	a.flightMu.Unlock()
 	_, err = a.conn.WriteTo(packet, a.RemoteAddr())
@@ -306,6 +319,7 @@ func (a *association) sendFramesLocked(frames []outFrame) error {
 		a.flightMu.Unlock()
 		return E.Cause(err, "write packet")
 	}
+	a.congestionSent(h.PacketNumber, len(packet), priorInFlight, true)
 	a.resetIdle()
 	// The probe timer belongs to the oldest packet in flight, so it is armed when
 	// there was nothing in flight before this one. A packet that follows a

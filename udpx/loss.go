@@ -138,14 +138,16 @@ func (a *association) probe() {
 	a.armPTO()
 }
 
-// handleAck takes the acknowledged packets out of flight, samples the round trip
-// and declares the packets the peer has moved past lost.
+// handleAck takes the acknowledged packets out of flight, samples the round trip,
+// tells the congestion controller what arrived and what was lost, and sends
+// whatever the window now allows.
 func (a *association) handleAck(body []byte, now time.Time) {
 	acknowledgement, err := parseAck(body)
 	if err != nil {
 		return
 	}
 	a.flightMu.Lock()
+	priorInFlight := a.inFlight.bytes
 	acked := a.inFlight.acked(acknowledgement.ranges[:acknowledgement.count])
 	for _, packet := range acked {
 		if packet.packetNumber != acknowledgement.largest {
@@ -162,6 +164,8 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	empty := a.inFlight.len() == 0
 	a.flightMu.Unlock()
 
+	a.rttStats.update(a.rttEstimate())
+	a.congestionAcked(acked, lost, priorInFlight, now)
 	if empty {
 		a.disarmPTO()
 	} else {
@@ -169,5 +173,9 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	}
 	if len(recovered) > 0 {
 		_ = a.sendFramesRetransmitted(recovered)
+	}
+	// The window just opened, so whatever waited for it can go out.
+	if a.queueLength() > 0 {
+		_ = a.flush()
 	}
 }

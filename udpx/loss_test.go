@@ -255,11 +255,11 @@ func TestProbingIsBounded(t *testing.T) {
 	a.flightMu.Lock()
 	inFlight := a.inFlight.len()
 	a.flightMu.Unlock()
-	if queued != 0 {
-		t.Fatalf("%d frames still queued", queued)
-	}
-	if inFlight != 1 {
-		t.Fatalf("%d packets in flight after a hundred probes", inFlight)
+	// The frame is either queued or in one packet, however many probes went out:
+	// probing neither loses it nor multiplies it, and the congestion window is what
+	// stops the probes from filling the path.
+	if queued+inFlight != 1 {
+		t.Fatalf("%d frames queued and %d packets in flight after a hundred probes", queued, inFlight)
 	}
 }
 
