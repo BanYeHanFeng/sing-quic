@@ -38,6 +38,12 @@ type Association interface {
 	OpenStream(ctx context.Context) (*Stream, error)
 	// AcceptStream returns the next stream the peer opened.
 	AcceptStream(ctx context.Context) (*Stream, error)
+	// SendDatagram sends one message to the peer on a channel of the caller's
+	// choosing. The message is not retransmitted: a datagram is a datagram.
+	SendDatagram(channel uint32, data []byte) error
+	// ReceiveDatagram returns the next message the peer sent, whole, from
+	// whichever channel it belongs to.
+	ReceiveDatagram(ctx context.Context) (Datagram, error)
 }
 
 var (
@@ -172,6 +178,15 @@ type association struct {
 	acceptStream chan *Stream
 	nextStreamID uint32
 
+	// datagramMu guards the datagram side: the message numbers this end hands
+	// out, the reassemblies in progress, and the messages waiting for the
+	// application. A datagram carries no promise, so nothing here waits for
+	// anything: what does not fit is dropped.
+	datagramMu      sync.Mutex
+	datagramMessage uint16
+	defragger       datagramDefragger
+	datagrams       chan Datagram
+
 	// fcMu guards the association window: what the peer allows this end to send,
 	// and what this end allows the peer to send.
 	fcMu         sync.Mutex
@@ -208,6 +223,8 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		sendBuffer:   make([]byte, 0, maxPacketSize),
 		streams:      make(map[uint32]*Stream),
 		acceptStream: make(chan *Stream, acceptStreamBacklog),
+		defragger:    newDatagramDefragger(),
+		datagrams:    make(chan Datagram, datagramBacklog),
 		sendCredit:   credit{limit: initialConnectionWindow},
 		recvLimit:    initialConnectionWindow,
 		isClient:     isClient,
@@ -350,6 +367,13 @@ func (a *association) handlePacket(packet []byte, source net.Addr) error {
 		case frameTypeResetStream:
 			ackEliciting = true
 			a.handleResetStream(f.streamReset())
+		case frameTypeDatagram:
+			ackEliciting = true
+			err = a.handleDatagram(f.datagram())
+			if err != nil {
+				a.shutdown(err, true)
+				return err
+			}
 		}
 	}
 	if ackEliciting {

@@ -49,6 +49,12 @@ const (
 	// needs: the stream is done, and the association and the streams beside it
 	// are not.
 	frameTypeResetStream
+
+	// frameTypeDatagram carries one unreliable message, or one piece of one.
+	// Nothing about it is retransmitted: a datagram that is lost is lost, which
+	// is what a forwarded UDP packet wants and what keeps a datagram from
+	// holding up a stream.
+	frameTypeDatagram
 )
 
 // Layout of the type byte.
@@ -70,6 +76,16 @@ const (
 const (
 	resetStreamFixedLen = 1 + 4 + 1
 	resetStreamBodyLen  = 4 + 1
+)
+
+// Layout of a datagram frame: the type byte, the channel the message belongs to,
+// which message on that channel it is part of, where in that message it goes and
+// how much of it is here. The channel is a key the caller chooses; one association
+// carries as many of them as the caller needs, which is what keeps a forwarded UDP
+// packet from opening an association of its own.
+const (
+	datagramFixedLen = 1 + 4 + 2 + 1 + 1 + 2
+	datagramBodyLen  = 4 + 2 + 1 + 1 + 2
 )
 
 // frame is one parsed frame of a payload. The body points into the payload, so
@@ -152,6 +168,18 @@ func nextFrame(payload []byte) (frame, []byte, error) {
 			frameType: frameTypeResetStream,
 			body:      payload[1:resetStreamFixedLen],
 		}, payload[resetStreamFixedLen:], nil
+	case frameTypeDatagram:
+		if flags != 0 || len(payload) < datagramFixedLen {
+			return frame{}, nil, errShortFrame
+		}
+		length := int(binary.BigEndian.Uint16(payload[datagramFixedLen-2:]))
+		if len(payload) < datagramFixedLen+length {
+			return frame{}, nil, errShortFrame
+		}
+		return frame{
+			frameType: frameTypeDatagram,
+			body:      payload[1 : datagramFixedLen+length],
+		}, payload[datagramFixedLen+length:], nil
 	default:
 		return frame{}, nil, E.New("unknown frame type ", int(payload[0]))
 	}
@@ -225,6 +253,36 @@ const (
 // closed connection comes down to.
 func (c resetCode) err() error {
 	return StreamResetError{Code: uint8(c)}
+}
+
+// datagramData is what a datagram frame carries.
+type datagramData struct {
+	data    []byte
+	channel uint32
+	message uint16
+	index   uint8
+	total   uint8
+}
+
+// datagram returns what a datagram frame carries.
+func (f frame) datagram() datagramData {
+	return datagramData{
+		channel: binary.BigEndian.Uint32(f.body),
+		message: binary.BigEndian.Uint16(f.body[4:]),
+		index:   f.body[6],
+		total:   f.body[7],
+		data:    f.body[datagramBodyLen:],
+	}
+}
+
+// appendDatagram appends a datagram frame to dst.
+func appendDatagram(dst []byte, data datagramData) []byte {
+	dst = append(dst, byte(frameTypeDatagram))
+	dst = binary.BigEndian.AppendUint32(dst, data.channel)
+	dst = binary.BigEndian.AppendUint16(dst, data.message)
+	dst = append(dst, data.index, data.total)
+	dst = binary.BigEndian.AppendUint16(dst, uint16(len(data.data)))
+	return append(dst, data.data...)
 }
 
 // closeCode returns the code of a close frame.
