@@ -249,6 +249,18 @@ func (a *association) sendFramesLocked(frames []outFrame) error {
 		frames[index].lastSent = h.PacketNumber
 		sent.ackEliciting = sent.ackEliciting || frames[index].ackEliciting
 	}
+	if !sent.ackEliciting {
+		// Nothing in this packet asks for an acknowledgement, so nothing will
+		// ever acknowledge it: putting it in flight would leave an entry that can
+		// only be given up on, and would keep the probe timer aimed at a packet
+		// nobody is waiting for.
+		_, err = a.conn.WriteTo(packet, a.RemoteAddr())
+		if err != nil {
+			return E.Cause(err, "write packet")
+		}
+		a.resetIdle()
+		return nil
+	}
 	a.flightMu.Lock()
 	wasEmpty := a.inFlight.len() == 0
 	a.inFlight.append(sent)

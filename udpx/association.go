@@ -2,6 +2,7 @@ package udpx
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"sync"
@@ -31,6 +32,10 @@ type Association interface {
 	// CloseWithError closes the association towards the peer, which reports err
 	// as the reason.
 	CloseWithError(err error) error
+	// OpenStream opens a stream towards the peer.
+	OpenStream(ctx context.Context) (*Stream, error)
+	// AcceptStream returns the next stream the peer opened.
+	AcceptStream(ctx context.Context) (*Stream, error)
 }
 
 var (
@@ -142,6 +147,27 @@ type association struct {
 	probes   int
 	ptoTimer *time.Timer
 
+	// streamsMu guards the streams of the association. The table is what turns a
+	// stream id on the wire into a stream, and what bounds how many the peer may
+	// have open at once.
+	streamsMu    sync.Mutex
+	streams      map[uint32]*Stream
+	acceptStream chan *Stream
+	nextStreamID uint32
+
+	// fcMu guards the association window: what the peer allows this end to send,
+	// and what this end allows the peer to send.
+	fcMu         sync.Mutex
+	sendCredit   credit
+	recvLimit    uint64
+	recvRead     uint64
+	recvReceived uint64
+
+	// isClient says which half of the protocol this association is. It is what
+	// stream ids are built from and what tells an incoming stream id apart from an
+	// outgoing one.
+	isClient bool
+
 	// ownsConn says whether closing the association closes the socket. A client
 	// owns the socket it dialled on; a server association writes on the socket
 	// its listener accepts on.
@@ -151,19 +177,24 @@ type association struct {
 	closeOnce sync.Once
 }
 
-func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, options Options, ownsConn bool) *association {
+func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, options Options, isClient, ownsConn bool) *association {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	a := &association{
-		localConnID: result.localConnID,
-		peerConnID:  result.peerConnID,
-		conn:        conn,
-		options:     options.withDefaults(),
-		ctx:         ctx,
-		cancel:      cancel,
-		sendRing:    result.send,
-		recvRing:    result.recv,
-		sendBuffer:  make([]byte, 0, maxPacketSize),
-		ownsConn:    ownsConn,
+		localConnID:  result.localConnID,
+		peerConnID:   result.peerConnID,
+		conn:         conn,
+		options:      options.withDefaults(),
+		ctx:          ctx,
+		cancel:       cancel,
+		sendRing:     result.send,
+		recvRing:     result.recv,
+		sendBuffer:   make([]byte, 0, maxPacketSize),
+		streams:      make(map[uint32]*Stream),
+		acceptStream: make(chan *Stream, acceptStreamBacklog),
+		sendCredit:   credit{limit: initialConnectionWindow},
+		recvLimit:    initialConnectionWindow,
+		isClient:     isClient,
+		ownsConn:     ownsConn,
 	}
 	a.peerAddr.Store(&peer)
 	a.idleTimer = time.AfterFunc(a.options.IdleTimeout, func() {
@@ -209,6 +240,7 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 		a.ackTimer.Stop()
 		a.ptoTimer.Stop()
 		a.cancel(cause)
+		a.closeStreams(cause)
 		if a.ownsConn {
 			_ = a.conn.Close()
 		}
@@ -280,6 +312,19 @@ func (a *association) handlePacket(packet []byte, source net.Addr) error {
 			return nil
 		case frameTypeAck:
 			a.handleAck(f.body, time.Now())
+		case frameTypeStream:
+			ackEliciting = true
+			err = a.handleStreamFrame(f.stream())
+			if err != nil {
+				a.shutdown(err, true)
+				return err
+			}
+		case frameTypeMaxData:
+			ackEliciting = true
+			a.handleMaxData(binary.BigEndian.Uint64(f.body))
+		case frameTypeMaxStreamData:
+			ackEliciting = true
+			a.handleMaxStreamData(binary.BigEndian.Uint32(f.body), binary.BigEndian.Uint64(f.body[4:]))
 		}
 	}
 	if ackEliciting {
@@ -383,7 +428,7 @@ func Dial(ctx context.Context, conn net.PacketConn, remote net.Addr, credential 
 	if err != nil {
 		return nil, err
 	}
-	a := newAssociation(conn, result, remote, options, true)
+	a := newAssociation(conn, result, remote, options, true, true)
 	go a.readLoop()
 	return a, nil
 }

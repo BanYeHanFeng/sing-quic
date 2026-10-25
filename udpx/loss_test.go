@@ -78,7 +78,7 @@ func newTestAssociation(t *testing.T, conn net.PacketConn) *association {
 	a := newAssociation(conn, handshakeResult{
 		send: newKeyRing(0, mustAEAD(t, testKey(0x11))),
 		recv: newKeyRing(0, recvAEAD),
-	}, conn.LocalAddr(), Options{IdleTimeout: time.Minute}, false)
+	}, conn.LocalAddr(), Options{IdleTimeout: time.Minute}, false, false)
 	t.Cleanup(func() {
 		a.shutdown(net.ErrClosed, false)
 	})

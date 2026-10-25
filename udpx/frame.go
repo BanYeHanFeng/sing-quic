@@ -36,6 +36,13 @@ const (
 	// to be sent again after a loss, because it is the only one that carries
 	// something the peer cannot reconstruct.
 	frameTypeStream
+
+	// frameTypeMaxData moves the association window forward: the peer may send
+	// more than it was allowed to before.
+	frameTypeMaxData
+
+	// frameTypeMaxStreamData moves one stream's window forward.
+	frameTypeMaxStreamData
 )
 
 // Layout of the type byte.
@@ -61,11 +68,17 @@ type frame struct {
 }
 
 // retransmittable reports whether a lost frame of this type has to be sent
-// again. Only frames that carry data of their own do: an acknowledgement
-// reports on packets that are already gone, and a ping that was lost did what it
-// was for.
+// again. Frames that carry data, and frames that move a window forward, do: a
+// window update that was lost would leave the peer waiting for credit that was
+// already granted, while repeating one that arrived is harmless because a window
+// only ever moves forward.
 func (t frameType) retransmittable() bool {
-	return t == frameTypeStream
+	switch t {
+	case frameTypeStream, frameTypeMaxData, frameTypeMaxStreamData:
+		return true
+	default:
+		return false
+	}
 }
 
 // nextFrame splits the first frame off payload and returns it with the rest.
@@ -107,6 +120,16 @@ func nextFrame(payload []byte) (frame, []byte, error) {
 			flags:     flags,
 			body:      payload[1 : streamFixedLen+length],
 		}, payload[streamFixedLen+length:], nil
+	case frameTypeMaxData:
+		if flags != 0 || len(payload) < 1+8 {
+			return frame{}, nil, errShortFrame
+		}
+		return frame{frameType: frameTypeMaxData, body: payload[1:9]}, payload[9:], nil
+	case frameTypeMaxStreamData:
+		if flags != 0 || len(payload) < 1+4+8 {
+			return frame{}, nil, errShortFrame
+		}
+		return frame{frameType: frameTypeMaxStreamData, body: payload[1:13]}, payload[13:], nil
 	default:
 		return frame{}, nil, E.New("unknown frame type ", int(payload[0]))
 	}
