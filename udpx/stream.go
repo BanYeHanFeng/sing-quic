@@ -306,6 +306,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 				_ = s.association.send(appendMaxStreamData(nil, s.id, limit))
 			}
 			s.association.dataRead(read)
+			s.endIfDone()
 			return read, nil
 		}
 		if s.finReceived && s.readOffset >= s.finOffset {
@@ -424,11 +425,27 @@ func (s *Stream) push(offset uint64, data []byte, fin bool) (int, error) {
 	}
 	s.recvMu.Unlock()
 	s.signalRecv()
-	if fin && s.finQueued() {
-		// Both halves are done: nothing is left that either end could wait for.
-		s.association.removeStream(s.id)
+	if fin {
+		s.endIfDone()
 	}
 	return received, nil
+}
+
+// endIfDone drops the stream from the table once there is nothing left for either
+// end to do with it: the peer closed its half, this end closed its own, and
+// everything the peer sent was handed to the application.
+//
+// The last part is what makes this the end and not the FIN. A FIN is an offset like
+// any other, so it can arrive before the data in front of it — and then the stream
+// still has to receive that data long after it closed its own half. Dropping it on
+// the FIN alone loses what is still on the way, which is a read that never ends.
+func (s *Stream) endIfDone() {
+	s.recvMu.Lock()
+	delivered := s.finReceived && s.readOffset >= s.finOffset
+	s.recvMu.Unlock()
+	if delivered && s.finQueued() {
+		s.association.removeStream(s.id)
+	}
 }
 
 // finQueued reports whether the FIN was already framed, which is what says the
