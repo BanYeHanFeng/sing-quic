@@ -50,7 +50,7 @@ func ListenPacket(conn net.PacketConn, verifier Verifier, options Options) *List
 	ctx, cancel := context.WithCancelCause(context.Background())
 	l := &Listener{
 		conn:         conn,
-		batchIO:      udpio.New(conn, udpio.Options{GRO: true}),
+		batchIO:      udpio.New(conn, udpio.Options{GRO: true, DisableGSO: options.DisableGSO}),
 		verifier:     verifier,
 		options:      options.withDefaults(),
 		ctx:          ctx,

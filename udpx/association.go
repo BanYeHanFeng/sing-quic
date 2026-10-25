@@ -113,6 +113,11 @@ type Options struct {
 	// path in both directions sets it on both ends.
 	FEC FECOptions
 
+	// DisableGSO keeps the send path at one datagram per call. Segmentation is a
+	// kernel feature that some drivers and some virtual interfaces handle badly,
+	// and a sender that has seen it fail wants to stop asking rather than to
+	// guess per packet.
+	DisableGSO bool
 }
 
 // FECOptions is how a sender protects its packets with forward error correction.
@@ -273,7 +278,7 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		cancel:       cancel,
 		sendRing:     result.send,
 		recvRing:     result.recv,
-		batchIO:      udpio.New(conn, udpio.Options{GRO: true}),
+		batchIO:      udpio.New(conn, udpio.Options{GRO: true, DisableGSO: options.DisableGSO}),
 		batchBuffers: make([]byte, 0, 2*maxPacketSize),
 		maxPayload:   maxPacketSize - headerLen - tagLen,
 		fecSender:    newFECSender(options.FEC),
