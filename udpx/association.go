@@ -538,6 +538,16 @@ func (a *association) handleParity(packet []byte, packetHeader header, source ne
 	// group outlives this call.
 	recovered := a.fec.parity(description, append([]byte(nil), payload...))
 	for _, member := range recovered {
+		packetHeader, headerErr := parseHeader(member)
+		if headerErr != nil {
+			continue
+		}
+		if a.wasReceived(packetHeader.PacketNumber) {
+			// The member did arrive, before the group was assembled and outside
+			// the window the group was filled from. Delivering the recovered copy
+			// would deliver the same frames a second time.
+			continue
+		}
 		_ = a.handlePacket(member, source)
 	}
 	// Parity is ack-eliciting like anything else: it takes room in flight, and a

@@ -402,3 +402,45 @@ func TestFECParityFollowsLoss(t *testing.T) {
 		t.Fatal("zero data shards did not turn forward error correction off")
 	}
 }
+
+// TestFECRecoveredOnce requires a packet that already arrived to be left alone when
+// the group around it is recovered. The first parity shard can arrive before the
+// members do, so a group is assembled from a cache the earliest members never
+// entered; recovering it then has to notice that they arrived rather than hand the
+// same frames up a second time.
+func TestFECRecoveredOnce(t *testing.T) {
+	sender, receiver, conn := newTestFECPair(t, Options{IdleTimeout: time.Minute, FEC: FECOptions{DataShards: 4, ParityShards: 2}})
+	for channel := range 4 {
+		if err := sender.SendDatagram(uint32(channel), []byte{byte(channel)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	packets := fecTestPackets(t, conn, &sender.sendRing)
+	if len(packets) != 6 {
+		t.Fatalf("%d packets written for one group", len(packets))
+	}
+	// The first member arrives before this end knows the peer protects what it
+	// sends, so it is delivered and not kept. Parity follows, then the rest of the
+	// members, and the second shard is what completes the group.
+	fecFeed(t, receiver, []fecTestPacket{packets[0], packets[4], packets[1], packets[2], packets[3], packets[5]})
+	seen := make(map[uint32]int)
+	for range 4 {
+		datagram, err := receiver.ReceiveDatagram(testContext(t, 5*time.Second))
+		if err != nil {
+			t.Fatalf("%d datagrams arrived: %v", len(seen), err)
+		}
+		seen[datagram.Channel]++
+	}
+	for channel := range uint32(4) {
+		if seen[channel] != 1 {
+			t.Fatalf("channel %d arrived %d times", channel, seen[channel])
+		}
+	}
+	// Nothing else is waiting: a recovered copy of a member that arrived would be
+	// one more message, not a correction.
+	extra := testContext(t, 500*time.Millisecond)
+	datagram, err := receiver.ReceiveDatagram(extra)
+	if err == nil {
+		t.Fatalf("channel %d arrived twice", datagram.Channel)
+	}
+}

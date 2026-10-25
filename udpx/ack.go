@@ -252,6 +252,20 @@ func (s *ackScheduler) received(pn uint32, now time.Time) bool {
 	return true
 }
 
+// wasReceived reports whether a packet number has already been taken off the
+// wire. It is what keeps a recovered packet from being delivered twice: a member
+// that arrived before its group was assembled is outside the cache the group was
+// filled from, so the group believes it is missing and recovers it again.
+//
+// The ranges are the ones an acknowledgement names, so they cover the recent past
+// and not the whole association. That is the same window a group lives in, which
+// is why the answer is the right one here.
+func (a *association) wasReceived(packetNumber uint32) bool {
+	a.ackMu.Lock()
+	defer a.ackMu.Unlock()
+	return a.ack.ranges.contains(packetNumber)
+}
+
 // pack builds the acknowledgement of everything received so far, or nil when
 // there is nothing to acknowledge.
 func (s *ackScheduler) pack(now time.Time) []byte {
