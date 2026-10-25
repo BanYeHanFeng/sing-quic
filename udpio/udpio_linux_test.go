@@ -5,6 +5,7 @@ package udpio
 import (
 	"bytes"
 	"net"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -208,5 +209,48 @@ func TestSegmentedSend(t *testing.T) {
 		if !bytes.Equal(buffer[:read], payload) {
 			t.Fatalf("datagram %d does not match what was sent", index)
 		}
+	}
+}
+
+// socketBuffer reads one buffer size off the socket.
+func socketBuffer(t *testing.T, conn net.PacketConn, option int) int {
+	t.Helper()
+	syscallConn, isSyscallConn := conn.(syscall.Conn)
+	if !isSyscallConn {
+		t.Fatal("socket has no file descriptor")
+	}
+	raw, err := syscallConn.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var size int
+	var getErr error
+	if err = raw.Control(func(fd uintptr) {
+		size, getErr = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, option)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	return size
+}
+
+// TestSocketBuffers requires the socket to be asked for buffers this protocol can
+// use, and requires the ask not to make them smaller. A host that caps its
+// buffers keeps the cap, which is why the test only reports what it got.
+func TestSocketBuffers(t *testing.T) {
+	conn := listenPacket(t)
+	before := socketBuffer(t, conn, unix.SO_RCVBUF)
+	if New(conn, Options{}) == nil {
+		t.Skip("this kernel offers no batched path")
+	}
+	after := socketBuffer(t, conn, unix.SO_RCVBUF)
+	if after < before {
+		t.Fatalf("receive buffer shrank from %d to %d", before, after)
+	}
+	t.Logf("receive buffer %d -> %d (asked for %d)", before, after, desiredReceiveBuffer)
+	if after < desiredReceiveBuffer {
+		t.Logf("the host capped the buffer, so only %d bytes are usable", after)
 	}
 }

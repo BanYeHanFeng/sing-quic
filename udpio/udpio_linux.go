@@ -30,6 +30,14 @@ const (
 	// the whole run is bounded by the same number. It also keeps a batch from
 	// being held back by the socket's send buffer.
 	maxSegmentTotal = 65507
+
+	// desiredReceiveBuffer and desiredSendBuffer are what this package asks the
+	// socket for. The receive side matches the association window the transport
+	// advertises: a buffer below it turns the window into a number the peer obeys
+	// and the kernel then throws away. The send side is smaller because a send
+	// buffer only has to hold one batch of paced packets.
+	desiredReceiveBuffer = 4 * 1024 * 1024
+	desiredSendBuffer    = 1 * 1024 * 1024
 )
 
 // batchedConn is the Linux fast path: one sendmsg for a run of equal datagrams,
@@ -71,6 +79,8 @@ func newBatched(conn net.PacketConn, options Options) Conn {
 	c.writeFn = c.write
 	var gso, gro bool
 	err = raw.Control(func(fd uintptr) {
+		setBuffer(int(fd), unix.SO_RCVBUF, unix.SO_RCVBUFFORCE, desiredReceiveBuffer)
+		setBuffer(int(fd), unix.SO_SNDBUF, unix.SO_SNDBUFFORCE, desiredSendBuffer)
 		if !options.DisableGSO {
 			// A kernel that does not know UDP_SEGMENT answers with an error,
 			// which is the whole capability check.
@@ -87,6 +97,25 @@ func newBatched(conn net.PacketConn, options Options) Conn {
 	c.gso = gso
 	c.gro = gro
 	return c
+}
+
+// setBuffer asks for a socket buffer large enough for the window this protocol
+// advertises: a receive buffer smaller than the window is a window that cannot be
+// filled, because what the peer was allowed to send does not fit and the kernel
+// drops the rest. It is a request, not a promise — a host that caps its buffers
+// keeps the cap, and the transport simply cannot use a window larger than it.
+//
+// The force variant is tried second: it is the one that works when the cap is the
+// only thing in the way and this end is allowed to override it.
+func setBuffer(fd int, option int, force int, size int) {
+	current, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, option)
+	if err == nil && current >= size {
+		return
+	}
+	if unix.SetsockoptInt(fd, unix.SOL_SOCKET, option, size) == nil {
+		return
+	}
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, force, size)
 }
 
 // ReadPackets reads one datagram, or one run of them when GRO merged them.
