@@ -66,6 +66,12 @@ const (
 	// is a constant with a hard ceiling.
 	maxPacketSize = 1452
 
+	// maxReceiveSize is how much one read may take. A datagram is at most 64 KiB
+	// including its headers, and a socket that merges datagrams hands up a run of
+	// them in one buffer, so the buffer has to hold a whole run: one that is too
+	// small truncates the last datagram of it.
+	maxReceiveSize = 64 * 1024
+
 	// resetLen is the size of the body of a reset packet. It is random and
 	// carries nothing: a reset says that the peer has no state for the
 	// association, and there is nothing further to say.
@@ -266,7 +272,7 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		cancel:       cancel,
 		sendRing:     result.send,
 		recvRing:     result.recv,
-		batchIO:      udpio.New(conn, udpio.Options{}),
+		batchIO:      udpio.New(conn, udpio.Options{GRO: true}),
 		batchBuffers: make([]byte, 0, 2*maxPacketSize),
 		maxPayload:   maxPacketSize - headerLen - tagLen,
 		fecSender:    newFECSender(options.FEC),
@@ -647,9 +653,9 @@ func exchangeHello(ctx context.Context, conn net.PacketConn, remote net.Addr, ha
 
 // readLoop is the receive side of a client association, which owns its socket.
 func (a *association) readLoop() {
-	buffer := make([]byte, maxPacketSize)
+	buffer := make([]byte, maxReceiveSize)
 	for {
-		n, source, err := a.conn.ReadFrom(buffer)
+		packets, err := a.batchIO.ReadPackets([][]byte{buffer})
 		if err != nil {
 			if isClosed(err) {
 				a.shutdown(err, false)
@@ -657,7 +663,11 @@ func (a *association) readLoop() {
 			}
 			continue
 		}
-		_ = a.handlePacket(buffer[:n], source)
+		for _, packet := range packets {
+			packet.ForEach(func(datagram []byte) {
+				_ = a.handlePacket(datagram, packet.Addr)
+			})
+		}
 	}
 }
 

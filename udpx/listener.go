@@ -6,6 +6,8 @@ import (
 	"net"
 	"sync"
 
+	"github.com/sagernet/sing-quic/udpio"
+
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
@@ -28,6 +30,7 @@ const (
 // connection id and needs nothing of the payload.
 type Listener struct {
 	conn        net.PacketConn
+	batchIO     udpio.Conn
 	verifier    Verifier
 	options     Options
 	ctx         context.Context
@@ -47,6 +50,7 @@ func ListenPacket(conn net.PacketConn, verifier Verifier, options Options) *List
 	ctx, cancel := context.WithCancelCause(context.Background())
 	l := &Listener{
 		conn:         conn,
+		batchIO:      udpio.New(conn, udpio.Options{GRO: true}),
 		verifier:     verifier,
 		options:      options.withDefaults(),
 		ctx:          ctx,
@@ -93,9 +97,9 @@ func (l *Listener) shutdown(cause error) {
 // readLoop reads the socket and routes every packet by its connection id. Every
 // packet it cannot place is dropped without an answer.
 func (l *Listener) readLoop() {
-	buffer := make([]byte, maxPacketSize)
+	buffer := make([]byte, maxReceiveSize)
 	for {
-		n, source, err := l.conn.ReadFrom(buffer)
+		packets, err := l.batchIO.ReadPackets([][]byte{buffer})
 		if err != nil {
 			if isClosed(err) {
 				l.shutdown(err)
@@ -103,17 +107,21 @@ func (l *Listener) readLoop() {
 			}
 			continue
 		}
-		packetHeader, err := parseHeader(buffer[:n])
-		if err != nil {
-			continue
+		for _, packet := range packets {
+			packet.ForEach(func(datagram []byte) {
+				packetHeader, err := parseHeader(datagram)
+				if err != nil {
+					return
+				}
+				if packetHeader.Type == packetTypeHandshake {
+					// A hello is answered by the handshake goroutine, which needs the
+					// bytes after this one has been replaced in the buffer.
+					l.handleHello(bytes.Clone(datagram), packet.Addr)
+					return
+				}
+				l.dispatch(packetHeader, datagram, packet.Addr)
+			})
 		}
-		if packetHeader.Type == packetTypeHandshake {
-			// A hello is answered by the handshake goroutine, which needs the
-			// bytes after this one has been replaced in the buffer.
-			l.handleHello(bytes.Clone(buffer[:n]), source)
-			continue
-		}
-		l.dispatch(packetHeader, buffer[:n], source)
 	}
 }
 
