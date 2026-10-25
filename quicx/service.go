@@ -33,6 +33,10 @@ type ServiceOptions struct {
 	UDPTimeout  time.Duration
 	Handler     ServiceHandler
 	BBRProfile  string
+	// FEC protects what this server sends, which is the direction the answers
+	// travel in. It is per direction: a client that wants its own requests covered
+	// sets it on the client.
+	FEC udpx.FECOptions
 }
 
 type ServiceHandler interface {
@@ -88,6 +92,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 			IdleTimeout:     options.IdleTimeout,
 			KeepAlivePeriod: options.Heartbeat,
 			Congestion:      bbrProfile,
+			FEC:             options.FEC,
 		},
 		userMap: make(map[[8]byte]userEntry[U]),
 	}, nil

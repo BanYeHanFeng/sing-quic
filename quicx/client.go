@@ -28,6 +28,10 @@ type ClientOptions struct {
 	IdleTimeout   time.Duration
 	Heartbeat     time.Duration
 	BBRProfile    string
+	// FEC protects what this client sends, which is the direction its requests
+	// travel in: a lost packet that the redundancy replaces does not cost a round
+	// trip of the request it belongs to.
+	FEC udpx.FECOptions
 	// Logger receives the dial diagnostics. A failed dial is otherwise only
 	// visible as a generic error to the caller, which cannot tell whether the
 	// address failed to resolve, the handshake timed out, or the server
@@ -74,6 +78,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 			// a ping the peer acknowledges.
 			KeepAlivePeriod: options.Heartbeat,
 			Congestion:      bbrProfile,
+			FEC:             options.FEC,
 		},
 		logger: options.Logger,
 	}, nil
