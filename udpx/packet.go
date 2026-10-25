@@ -8,7 +8,7 @@
 // a different kind of event from receiving one: both end up as bytes that go
 // through the same parsing and authentication.
 //
-// Wire format
+// # Wire format
 //
 // A packet is a clear header followed by an authenticated payload:
 //
