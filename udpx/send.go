@@ -78,6 +78,11 @@ func (q *frameQueue) take(budget int) []outFrame {
 	return taken
 }
 
+// frameType returns the type of the frame the entry carries.
+func (f outFrame) frameType() frameType {
+	return frameType(f.payload[0] & frameTypeBits)
+}
+
 // sentPacket is one packet in flight.
 type sentPacket struct {
 	sentAt       time.Time
@@ -136,6 +141,39 @@ func (s *sentPackets) remove(packet *sentPacket) {
 	}
 }
 
+// lost removes the packets that are lost by now and returns them, oldest first.
+func (s *sentPackets) lost(now time.Time, largestAcked uint32, lossDelay time.Duration) []*sentPacket {
+	if len(s.packets) == 0 {
+		return nil
+	}
+	var lost []*sentPacket
+	kept := s.packets[:0]
+	for _, packet := range s.packets {
+		if !isLost(packet, now, largestAcked, lossDelay) {
+			kept = append(kept, packet)
+			continue
+		}
+		lost = append(lost, packet)
+		s.bytes -= packet.size
+	}
+	s.packets = kept
+	return lost
+}
+
+// oldest returns the packet that has been in flight longest.
+func (s *sentPackets) oldest() *sentPacket {
+	if len(s.packets) == 0 {
+		return nil
+	}
+	oldest := s.packets[0]
+	for _, packet := range s.packets[1:] {
+		if packet.sentAt.Before(oldest.sentAt) {
+			oldest = packet
+		}
+	}
+	return oldest
+}
+
 func containsPacketNumber(ranges []pnRange, packetNumber uint32) bool {
 	for _, current := range ranges {
 		if packetNumber > current.end {
@@ -146,6 +184,17 @@ func containsPacketNumber(ranges []pnRange, packetNumber uint32) bool {
 		}
 	}
 	return false
+}
+
+// isLost reports whether a packet is lost. A packet is lost when it is far enough
+// behind what the peer acknowledged that a reordering cannot explain it, or when
+// it has been in flight for longer than a round trip and its acknowledgement is
+// therefore not on the way.
+func isLost(packet *sentPacket, now time.Time, largestAcked uint32, lossDelay time.Duration) bool {
+	if largestAcked >= packet.packetNumber && largestAcked-packet.packetNumber >= packetThreshold {
+		return true
+	}
+	return now.Sub(packet.sentAt) >= lossDelay
 }
 
 // flush packs the frames waiting to be sent into packets and sends them.
@@ -201,6 +250,7 @@ func (a *association) sendFramesLocked(frames []outFrame) error {
 		sent.ackEliciting = sent.ackEliciting || frames[index].ackEliciting
 	}
 	a.flightMu.Lock()
+	wasEmpty := a.inFlight.len() == 0
 	a.inFlight.append(sent)
 	a.flightMu.Unlock()
 	_, err = a.conn.WriteTo(packet, a.RemoteAddr())
@@ -211,5 +261,11 @@ func (a *association) sendFramesLocked(frames []outFrame) error {
 		return E.Cause(err, "write packet")
 	}
 	a.resetIdle()
+	// The probe timer belongs to the oldest packet in flight, so it is armed when
+	// there was nothing in flight before this one. A packet that follows a
+	// pending one is already covered by the wait that packet armed.
+	if wasEmpty && sent.ackEliciting {
+		a.armPTO()
+	}
 	return nil
 }

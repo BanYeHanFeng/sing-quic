@@ -137,6 +137,10 @@ type association struct {
 	flightMu sync.Mutex
 	inFlight sentPackets
 	rtt      rttEstimator
+	// probes counts the probes that went unanswered, which is what the wait
+	// before the next one doubles with.
+	probes   int
+	ptoTimer *time.Timer
 
 	// ownsConn says whether closing the association closes the socket. A client
 	// owns the socket it dialled on; a server association writes on the socket
@@ -166,6 +170,8 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		a.shutdown(ErrIdleTimeout, true)
 	})
 	a.ackTimer = time.AfterFunc(maxAckDelay, a.flushAck)
+	a.ptoTimer = time.AfterFunc(initialPTO, a.probe)
+	a.ptoTimer.Stop()
 	if a.options.KeepAlivePeriod > 0 {
 		go a.keepAliveLoop()
 	}
@@ -201,6 +207,7 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 		}
 		a.idleTimer.Stop()
 		a.ackTimer.Stop()
+		a.ptoTimer.Stop()
 		a.cancel(cause)
 		if a.ownsConn {
 			_ = a.conn.Close()
@@ -309,27 +316,6 @@ func (a *association) flushAck() {
 		return
 	}
 	_ = a.send(acknowledgement)
-}
-
-// handleAck takes the acknowledged packets out of flight and turns the newest of
-// them into a round trip sample. The sample comes from the largest acknowledged
-// packet, because that is the one the peer's delay refers to; the delay is
-// subtracted because it is time the peer held the acknowledgement rather than
-// time the packet spent in flight.
-func (a *association) handleAck(body []byte, now time.Time) {
-	acknowledgement, err := parseAck(body)
-	if err != nil {
-		return
-	}
-	a.flightMu.Lock()
-	acked := a.inFlight.acked(acknowledgement.ranges[:acknowledgement.count])
-	for _, packet := range acked {
-		if packet.packetNumber != acknowledgement.largest {
-			continue
-		}
-		a.rtt.sample(now.Sub(packet.sentAt) - acknowledgement.delay)
-	}
-	a.flightMu.Unlock()
 }
 
 // roundTrip returns the current round trip estimate.
