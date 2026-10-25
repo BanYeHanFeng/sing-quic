@@ -337,34 +337,34 @@ func TestCredit(t *testing.T) {
 // to complete, which it can only do if the association window is moved forward as
 // data is read and not just the window of the stream.
 func TestStreamLargeTransfer(t *testing.T) {
-client, server, _ := testSetup(t, Options{}, Options{})
-ctx := testContext(t, 120*time.Second)
-stream, err := client.OpenStream(ctx)
-if err != nil {
-t.Fatal(err)
-}
-payload := testPayload(2 * initialConnectionWindow)
-go func() {
-if _, writeErr := stream.Write(payload); writeErr != nil {
-t.Errorf("write: %v", writeErr)
-return
-}
-_ = stream.CloseWrite()
-}()
-accepted, err := server.AcceptStream(ctx)
-if err != nil {
-t.Fatal(err)
-}
-read := make([]byte, 0, len(payload))
-buffer := make([]byte, 64*1024)
-for len(read) < len(payload) {
-n, readErr := accepted.Read(buffer)
-if readErr != nil {
-t.Fatalf("read %d of %d bytes: %v", len(read), len(payload), readErr)
-}
-read = append(read, buffer[:n]...)
-}
-if !bytes.Equal(read, payload) {
-t.Fatal("the payload changed on the way")
-}
+	client, server, _ := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 120*time.Second)
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := testPayload(2 * initialConnectionWindow)
+	go func() {
+		if _, writeErr := stream.Write(payload); writeErr != nil {
+			t.Errorf("write: %v", writeErr)
+			return
+		}
+		_ = stream.CloseWrite()
+	}()
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := make([]byte, 0, len(payload))
+	buffer := make([]byte, 64*1024)
+	for len(read) < len(payload) {
+		n, readErr := accepted.Read(buffer)
+		if readErr != nil {
+			t.Fatalf("read %d of %d bytes: %v", len(read), len(payload), readErr)
+		}
+		read = append(read, buffer[:n]...)
+	}
+	if !bytes.Equal(read, payload) {
+		t.Fatal("the payload changed on the way")
+	}
 }

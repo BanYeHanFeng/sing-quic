@@ -100,18 +100,38 @@ func TestInFlightRemove(t *testing.T) {
 	}
 }
 
-func TestContainsPacketNumber(t *testing.T) {
-	ranges := []pnRange{{start: 10, end: 12}, {start: 4, end: 5}}
-	for _, test := range []struct {
-		packetNumber uint32
-		contained    bool
-	}{
-		{12, true}, {10, true}, {11, true},
-		{9, false}, {13, false}, {5, true}, {4, true}, {3, false}, {0, false},
-	} {
-		if containsPacketNumber(ranges, test.packetNumber) != test.contained {
-			t.Fatalf("packet %d: contained %v", test.packetNumber, !test.contained)
+// TestInFlightCompaction requires the flight table to drop what left it and to
+// count only what is still in flight, which is what keeps an acknowledgement from
+// costing a pass over the whole table.
+func TestInFlightCompaction(t *testing.T) {
+	var inFlight sentPackets
+	for packetNumber := uint32(0); packetNumber < 100; packetNumber++ {
+		inFlight.append(&sentPacket{packetNumber: packetNumber, size: 100})
+	}
+	acked := inFlight.acked([]pnRange{{start: 0, end: 49}})
+	if len(acked) != 50 {
+		t.Fatalf("%d packets acknowledged", len(acked))
+	}
+	if inFlight.len() != 50 {
+		t.Fatalf("%d packets in flight", inFlight.len())
+	}
+	if inFlight.bytes != 5000 {
+		t.Fatalf("%d bytes in flight", inFlight.bytes)
+	}
+	for _, packet := range inFlight.packets {
+		if packet.removed {
+			t.Fatal("a packet that left the flight table is still in it")
 		}
+	}
+	acked = inFlight.acked([]pnRange{{start: 50, end: 99}})
+	if len(acked) != 50 {
+		t.Fatalf("%d packets acknowledged", len(acked))
+	}
+	if inFlight.len() != 0 || inFlight.bytes != 0 {
+		t.Fatalf("%d packets and %d bytes in flight", inFlight.len(), inFlight.bytes)
+	}
+	if oldest := inFlight.oldest(); oldest != nil {
+		t.Fatalf("an empty flight table has an oldest packet: %d", oldest.packetNumber)
 	}
 }
 

@@ -2,6 +2,7 @@ package udpx
 
 import (
 	"context"
+	"sort"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -90,15 +91,25 @@ type sentPacket struct {
 	size         int
 	packetNumber uint32
 	ackEliciting bool
+	// removed says the packet left the flight table. The entry stays in the
+	// ordered slice until the next compaction, because an acknowledgement covers
+	// a range of packet numbers and rewriting the whole table once per range is
+	// what turns a transfer into a quadratic amount of work.
+	removed bool
 }
 
-// sentPackets is the set of packets in flight, ordered by packet number. Both
-// ways a packet can leave it — an acknowledgement, or a loss — are reported as
-// ranges of packet numbers, so removal is a pass over the ordered slice instead
-// of a lookup per packet number.
+// sentPackets is the set of packets in flight, ordered by packet number.
+//
+// An acknowledgement names ranges of packet numbers, so the packets it covers are
+// found by searching the ordered slice instead of by a scan over everything in
+// flight, and the ones that left are compacted out of it once a quarter of the
+// table is gone. A loss is handled the same way, and both are reported as a
+// prefix: a packet far behind what was acknowledged, or one that has been in
+// flight long enough, is lost before anything that came after it.
 type sentPackets struct {
 	packets []*sentPacket
 	bytes   int
+	removed int
 }
 
 func (s *sentPackets) append(packet *sentPacket) {
@@ -106,84 +117,107 @@ func (s *sentPackets) append(packet *sentPacket) {
 	s.bytes += packet.size
 }
 
+// len is how many packets are in flight, not how many entries the table holds.
 func (s *sentPackets) len() int {
-	return len(s.packets)
+	return len(s.packets) - s.removed
 }
 
-// acked removes the packets an acknowledgement covers and returns them.
+// acked marks the packets an acknowledgement covers and returns them.
 func (s *sentPackets) acked(ranges []pnRange) []*sentPacket {
 	if len(s.packets) == 0 || len(ranges) == 0 {
 		return nil
 	}
 	var acked []*sentPacket
-	kept := s.packets[:0]
+	for _, current := range ranges {
+		index := sort.Search(len(s.packets), func(index int) bool {
+			return s.packets[index].packetNumber >= current.start
+		})
+		for ; index < len(s.packets) && s.packets[index].packetNumber <= current.end; index++ {
+			packet := s.packets[index]
+			if packet.removed {
+				continue
+			}
+			if s.markRemoved(packet) {
+				acked = append(acked, packet)
+			}
+		}
+	}
+	s.compact()
+	return acked
+}
+
+// lost marks the packets that are lost by now and returns them, oldest first.
+func (s *sentPackets) lost(now time.Time, largestAcked uint32, lossDelay time.Duration) []*sentPacket {
+	var lost []*sentPacket
 	for _, packet := range s.packets {
-		if containsPacketNumber(ranges, packet.packetNumber) {
-			acked = append(acked, packet)
-			s.bytes -= packet.size
+		if packet.removed {
 			continue
 		}
-		kept = append(kept, packet)
+		if !isLost(packet, now, largestAcked, lossDelay) {
+			// The table is ordered by packet number and, with it, by send time, so
+			// nothing behind a packet that is not lost is lost either.
+			break
+		}
+		if s.markRemoved(packet) {
+			lost = append(lost, packet)
+		}
 	}
-	s.packets = kept
-	return acked
+	s.compact()
+	return lost
 }
 
 // remove drops one packet from flight, which is what a failed write leaves
 // behind: the packet never left, so nothing will acknowledge it.
 func (s *sentPackets) remove(packet *sentPacket) {
-	for index, candidate := range s.packets {
-		if candidate == packet {
-			s.packets = append(s.packets[:index], s.packets[index+1:]...)
-			s.bytes -= packet.size
-			return
-		}
-	}
-}
-
-// lost removes the packets that are lost by now and returns them, oldest first.
-func (s *sentPackets) lost(now time.Time, largestAcked uint32, lossDelay time.Duration) []*sentPacket {
-	if len(s.packets) == 0 {
-		return nil
-	}
-	var lost []*sentPacket
-	kept := s.packets[:0]
-	for _, packet := range s.packets {
-		if !isLost(packet, now, largestAcked, lossDelay) {
-			kept = append(kept, packet)
-			continue
-		}
-		lost = append(lost, packet)
-		s.bytes -= packet.size
-	}
-	s.packets = kept
-	return lost
+	s.markRemoved(packet)
+	s.compact()
 }
 
 // oldest returns the packet that has been in flight longest.
 func (s *sentPackets) oldest() *sentPacket {
-	if len(s.packets) == 0 {
-		return nil
-	}
-	oldest := s.packets[0]
-	for _, packet := range s.packets[1:] {
-		if packet.sentAt.Before(oldest.sentAt) {
+	var oldest *sentPacket
+	for _, packet := range s.packets {
+		if packet.removed {
+			continue
+		}
+		if oldest == nil || packet.sentAt.Before(oldest.sentAt) {
 			oldest = packet
 		}
 	}
 	return oldest
 }
 
-func containsPacketNumber(ranges []pnRange, packetNumber uint32) bool {
-	for _, current := range ranges {
-		if packetNumber > current.end {
+func (s *sentPackets) markRemoved(packet *sentPacket) bool {
+	if packet.removed {
+		return false
+	}
+	packet.removed = true
+	s.removed++
+	s.bytes -= packet.size
+	return true
+}
+
+// compact drops the entries that left the flight table once enough of them are
+// gone for the pass to be worth it.
+func (s *sentPackets) compact() {
+	if s.removed == 0 {
+		return
+	}
+	if s.removed < len(s.packets)/4 && s.removed < 32 && len(s.packets) > 0 {
+		return
+	}
+	kept := s.packets[:0]
+	for _, packet := range s.packets {
+		if packet.removed {
 			continue
 		}
-		if packetNumber >= current.start {
-			return true
-		}
+		kept = append(kept, packet)
 	}
-	return false
+	for index := len(kept); index < len(s.packets); index++ {
+		s.packets[index] = nil
+	}
+	s.packets = kept
+	s.removed = 0
 }
 
 // isLost reports whether a packet is lost. A packet is lost when it is far enough
