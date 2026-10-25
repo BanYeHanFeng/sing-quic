@@ -297,6 +297,44 @@ func TestPacketConnections(t *testing.T) {
 	}
 }
 
+// TestLargeTransfer requires a transfer larger than both windows of the stream to
+// complete, which it can only do if the windows move forward as the reader reads.
+func TestLargeTransfer(t *testing.T) {
+	client, handler := testSetup(t, "password")
+	ctx := testContext(t, 60*time.Second)
+	const size = 4 * 1024 * 1024
+	payload := make([]byte, size)
+	for index := range payload {
+		payload[index] = byte(index % 251)
+	}
+	conn, err := client.DialConn(ctx, M.ParseSocksaddr("example.com:80"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	serverConn := handler.connection(t, ctx)
+	written := make(chan error, 1)
+	go func() {
+		_, writeErr := serverConn.conn.Write(payload)
+		written <- writeErr
+	}()
+	read := make([]byte, 0, size)
+	buffer := make([]byte, 32*1024)
+	for len(read) < size {
+		n, readErr := conn.Read(buffer)
+		if readErr != nil {
+			t.Fatalf("read %d of %d bytes: %v", len(read), size, readErr)
+		}
+		read = append(read, buffer[:n]...)
+	}
+	if !bytes.Equal(read, payload) {
+		t.Fatal("the payload changed on the way")
+	}
+	if err = <-written; err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestWrongPassword requires a client with a password the server does not know to
 // be refused, with nothing to authenticate against.
 func TestWrongPassword(t *testing.T) {
