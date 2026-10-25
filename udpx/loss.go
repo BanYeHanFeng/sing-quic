@@ -54,7 +54,7 @@ func lossDelay(rtt rttEstimator) time.Duration {
 		base = rtt.latest
 	}
 	if base <= 0 {
-		return timerGranularity
+		base = initialRTT
 	}
 	delay := time.Duration(float64(base) * timeThreshold)
 	if delay < timerGranularity {

@@ -46,6 +46,13 @@ const (
 	// trip measured in microseconds does not turn into a timer no scheduler can
 	// keep.
 	timerGranularity = time.Millisecond
+
+	// initialRTT is the round trip a path is assumed to have before one was
+	// measured. Declaring a packet lost before its acknowledgement could have
+	// arrived is not loss recovery: on a path of a few hundred milliseconds it
+	// retransmits the whole first window, and on one that is merely slow it
+	// keeps doing so.
+	initialRTT = 333 * time.Millisecond
 )
 
 // pnRange is an inclusive range of packet numbers.
@@ -295,6 +302,9 @@ func (e *rttEstimator) sample(latest time.Duration) {
 // rto is how long to wait for an acknowledgement before considering a packet
 // lost.
 func (e *rttEstimator) rto() time.Duration {
+	if !e.sampled {
+		return initialRTT
+	}
 	variation := 4 * e.rttvar
 	if variation < timerGranularity {
 		variation = timerGranularity

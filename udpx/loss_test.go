@@ -265,8 +265,13 @@ func TestProbingIsBounded(t *testing.T) {
 
 func TestLossDelay(t *testing.T) {
 	var estimator rttEstimator
-	if delay := lossDelay(estimator); delay != timerGranularity {
+	// A path nobody measured is assumed to have a round trip rather than none,
+	// so that a first window is not declared lost before it could be answered.
+	if delay := lossDelay(estimator); delay != time.Duration(float64(initialRTT)*timeThreshold) {
 		t.Fatalf("delay without a sample: %v", delay)
+	}
+	if timeout := estimator.rto(); timeout != initialRTT {
+		t.Fatalf("timeout without a sample: %v", timeout)
 	}
 	estimator.sample(100 * time.Millisecond)
 	if delay := lossDelay(estimator); delay != 112500*time.Microsecond {
