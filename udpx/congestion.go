@@ -81,7 +81,7 @@ func (a *association) congestionBudget() (bool, time.Time) {
 		// as none. What is already in flight as redundancy was charged this way
 		// when it went out, so it is not charged twice.
 		data := int64(inFlight - parityBytes)
-		charged = congestion.ByteCount(data + data*int64(a.fecSender.parityShards)/int64(a.fecSender.dataShards) + int64(parityBytes))
+		charged = congestion.ByteCount(data + data*int64(a.fecSender.parity())/int64(a.fecSender.dataShards) + int64(parityBytes))
 	}
 	now := time.Now()
 	a.ccMu.Lock()

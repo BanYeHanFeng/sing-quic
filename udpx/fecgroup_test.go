@@ -301,15 +301,27 @@ func TestFECGroupTimer(t *testing.T) {
 // cheaper than waiting a round trip for it, which is the whole reason the packet
 // number is in the clear.
 func TestFECOverLossyLink(t *testing.T) {
+for _, config := range []struct {
+name    string
+options FECOptions
+}{
+{"fixed parity", FECOptions{DataShards: 8, ParityShards: 2}},
+{"parity from loss", FECOptions{DataShards: 8}},
+} {
+t.Run(config.name, func(t *testing.T) {
+testFECOverLossyLink(t, config.options)
+})
+}
+}
+
+func testFECOverLossyLink(t *testing.T, fecOptions FECOptions) {
 password := NewPassword("password")
 listenerConn := udpConn(t)
 listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
 defer listener.Close()
 link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: 0.05, delay: 20 * time.Millisecond})
 ctx := testContext(t, 120*time.Second)
-client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{
-FEC: FECOptions{DataShards: 8, ParityShards: 2},
-})
+client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{FEC: fecOptions})
 if err != nil {
 t.Fatal(err)
 }
@@ -348,9 +360,45 @@ read = append(read, buffer[:n]...)
 if !bytes.Equal(read, payload) {
 t.Fatal("the payload changed on the way")
 }
-serverAssociation := server.(*association)
-recovered := serverAssociation.fec.recovered.Load()
+recovered := server.(*association).fec.recovered.Load()
 if recovered == 0 {
 t.Fatal("no packet was recovered from parity")
+}
+}
+
+// TestFECParityFollowsLoss requires the redundancy of a group to follow what the
+// path is losing: nothing where nothing is lost, and more where more is, with what
+// was asked for taking precedence over both.
+func TestFECParityFollowsLoss(t *testing.T) {
+sender := newFECSender(FECOptions{DataShards: 8})
+if sender == nil {
+t.Fatal("data shards of eight did not turn forward error correction on")
+}
+// Nothing has been settled, so nothing is known about the path.
+if parity := sender.parity(); parity != 0 {
+t.Fatalf("%d parity shards before anything was acknowledged", parity)
+}
+sender.observe(32, 0)
+if parity := sender.parity(); parity != 0 {
+t.Fatalf("%d parity shards on a path that lost nothing", parity)
+}
+// Five per cent of what is settled: a group of eight expects half a packet lost.
+sender.observe(28, 4)
+if parity := sender.parity(); parity < 1 {
+t.Fatalf("%d parity shards for a path losing five per cent", parity)
+}
+// A path that loses half of everything gets redundancy in proportion, up to the
+// members it covers.
+sender.observe(0, 64)
+if parity := sender.parity(); parity < 2 || parity > 8 {
+t.Fatalf("%d parity shards for a path losing half of it", parity)
+}
+// What the caller asked for is what is sent, whatever the path does.
+fixed := newFECSender(FECOptions{DataShards: 8, ParityShards: 3})
+if parity := fixed.parity(); parity != 3 {
+t.Fatalf("%d parity shards for a group that asked for three", parity)
+}
+if sender := newFECSender(FECOptions{DataShards: 0}); sender != nil {
+t.Fatal("zero data shards did not turn forward error correction off")
 }
 }
