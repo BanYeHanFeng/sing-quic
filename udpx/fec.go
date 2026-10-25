@@ -533,7 +533,12 @@ func (a *association) flushFECGroup() {
 		sender.close()
 		return
 	}
-	_ = a.sendParityLocked()
+	if err := a.sendParityLocked(); err != nil {
+		return
+	}
+	// Nothing else is going to fill a batch on a timer: the group closed on its
+	// own, so the parity it produced leaves now.
+	_ = a.writePendingLocked()
 }
 
 // sendParityLocked encodes the open group and sends its parity shards, one packet
@@ -599,13 +604,12 @@ func (a *association) sendParityPacketLocked(description fecHeader, shard []byte
 		Epoch:        a.sendRing.epoch(),
 		PacketNumber: a.sendPacket,
 	}
-	packet, err := a.sendRing.seal(a.sendBuffer[:0], h, &description, shard)
+	packet, err := a.sealLocked(h, &description, shard)
 	if err != nil {
 		return err
 	}
-	a.sendBuffer = packet
 	a.sendPacket++
-	return a.writePacketLocked(&sentPacket{
+	return a.appendPacketLocked(&sentPacket{
 		packetNumber: h.PacketNumber,
 		sentAt:       time.Now(),
 		size:         len(packet),

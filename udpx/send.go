@@ -5,6 +5,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/sagernet/sing-quic/udpio"
+
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
@@ -124,6 +126,21 @@ type sentPacket struct {
 	// a range of packet numbers and rewriting the whole table once per range is
 	// what turns a transfer into a quadratic amount of work.
 	removed bool
+}
+
+// maxSendBatch is how many packets one flush may hand to the socket at once. What
+// pacing allows bounds it in practice; this is the ceiling for when pacing does
+// not: a run of acknowledgements, or the parity shards of a group encoded at once.
+const maxSendBatch = 16
+
+// pendingPacket is a packet that has left the frame queue and has a number but has
+// not left the host. priorInFlight is what was in flight when it was recorded,
+// which the congestion controller needs per packet and which therefore cannot be
+// read after the whole batch has been added.
+type pendingPacket struct {
+	sent          *sentPacket
+	packet        []byte
+	priorInFlight int
 }
 
 // sentPackets is the set of packets in flight, ordered by packet number.
@@ -280,12 +297,35 @@ func isLost(packet *sentPacket, now time.Time, largestAcked uint32, lossDelay ti
 // flush packs the frames waiting to be sent into packets and sends them, as far
 // as the congestion window and the pacing rate allow. What does not fit stays
 // queued: an acknowledgement opens the window again and calls this.
+//
+// A flush is a batch: packets are sealed one after another into one buffer and
+// leave in as few calls as the socket allows. Whether that is one call or twenty
+// is the socket's business, and a socket that can segment sends a run of equal
+// packets with a single one.
 func (a *association) flush() error {
 	a.sendMu.Lock()
 	defer a.sendMu.Unlock()
-	for a.queue.len() > 0 {
+	for {
+		if a.queue.len() == 0 {
+			return a.writePendingLocked()
+		}
+		if len(a.pending) >= maxSendBatch {
+			if err := a.writePendingLocked(); err != nil {
+				return err
+			}
+			continue
+		}
 		allowed, waitUntil := a.congestionBudget()
 		if !allowed {
+			if len(a.pending) > 0 {
+				// What is sealed leaves before the window is asked again: it was
+				// taken while the window was open, and the acknowledgement that
+				// opens the window further is an answer to it.
+				if err := a.writePendingLocked(); err != nil {
+					return err
+				}
+				continue
+			}
 			acknowledgement := a.queue.takeAckOnly(a.maxPayload)
 			if len(acknowledgement) > 0 {
 				// The window is closed, but this packet is what the peer needs
@@ -315,7 +355,6 @@ func (a *association) flush() error {
 			return err
 		}
 	}
-	return nil
 }
 
 // sendFramesLocked writes the frames as one packet. The caller holds sendMu,
@@ -336,65 +375,128 @@ func (a *association) sendFramesLocked(frames []outFrame) error {
 	for _, frame := range frames {
 		payload = append(payload, frame.payload...)
 	}
-	packet, err := a.sendRing.seal(a.sendBuffer[:0], h, nil, payload)
-	if err != nil {
-		return err
-	}
 	a.buildBuffer = payload[:0]
-	a.sendBuffer = packet
-	a.sendPacket++
 	sent := &sentPacket{
 		packetNumber: h.PacketNumber,
 		sentAt:       time.Now(),
-		size:         len(packet),
 		frames:       frames,
 	}
 	for index := range frames {
 		frames[index].lastSent = h.PacketNumber
 		sent.ackEliciting = sent.ackEliciting || frames[index].ackEliciting
 	}
-	err = a.writePacketLocked(sent, packet)
+	packet, err := a.sealLocked(h, nil, payload)
+	if err != nil {
+		return err
+	}
+	sent.size = len(packet)
+	a.sendPacket++
+	err = a.appendPacketLocked(sent, packet)
 	if err != nil {
 		return err
 	}
 	return a.fecMemberLocked(packet, h.PacketNumber)
 }
 
-// writePacketLocked puts one sealed packet on the wire and records what it means
-// for what is in flight, for the congestion controller and for the probe timer.
-// The caller holds sendMu.
-func (a *association) writePacketLocked(sent *sentPacket, packet []byte) error {
-	if !sent.ackEliciting {
-		// Nothing in this packet asks for an acknowledgement, so nothing will
-		// ever acknowledge it: putting it in flight would leave an entry that can
-		// only be given up on, and would keep the probe timer aimed at a packet
-		// nobody is waiting for.
-		_, err := a.conn.WriteTo(packet, a.RemoteAddr())
-		if err != nil {
-			return E.Cause(err, "write packet")
-		}
-		a.resetIdle()
+// sealLocked seals one packet at the end of the batch buffer, so that the packets
+// of a batch are one run of memory for a segmented send to take as it is.
+func (a *association) sealLocked(h header, description *fecHeader, payload []byte) ([]byte, error) {
+	start := len(a.batchBuffers)
+	if cap(a.batchBuffers) < start+maxPacketSize {
+		grown := make([]byte, start, 2*(start+maxPacketSize))
+		copy(grown, a.batchBuffers)
+		a.batchBuffers = grown
+	}
+	a.batchBuffers = a.batchBuffers[:start+maxPacketSize]
+	packet, err := a.sendRing.seal(a.batchBuffers[start:start], h, description, payload)
+	if err != nil {
+		a.batchBuffers = a.batchBuffers[:start]
+		return nil, err
+	}
+	a.batchBuffers = a.batchBuffers[:start+len(packet)]
+	return packet, nil
+}
+
+// appendPacketLocked adds a sealed packet to the batch, writing the batch out when
+// it is full. A group of parity shards is encoded all at once, so the batch can
+// fill in the middle of one.
+func (a *association) appendPacketLocked(sent *sentPacket, packet []byte) error {
+	a.pending = append(a.pending, pendingPacket{sent: sent, packet: packet})
+	if len(a.pending) >= maxSendBatch {
+		return a.writePendingLocked()
+	}
+	return nil
+}
+
+// writePendingLocked puts the sealed packets on the wire in one call where it can,
+// and records what they mean for what is in flight, for the congestion controller
+// and for the probe timer. The caller holds sendMu.
+func (a *association) writePendingLocked() error {
+	if len(a.pending) == 0 {
 		return nil
 	}
+	select {
+	case <-a.ctx.Done():
+		a.clearPendingLocked()
+		return context.Cause(a.ctx)
+	default:
+	}
+	remote := a.RemoteAddr()
+	packets := a.writeBuffer[:0]
+	for index := range a.pending {
+		packets = append(packets, udpio.Packet{Data: a.pending[index].packet, Addr: remote})
+	}
+	a.writeBuffer = packets
 	a.flightMu.Lock()
 	wasEmpty := a.inFlight.len() == 0
-	priorInFlight := a.inFlight.bytes
-	a.inFlight.append(sent)
+	for index := range a.pending {
+		packet := &a.pending[index]
+		if !packet.sent.ackEliciting {
+			// Nothing in this packet asks for an acknowledgement, so nothing will
+			// ever acknowledge it: putting it in flight would leave an entry that
+			// can only be given up on, and would keep the probe timer aimed at a
+			// packet nobody is waiting for.
+			continue
+		}
+		packet.priorInFlight = a.inFlight.bytes
+		a.inFlight.append(packet.sent)
+	}
 	a.flightMu.Unlock()
-	_, err := a.conn.WriteTo(packet, a.RemoteAddr())
+	err := a.batchIO.WritePackets(packets)
+	a.writeBuffer = packets[:0]
 	if err != nil {
 		a.flightMu.Lock()
-		a.inFlight.remove(sent)
+		for index := range a.pending {
+			if a.pending[index].sent.ackEliciting {
+				a.inFlight.remove(a.pending[index].sent)
+			}
+		}
 		a.flightMu.Unlock()
-		return E.Cause(err, "write packet")
+		a.clearPendingLocked()
+		return E.Cause(err, "write packets")
 	}
-	a.congestionSent(sent.packetNumber, sent.size, priorInFlight, true)
+	for index := range a.pending {
+		packet := &a.pending[index]
+		if packet.sent.ackEliciting {
+			a.congestionSent(packet.sent.packetNumber, packet.sent.size, packet.priorInFlight, true)
+		}
+	}
 	a.resetIdle()
 	// The probe timer belongs to the oldest packet in flight, so it is armed when
-	// there was nothing in flight before this one. A packet that follows a
+	// there was nothing in flight before this batch. A packet that follows a
 	// pending one is already covered by the wait that packet armed.
 	if wasEmpty {
 		a.armPTO()
 	}
+	a.clearPendingLocked()
 	return nil
+}
+
+// clearPendingLocked forgets the batch, keeping its buffers for the next one.
+func (a *association) clearPendingLocked() {
+	for index := range a.pending {
+		a.pending[index] = pendingPacket{}
+	}
+	a.pending = a.pending[:0]
+	a.batchBuffers = a.batchBuffers[:0]
 }

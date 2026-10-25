@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-quic/congestion"
+	"github.com/sagernet/sing-quic/udpio"
 
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -160,9 +161,16 @@ type association struct {
 	sendMu      sync.Mutex
 	sendRing    keyRing
 	sendPacket  uint32
-	sendBuffer  []byte
 	buildBuffer []byte
-	queue       frameQueue
+	// batchIO moves the packets of one flush in as few calls as the socket
+	// allows. pending holds the ones already sealed and numbered, batchBuffers
+	// is where they were sealed one after another so that a segmented send has
+	// nothing to copy, and writeBuffer is the list handed to the socket.
+	batchIO      udpio.Conn
+	pending      []pendingPacket
+	batchBuffers []byte
+	writeBuffer  []udpio.Packet
+	queue        frameQueue
 	// maxPayload is how many payload bytes a packet may carry, which is smaller
 	// than what the MTU allows once this end protects its packets: the parity
 	// shards and the description in their headers have to fit as well.
@@ -258,7 +266,8 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		cancel:       cancel,
 		sendRing:     result.send,
 		recvRing:     result.recv,
-		sendBuffer:   make([]byte, 0, maxPacketSize),
+		batchIO:      udpio.New(conn, udpio.Options{}),
+		batchBuffers: make([]byte, 0, 2*maxPacketSize),
 		maxPayload:   maxPacketSize - headerLen - tagLen,
 		fecSender:    newFECSender(options.FEC),
 		fec:          newFECReceiver(),
