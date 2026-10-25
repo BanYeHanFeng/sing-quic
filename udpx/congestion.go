@@ -66,9 +66,9 @@ func newCongestionController(options Options) congestion.Controller {
 	return congestion.NewBbrController(congestion.ByteCount(maxPacketSize), options.Congestion)
 }
 
-// congestionBudget reports whether a packet may leave now, and when it may if it
-// may not.
-func (a *association) congestionBudget() (bool, time.Time) {
+// congestionCharged is what the window is asked about: what is in flight, plus
+// the redundancy the open group is going to need.
+func (a *association) congestionCharged() congestion.ByteCount {
 	a.flightMu.Lock()
 	inFlight := a.inFlight.bytes
 	parityBytes := a.inFlight.parityBytes
@@ -83,16 +83,33 @@ func (a *association) congestionBudget() (bool, time.Time) {
 		data := int64(inFlight - parityBytes)
 		charged = congestion.ByteCount(data + data*int64(a.fecSender.parity())/int64(a.fecSender.dataShards) + int64(parityBytes))
 	}
+	return charged
+}
+
+// windowAllows reports whether the congestion window has room for another packet.
+//
+// The window is asked once per packet and the pacing once per batch: pacing is
+// what spreads a batch over time, so asking it per packet is what keeps a batch
+// from ever being more than one packet, which is the one thing a send path built
+// around segmentation cannot afford.
+func (a *association) windowAllows() bool {
+	charged := a.congestionCharged()
+	a.ccMu.Lock()
+	defer a.ccMu.Unlock()
+	return a.cc.CanSend(charged)
+}
+
+// pacingWait reports when the next batch may leave, or the zero time when it may
+// leave now.
+func (a *association) pacingWait() time.Time {
+	charged := a.congestionCharged()
 	now := time.Now()
 	a.ccMu.Lock()
 	defer a.ccMu.Unlock()
-	if !a.cc.CanSend(charged) {
-		return false, time.Time{}
-	}
 	if a.cc.HasPacingBudget(now) {
-		return true, time.Time{}
+		return time.Time{}
 	}
-	return false, a.cc.TimeUntilSend(charged)
+	return a.cc.TimeUntilSend(charged)
 }
 
 // congestionSent records a packet that left.

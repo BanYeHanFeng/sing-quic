@@ -315,8 +315,7 @@ func (a *association) flush() error {
 			}
 			continue
 		}
-		allowed, waitUntil := a.congestionBudget()
-		if !allowed {
+		if !a.windowAllows() {
 			if len(a.pending) > 0 {
 				// What is sealed leaves before the window is asked again: it was
 				// taken while the window was open, and the acknowledgement that
@@ -338,13 +337,20 @@ func (a *association) flush() error {
 				}
 				continue
 			}
-			if waitUntil.IsZero() {
-				// The window is full: it opens when an acknowledgement arrives, and
-				// nothing before that can change it.
+			// The window is full: it opens when an acknowledgement arrives, and
+			// nothing before that can change it.
+			return nil
+		}
+		if len(a.pending) == 0 {
+			// The pacing rate is what spreads the batches over time, so it is
+			// asked once per batch: a batch that waited for its own last packet
+			// would hold one packet, and one packet per call is the thing the
+			// socket was asked to avoid.
+			waitUntil := a.pacingWait()
+			if !waitUntil.IsZero() {
+				a.paceTimer.Reset(time.Until(waitUntil))
 				return nil
 			}
-			a.paceTimer.Reset(time.Until(waitUntil))
-			return nil
 		}
 		frames := a.queue.take(a.maxPayload)
 		if len(frames) == 0 {
