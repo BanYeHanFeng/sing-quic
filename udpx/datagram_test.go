@@ -204,3 +204,32 @@ func TestDatagramFrame(t *testing.T) {
 		t.Fatal("a datagram is retransmitted")
 	}
 }
+
+// TestDatagramUnderFEC cuts a message by the length this end can actually send.
+// Redundancy takes room out of every packet, so the fragment length is not the
+// one a packet without it would have; a message that crosses that boundary must
+// still be split at the boundary rather than at the size a full packet would be.
+func TestDatagramUnderFEC(t *testing.T) {
+	options := Options{FEC: FECOptions{DataShards: 8, ParityShards: 2}}
+	client, server, _ := testSetup(t, options, Options{})
+	assoc := client.(*association)
+	fragmentLen := assoc.datagramDataLen()
+	if fragmentLen >= maxPacketSize-headerLen-tagLen-datagramFixedLen {
+		t.Fatalf("redundancy took no room out of a packet: %d", fragmentLen)
+	}
+	sizes := []int{1, fragmentLen - 1, fragmentLen, fragmentLen + 1, 2 * fragmentLen, 2005, 4000}
+	ctx := testContext(t, 20*time.Second)
+	for _, size := range sizes {
+		payload := make([]byte, size)
+		for index := range payload {
+			payload[index] = byte(index)
+		}
+		if err := client.SendDatagram(1, payload); err != nil {
+			t.Fatalf("size %d: %v", size, err)
+		}
+		datagram := receiveDatagram(t, server, ctx)
+		if !bytes.Equal(datagram.Data, payload) {
+			t.Fatalf("size %d came back as %d bytes", size, len(datagram.Data))
+		}
+	}
+}

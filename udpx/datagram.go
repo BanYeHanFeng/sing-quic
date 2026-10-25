@@ -29,10 +29,6 @@ const (
 	// reassembling.
 	maxDatagramSize = 0xffff
 
-	// datagramFragmentLen is how much of a datagram one fragment carries, so that
-	// the frame it is packed into fits in a packet alone.
-	datagramFragmentLen = maxPacketSize - headerLen - tagLen - datagramFixedLen
-
 	// datagramBacklog is how many reassembled datagrams may wait for the
 	// application. A full backlog drops what arrives instead of making the
 	// receive loop wait: a datagram that has to be dropped is dropped, and the
@@ -219,16 +215,14 @@ func (a *association) SendDatagram(channel uint32, data []byte) error {
 	a.datagramMessage++
 	a.datagramMu.Unlock()
 	for index := 0; index < fragmentCount; index++ {
-		fragment := data[index*datagramFragmentLen:]
-		if len(fragment) > datagramFragmentLen {
-			fragment = fragment[:datagramFragmentLen]
-		}
+		start := index * fragmentLen
+		end := min(start+fragmentLen, len(data))
 		a.queueFrame(appendDatagram(nil, datagramData{
 			channel: channel,
 			message: message,
 			index:   uint8(index),
 			total:   uint8(fragmentCount),
-			data:    fragment,
+			data:    data[start:end],
 		}))
 	}
 	return a.flush()
