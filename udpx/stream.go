@@ -71,10 +71,14 @@ type Stream struct {
 	endErr error
 	done   chan struct{}
 
-	// notify is a single-slot channel: whoever waits on the stream waits for it,
-	// and a second notification that arrives before the first was seen changes
-	// nothing.
-	notify chan struct{}
+	// A notification channel per direction, each a single slot: a second
+	// notification that arrives before the first was seen changes nothing. They
+	// are apart because a reader and a writer wait on the same stream at the same
+	// time, and one channel would let the reader take the notification the writer
+	// was waiting for — a lost wakeup that leaves the writer waiting for credit
+	// that already arrived.
+	sendNotify chan struct{}
+	recvNotify chan struct{}
 }
 
 // StreamResetError is how a stream ended when the peer reset it. A stream is not
@@ -110,7 +114,8 @@ func newStream(association *association, id uint32, sendLimit uint64) *Stream {
 		writeDeadline: pipe.MakeDeadline(),
 		readDeadline:  pipe.MakeDeadline(),
 		done:          make(chan struct{}),
-		notify:        make(chan struct{}, 1),
+		sendNotify:    make(chan struct{}, 1),
+		recvNotify:    make(chan struct{}, 1),
 	}
 }
 
@@ -201,7 +206,7 @@ func (s *Stream) waitForCredit() error {
 	select {
 	case <-s.done:
 		return s.endCause()
-	case <-s.notify:
+	case <-s.sendNotify:
 		return nil
 	case <-s.writeDeadline.Wait():
 		return os.ErrDeadlineExceeded
@@ -308,7 +313,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 		select {
 		case <-s.done:
 			return 0, s.endCause()
-		case <-s.notify:
+		case <-s.recvNotify:
 		case <-s.readDeadline.Wait():
 			return 0, os.ErrDeadlineExceeded
 		case <-s.association.ctx.Done():
@@ -332,7 +337,8 @@ func (s *Stream) end(cause error) {
 	s.sendMu.Lock()
 	s.sendBuffer = nil
 	s.sendMu.Unlock()
-	s.signal()
+	s.signalSend()
+	s.signalRecv()
 }
 
 // discardUnread drops what arrived and was not read. Closing a stream is what
@@ -414,7 +420,7 @@ func (s *Stream) push(offset uint64, data []byte, fin bool) (int, error) {
 		s.finOffset = end
 	}
 	s.recvMu.Unlock()
-	s.signal()
+	s.signalRecv()
 	if fin && s.finQueued() {
 		// Both halves are done: nothing is left that either end could wait for.
 		s.association.removeStream(s.id)
@@ -476,10 +482,18 @@ func (s *Stream) windowMoved() (uint64, bool) {
 	return s.recvLimit, true
 }
 
-// signal wakes whoever waits on the stream.
-func (s *Stream) signal() {
+// signalSend wakes the writer: credit moved forward, or the stream ended.
+func (s *Stream) signalSend() {
 	select {
-	case s.notify <- struct{}{}:
+	case s.sendNotify <- struct{}{}:
+	default:
+	}
+}
+
+// signalRecv wakes the reader: data arrived, or the stream ended.
+func (s *Stream) signalRecv() {
+	select {
+	case s.recvNotify <- struct{}{}:
 	default:
 	}
 }
@@ -664,7 +678,7 @@ func (a *association) handleMaxStreamData(streamID uint32, limit uint64) {
 	moved := stream.sendCredit.give(limit)
 	stream.sendMu.Unlock()
 	if moved {
-		stream.signal()
+		stream.signalSend()
 	}
 }
 
@@ -720,7 +734,7 @@ func (a *association) notifyStreams() {
 	}
 	a.streamsMu.Unlock()
 	for _, stream := range streams {
-		stream.signal()
+		stream.signalSend()
 	}
 }
 

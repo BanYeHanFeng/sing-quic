@@ -350,6 +350,66 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	}
 }
 
+// TestStreamBothDirectionsBlocked requires the credit a read grants to reach the
+// writer of the same stream, while the reader of that stream is waiting for data
+// that will not come. Both halves of one stream wait at the same time, so one
+// notification channel for both of them delivers the credit to the reader: the
+// writer then waits for credit that already arrived, and nothing else ever happens
+// to wake it.
+func TestStreamBothDirectionsBlocked(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 120*time.Second)
+	for round := range 8 {
+		stream, err := client.OpenStream(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A stream exists on the peer only once something was written on it.
+		_, err = stream.Write([]byte{0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		accepted, err := server.AcceptStream(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if read, readErr := readExactly(accepted, 1); readErr != nil || read[0] != 0 {
+			t.Fatalf("round %d: the first byte is %v, %v", round, read, readErr)
+		}
+		// The writer fills the whole window and has a few bytes left over, so it
+		// is waiting for credit when the peer reads.
+		payload := testPayload(initialStreamWindow + 4096)
+		written := make(chan error, 1)
+		go func() {
+			_, writeErr := stream.Write(payload)
+			written <- writeErr
+		}()
+		// The reader of the same stream waits for data that never comes.
+		readStarted := make(chan struct{})
+		go func() {
+			close(readStarted)
+			_, _ = stream.Read(make([]byte, 1024))
+		}()
+		<-readStarted
+		time.Sleep(20 * time.Millisecond)
+		// Reading grants the credit, and it is the last thing that happens on this
+		// stream: the peer reads exactly what it was sent and stops.
+		if read, readErr := readExactly(accepted, len(payload)); readErr != nil {
+			t.Fatalf("round %d: the peer read %d bytes: %v", round, len(read), readErr)
+		}
+		select {
+		case err = <-written:
+			if err != nil {
+				t.Fatalf("round %d: the write ended with %v", round, err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("round %d: the writer waited for credit that arrived", round)
+		}
+		_ = stream.Close()
+		_ = accepted.Close()
+	}
+}
+
 // TestAssociationEndsUnderLoad requires an association that ends while both ends
 // are still transferring to end for both of them: a reader and a writer that wait
 // for a window have to see it, or the close of one end leaves the other running.
