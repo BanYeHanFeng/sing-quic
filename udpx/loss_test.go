@@ -165,32 +165,71 @@ func TestLossByPacketThreshold(t *testing.T) {
 }
 
 // TestLossByTimeThreshold requires a packet that has been in flight for longer
-// than the round trip to be sent again even when nothing behind it was
-// acknowledged.
+// than the round trip to be sent again once something behind it was acknowledged,
+// and requires a packet the peer acknowledged nothing behind to be left alone: its
+// answer may be exactly what is on the way.
 func TestLossByTimeThreshold(t *testing.T) {
 	conn := newFakeConn()
 	a := newTestAssociation(t, conn)
-	frame := queueStream(t, a, 0, 1000)
-	queueStream(t, a, 1000, 1000)
+	frames := make([][]byte, 3)
+	for index := range frames {
+		frames[index] = queueStream(t, a, uint64(index)*1000, 1000)
+	}
+	now := time.Now()
+	// Packet 2 was acknowledged, and not enough packets came after 0 for the
+	// packet number threshold to be what finds it.
+	a.handleAck(testAck(2, pnRange{start: 2, end: 2}), now)
+	if written := conn.len(); written != 3 {
+		t.Fatalf("%d packets written before the delay passed", written)
+	}
+	// The packets that are still in flight have been for longer than a round trip.
+	a.handleAck(testAck(2, pnRange{start: 2, end: 2}), now.Add(time.Second))
+	payloads := conn.payloads(t, &a.sendRing)
+	if len(payloads) != 5 {
+		t.Fatalf("%d packets written", len(payloads))
+	}
+	if !bytes.Equal(payloads[3], frames[0]) {
+		t.Fatal("the first lost frame was not sent again first")
+	}
+	if !bytes.Equal(payloads[4], frames[1]) {
+		t.Fatal("the second lost frame was not sent again")
+	}
+	a.flightMu.Lock()
+	remaining := a.inFlight.len()
+	a.flightMu.Unlock()
+	if remaining != 2 {
+		t.Fatalf("%d packets in flight", remaining)
+	}
+}
+
+// TestNoLossWithoutEvidence requires a packet that nothing was acknowledged behind
+// to stay in flight however long it has been out: on a path with a long round trip
+// every packet is older than the threshold by the time its answer could arrive, so
+// judging it by time alone is a retransmission of everything, forever.
+func TestNoLossWithoutEvidence(t *testing.T) {
+	conn := newFakeConn()
+	a := newTestAssociation(t, conn)
+	frames := make([][]byte, 2)
+	for index := range frames {
+		frames[index] = queueStream(t, a, uint64(index)*1000, 1000)
+	}
 	now := time.Now()
 	a.handleAck(testAck(0, pnRange{start: 0, end: 0}), now)
-
-	// The packet that is still in flight has waited longer than a round trip.
-	a.handleAck(testAck(0, pnRange{start: 0, end: 0}), now.Add(time.Second))
+	for index := 1; index < 5; index++ {
+		a.handleAck(testAck(0, pnRange{start: 0, end: 0}), now.Add(time.Duration(index)*time.Second))
+	}
 	payloads := conn.payloads(t, &a.sendRing)
-	if len(payloads) != 3 {
+	if len(payloads) != 2 {
 		t.Fatalf("%d packets written", len(payloads))
+	}
+	if !bytes.Equal(payloads[1], frames[1]) {
+		t.Fatal("the packet that left was not the frame that was queued")
 	}
 	a.flightMu.Lock()
 	remaining := a.inFlight.len()
 	a.flightMu.Unlock()
 	if remaining != 1 {
 		t.Fatalf("%d packets in flight", remaining)
-	}
-	// The frame that was lost is the second one, so the last packet written is
-	// its data.
-	if len(payloads[2]) != len(frame) && bytes.Equal(payloads[2], frame) {
-		t.Fatal("the wrong frame was sent again")
 	}
 }
 
@@ -267,14 +306,17 @@ func TestLossDelay(t *testing.T) {
 	var estimator rttEstimator
 	// A path nobody measured is assumed to have a round trip rather than none,
 	// so that a first window is not declared lost before it could be answered.
-	if delay := lossDelay(estimator); delay != time.Duration(float64(initialRTT)*timeThreshold) {
+	if delay := lossDelay(estimator); delay != time.Duration(float64(initialRTT)*timeThreshold)+maxAckDelay {
 		t.Fatalf("delay without a sample: %v", delay)
 	}
 	if timeout := estimator.rto(); timeout != initialRTT {
 		t.Fatalf("timeout without a sample: %v", timeout)
 	}
 	estimator.sample(100 * time.Millisecond)
-	if delay := lossDelay(estimator); delay != 112500*time.Microsecond {
+	// The round trip an estimate is built from has the delay of an acknowledgement
+	// taken out of it, so the delay is added back here: a packet is not late while
+	// the peer is still allowed to be holding its answer.
+	if delay := lossDelay(estimator); delay != 112500*time.Microsecond+maxAckDelay {
 		t.Fatalf("delay for a 100ms round trip: %v", delay)
 	}
 	// The larger of the smoothed and the latest round trip is what counts, so a

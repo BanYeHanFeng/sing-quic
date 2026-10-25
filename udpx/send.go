@@ -244,11 +244,19 @@ func (s *sentPackets) compact() {
 }
 
 // isLost reports whether a packet is lost. A packet is lost when it is far enough
-// behind what the peer acknowledged that a reordering cannot explain it, or when
-// it has been in flight for longer than a round trip and its acknowledgement is
-// therefore not on the way.
+// behind what the peer acknowledged that a reordering cannot explain it, or when it
+// has been in flight for longer than a round trip and something behind it was
+// acknowledged, so its acknowledgement is therefore not on the way.
+//
+// A packet the peer has acknowledged nothing behind is not lost by the second rule
+// however long it has been in flight: its answer may be exactly what is on the way,
+// and a retransmission of it would be a duplicate. A packet like that is what the
+// probe asks about instead, which is the one place where being late is the signal.
 func isLost(packet *sentPacket, now time.Time, largestAcked uint32, lossDelay time.Duration) bool {
-	if largestAcked >= packet.packetNumber && largestAcked-packet.packetNumber >= packetThreshold {
+	if largestAcked < packet.packetNumber {
+		return false
+	}
+	if largestAcked-packet.packetNumber >= packetThreshold {
 		return true
 	}
 	return now.Sub(packet.sentAt) >= lossDelay

@@ -48,6 +48,12 @@ const (
 // lossDelay is how long a packet must have been in flight before it is lost. The
 // larger of the smoothed and the latest round trip is used, so a path that just
 // got slower is not declared to be losing packets.
+//
+// The delay an acknowledgement is allowed to sit on is added to it: the round trip
+// the estimate is built from has that delay taken out of it, so a packet whose
+// answer is on its way at the moment it is being judged would otherwise be exactly
+// at the threshold, and everything on a path of a few hundred milliseconds would
+// be sent twice.
 func lossDelay(rtt rttEstimator) time.Duration {
 	base := rtt.smoothed
 	if rtt.latest > base {
@@ -56,7 +62,7 @@ func lossDelay(rtt rttEstimator) time.Duration {
 	if base <= 0 {
 		base = initialRTT
 	}
-	delay := time.Duration(float64(base) * timeThreshold)
+	delay := time.Duration(float64(base)*timeThreshold) + maxAckDelay
 	if delay < timerGranularity {
 		delay = timerGranularity
 	}
