@@ -561,63 +561,63 @@ func TestStreamResetCode(t *testing.T) {
 // empty — and a stream this end has finished writing is still a stream this end is
 // reading.
 func TestStreamFinBeforeData(t *testing.T) {
-conn := newFakeConn()
-listenerConn := udpConn(t)
-password := NewPassword("password")
-listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
-defer listener.Close()
-client, err := Dial(testContext(t, 5*time.Second), conn, listenerConn.LocalAddr(), password, Options{})
-if err != nil {
-// The fake socket answers nothing, so the stream is driven directly below.
-_ = client
-}
-receiver := newTestAssociation(t, newFakeConn())
-ctx := testContext(t, 10*time.Second)
-// A read that never ends is the failure this is here to catch, so it is given a
-// deadline to end with.
-deadline := time.Now().Add(10 * time.Second)
-id := uint32(0)
-// The peer opens a stream and sends one frame of it.
-err = receiver.handleStreamFrame(streamData{streamID: id, data: []byte("hello")})
-if err != nil {
-t.Fatal(err)
-}
-accepted, err := receiver.AcceptStream(ctx)
-if err != nil {
-t.Fatal(err)
-}
-if read := readAll(t, accepted, 5); string(read) != "hello" {
-t.Fatalf("the stream carried %q", read)
-}
-// This end answers and closes its half, so both halves are now closed from its
-// own point of view — but the peer's FIN has not arrived yet.
-if _, err = accepted.Write([]byte("answer")); err != nil {
-t.Fatal(err)
-}
-if err = accepted.CloseWrite(); err != nil {
-t.Fatal(err)
-}
-// The peer's FIN arrives first, before the data in front of it.
-err = receiver.handleStreamFrame(streamData{streamID: id, offset: 10, fin: true})
-if err != nil {
-t.Fatal(err)
-}
-// The data it covers arrives after it, and has to be delivered all the same.
-err = receiver.handleStreamFrame(streamData{streamID: id, offset: 5, data: []byte("again")})
-if err != nil {
-t.Fatal(err)
-}
-accepted.SetReadDeadline(deadline)
-if read := readAll(t, accepted, 5); string(read) != "again" {
-t.Fatalf("the stream carried %q after its FIN arrived first", read)
-}
-// What arrives for a stream that ended on both sides and was read whole is
-// dropped: there is nothing left for it to change.
-err = receiver.handleStreamFrame(streamData{streamID: id, offset: 5, data: []byte("again")})
-if err != nil {
-t.Fatalf("a frame for an ended stream was rejected: %v", err)
-}
-if count := streamCount(t, receiver); count != 0 {
-t.Fatalf("%d streams are open after the stream ended", count)
-}
+	conn := newFakeConn()
+	listenerConn := udpConn(t)
+	password := NewPassword("password")
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
+	defer listener.Close()
+	client, err := Dial(testContext(t, 5*time.Second), conn, listenerConn.LocalAddr(), password, Options{})
+	if err != nil {
+		// The fake socket answers nothing, so the stream is driven directly below.
+		_ = client
+	}
+	receiver := newTestAssociation(t, newFakeConn())
+	ctx := testContext(t, 10*time.Second)
+	// A read that never ends is the failure this is here to catch, so it is given a
+	// deadline to end with.
+	deadline := time.Now().Add(10 * time.Second)
+	id := uint32(0)
+	// The peer opens a stream and sends one frame of it.
+	err = receiver.handleStreamFrame(streamData{streamID: id, data: []byte("hello")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := receiver.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read := readAll(t, accepted, 5); string(read) != "hello" {
+		t.Fatalf("the stream carried %q", read)
+	}
+	// This end answers and closes its half, so both halves are now closed from its
+	// own point of view — but the peer's FIN has not arrived yet.
+	if _, err = accepted.Write([]byte("answer")); err != nil {
+		t.Fatal(err)
+	}
+	if err = accepted.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	// The peer's FIN arrives first, before the data in front of it.
+	err = receiver.handleStreamFrame(streamData{streamID: id, offset: 10, fin: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The data it covers arrives after it, and has to be delivered all the same.
+	err = receiver.handleStreamFrame(streamData{streamID: id, offset: 5, data: []byte("again")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted.SetReadDeadline(deadline)
+	if read := readAll(t, accepted, 5); string(read) != "again" {
+		t.Fatalf("the stream carried %q after its FIN arrived first", read)
+	}
+	// What arrives for a stream that ended on both sides and was read whole is
+	// dropped: there is nothing left for it to change.
+	err = receiver.handleStreamFrame(streamData{streamID: id, offset: 5, data: []byte("again")})
+	if err != nil {
+		t.Fatalf("a frame for an ended stream was rejected: %v", err)
+	}
+	if count := streamCount(t, receiver); count != 0 {
+		t.Fatalf("%d streams are open after the stream ended", count)
+	}
 }
