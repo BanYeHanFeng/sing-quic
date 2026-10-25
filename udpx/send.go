@@ -56,6 +56,29 @@ func (q *frameQueue) len() int {
 	return len(q.frames)
 }
 
+// takeAckOnly removes the acknowledgements at the head of the queue, up to what
+// fits in one packet. They are the one kind of frame that is not congestion
+// controlled: everything the other end sends waits for them, so a closed window
+// that holds them back is a window that never opens again.
+func (q *frameQueue) takeAckOnly(budget int) []outFrame {
+	count := 0
+	size := 0
+	for count < len(q.frames) && !q.frames[count].ackEliciting {
+		length := len(q.frames[count].payload)
+		if size+length > budget {
+			break
+		}
+		size += length
+		count++
+	}
+	if count == 0 {
+		return nil
+	}
+	taken := q.frames[:count:count]
+	q.frames = q.frames[count:]
+	return taken
+}
+
 // take removes and returns the frames that fit in budget bytes. A frame that
 // does not fit waits for the next packet rather than being split: a frame is the
 // unit that is retransmitted, so a frame that changed shape between attempts
@@ -240,6 +263,18 @@ func (a *association) flush() error {
 	for a.queue.len() > 0 {
 		allowed, waitUntil := a.congestionBudget()
 		if !allowed {
+			acknowledgement := a.queue.takeAckOnly(maxPacketSize - headerLen - tagLen)
+			if len(acknowledgement) > 0 {
+				// The window is closed, but this packet is what the peer needs
+				// before it can send anything, and an acknowledgement is not
+				// congestion controlled. Two ends that each held one back would
+				// wait for the other to open a window neither of them can open.
+				err := a.sendFramesLocked(acknowledgement)
+				if err != nil {
+					return err
+				}
+				continue
+			}
 			if waitUntil.IsZero() {
 				// The window is full: it opens when an acknowledgement arrives, and
 				// nothing before that can change it.

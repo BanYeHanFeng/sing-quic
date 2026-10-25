@@ -304,11 +304,19 @@ func (a *association) send(frame []byte) error {
 // over. Frames queued before a flush share a packet, which is what keeps an
 // acknowledgement from costing a packet next to data that is going out anyway.
 func (a *association) queueFrame(frame []byte) {
-	a.sendMu.Lock()
-	a.queue.push(outFrame{
+	entry := outFrame{
 		payload:      frame,
 		ackEliciting: frameType(frame[0]) != frameTypeAck,
-	})
+	}
+	a.sendMu.Lock()
+	if entry.ackEliciting {
+		a.queue.push(entry)
+	} else {
+		// An acknowledgement goes ahead of what is already queued: it is what
+		// lets the peer send anything at all, and data that waits one packet
+		// longer costs less than an acknowledgement that waits behind a window.
+		a.queue.pushFront([]outFrame{entry})
+	}
 	a.sendMu.Unlock()
 }
 
