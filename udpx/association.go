@@ -168,6 +168,7 @@ type association struct {
 	// have open at once.
 	streamsMu    sync.Mutex
 	streams      map[uint32]*Stream
+	endedStreams endedStreams
 	acceptStream chan *Stream
 	nextStreamID uint32
 
@@ -346,6 +347,9 @@ func (a *association) handlePacket(packet []byte, source net.Addr) error {
 		case frameTypeMaxStreamData:
 			ackEliciting = true
 			a.handleMaxStreamData(binary.BigEndian.Uint32(f.body), binary.BigEndian.Uint64(f.body[4:]))
+		case frameTypeResetStream:
+			ackEliciting = true
+			a.handleResetStream(f.streamReset())
 		}
 	}
 	if ackEliciting {

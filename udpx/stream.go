@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -60,13 +61,38 @@ type Stream struct {
 	recvLimit    uint64
 	finOffset    uint64
 	finReceived  bool
-	closed       bool
 	readDeadline pipe.Deadline
+
+	// endMu guards how the stream ended when it did not end by both halves
+	// closing, which is either a reset from the peer or a close by the
+	// application. Once done is closed the answer never changes, so whoever waits
+	// on the stream waits on the channel and reads the reason afterwards.
+	endMu  sync.Mutex
+	endErr error
+	done   chan struct{}
 
 	// notify is a single-slot channel: whoever waits on the stream waits for it,
 	// and a second notification that arrives before the first was seen changes
 	// nothing.
 	notify chan struct{}
+}
+
+// StreamResetError is how a stream ended when the peer reset it. A stream is not
+// an association: the streams beside it and the association itself keep working,
+// and the error is only what the connection this stream carried sees.
+type StreamResetError struct {
+	// Code is what the reset carried. Zero is a stream the peer was done with,
+	// which is the normal end of one direction of a proxied connection rather
+	// than a failure, so it is reported as a closed connection.
+	Code uint8
+}
+
+func (e StreamResetError) Error() string {
+	return "udpx: stream reset with code " + strconv.Itoa(int(e.Code))
+}
+
+func (e StreamResetError) Is(target error) bool {
+	return e.Code == 0 && target == net.ErrClosed
 }
 
 // recvSegment is a piece of a stream that arrived but was not read yet.
@@ -83,6 +109,7 @@ func newStream(association *association, id uint32, sendLimit uint64) *Stream {
 		recvLimit:     initialStreamWindow,
 		writeDeadline: pipe.MakeDeadline(),
 		readDeadline:  pipe.MakeDeadline(),
+		done:          make(chan struct{}),
 		notify:        make(chan struct{}, 1),
 	}
 }
@@ -145,6 +172,8 @@ func (s *Stream) queueData(p []byte) (int, error) {
 	select {
 	case <-s.association.ctx.Done():
 		return 0, context.Cause(s.association.ctx)
+	case <-s.done:
+		return 0, s.endCause()
 	default:
 	}
 	s.sendMu.Lock()
@@ -170,6 +199,8 @@ func (s *Stream) queueData(p []byte) (int, error) {
 // the association ends.
 func (s *Stream) waitForCredit() error {
 	select {
+	case <-s.done:
+		return s.endCause()
 	case <-s.notify:
 		return nil
 	case <-s.writeDeadline.Wait():
@@ -183,6 +214,9 @@ func (s *Stream) waitForCredit() error {
 // once everything before it left.
 func (s *Stream) sendQueued() error {
 	for {
+		if s.isEnded() {
+			return s.endCause()
+		}
 		s.sendMu.Lock()
 		var frame []byte
 		if len(s.sendBuffer) > 0 {
@@ -216,25 +250,32 @@ func (s *Stream) CloseWrite() error {
 	return s.sendQueued()
 }
 
-// Close closes both halves of the stream. The stream stays known until the peer's
-// half of the connection is done with it, so that data still on its way is dropped
-// rather than mistaken for a stream that was never opened.
+// Close closes both halves of the stream: what was written is completed with a FIN,
+// and the peer is told that this end will read no more.
+//
+// The peer has to hear about it, unless its half was already complete: a stream that
+// ended on both sides needs no announcement, while one the application abandoned
+// would otherwise keep the peer writing into a stream nobody reads, and the entry
+// would stay here until the association closed.
 func (s *Stream) Close() error {
 	_ = s.CloseWrite()
 	s.recvMu.Lock()
-	s.closed = true
-	s.segments = nil
-	finished := s.finReceived
+	finished := s.finReceived && s.readOffset >= s.finOffset
 	s.recvMu.Unlock()
-	s.signal()
+	s.end(net.ErrClosed)
+	s.discardUnread()
 	if finished {
 		s.association.removeStream(s.id)
+	} else {
+		s.association.resetStream(s.id)
 	}
 	return nil
 }
 
 // Read reads data from the stream. It returns io.EOF once the peer closed its write
-// half and everything it sent was read.
+// half and everything it sent was read, and the reset error when the peer ended the
+// stream without completing it. Data that arrived before either is handed out
+// first: a stream that ended still has what already arrived.
 func (s *Stream) Read(p []byte) (int, error) {
 	for {
 		s.recvMu.Lock()
@@ -263,12 +304,10 @@ func (s *Stream) Read(p []byte) (int, error) {
 			s.recvMu.Unlock()
 			return 0, io.EOF
 		}
-		if s.closed {
-			s.recvMu.Unlock()
-			return 0, net.ErrClosed
-		}
 		s.recvMu.Unlock()
 		select {
+		case <-s.done:
+			return 0, s.endCause()
 		case <-s.notify:
 		case <-s.readDeadline.Wait():
 			return 0, os.ErrDeadlineExceeded
@@ -278,11 +317,75 @@ func (s *Stream) Read(p []byte) (int, error) {
 	}
 }
 
+// end records why the stream ended, which is what a reset from the peer and a
+// close by the application have in common: what was written and not yet framed is
+// dropped, and whoever waits on the stream wakes up with the reason.
+func (s *Stream) end(cause error) {
+	s.endMu.Lock()
+	if s.endErr != nil {
+		s.endMu.Unlock()
+		return
+	}
+	s.endErr = cause
+	close(s.done)
+	s.endMu.Unlock()
+	s.sendMu.Lock()
+	s.sendBuffer = nil
+	s.sendMu.Unlock()
+	s.signal()
+}
+
+// discardUnread drops what arrived and was not read. Closing a stream is what
+// calls it: the application is done, and the bytes the segments hold have to go
+// back to the association window instead of staying spent until the association
+// closes.
+func (s *Stream) discardUnread() {
+	s.recvMu.Lock()
+	dropped := 0
+	for _, segment := range s.segments {
+		dropped += len(segment.data)
+	}
+	s.segments = nil
+	s.recvMu.Unlock()
+	if dropped > 0 {
+		s.association.dataRead(dropped)
+	}
+}
+
+// resetFromPeer ends the stream because the peer said it is done with it. What
+// already arrived stays readable, because it is data the peer wrote and sent
+// before it gave up on the stream.
+func (s *Stream) resetFromPeer(code resetCode) {
+	s.end(code.err())
+}
+
+// isEnded reports whether the stream ended, without waiting for it.
+func (s *Stream) isEnded() bool {
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// endCause is why the stream ended, or nil while it did not.
+func (s *Stream) endCause() error {
+	s.endMu.Lock()
+	defer s.endMu.Unlock()
+	return s.endErr
+}
+
 // push records data received from the peer, in whatever order it arrived, and
 // returns how far the highest offset moved: the association window is counted in
 // the offsets the peer reached rather than in bytes that landed, so a hole costs
 // its bytes until it is filled, which is the conservative side to be on.
 func (s *Stream) push(offset uint64, data []byte, fin bool) (int, error) {
+	// A stream the application is done with has no reader left, so what is still
+	// on its way for it is dropped rather than stored.
+	if s.isEnded() {
+		return 0, nil
+	}
 	s.recvMu.Lock()
 	end := offset + uint64(len(data))
 	if end > s.recvLimit {
@@ -294,11 +397,7 @@ func (s *Stream) push(offset uint64, data []byte, fin bool) (int, error) {
 		received = int(end - s.recvHighest)
 		s.recvHighest = end
 	}
-	switch {
-	case s.closed:
-		// The application is done with this stream; what is still on its way is
-		// dropped, and the FIN is what lets the stream be forgotten.
-	case len(data) > 0 && end > s.readOffset:
+	if len(data) > 0 && end > s.readOffset {
 		if offset < s.readOffset {
 			// Bytes the application already read are not stored again: a
 			// retransmission that arrives after the fact is not an error.
@@ -314,13 +413,21 @@ func (s *Stream) push(offset uint64, data []byte, fin bool) (int, error) {
 		s.finReceived = true
 		s.finOffset = end
 	}
-	sendFinished := s.finSent
 	s.recvMu.Unlock()
 	s.signal()
-	if fin && sendFinished {
+	if fin && s.finQueued() {
+		// Both halves are done: nothing is left that either end could wait for.
 		s.association.removeStream(s.id)
 	}
 	return received, nil
+}
+
+// finQueued reports whether the FIN was already framed, which is what says the
+// write half of the stream is complete.
+func (s *Stream) finQueued() bool {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	return s.finSent
 }
 
 // insertSegment places a segment in the reassembly buffer, which is kept sorted
@@ -411,10 +518,75 @@ func (a *association) stream(id uint32) (*Stream, bool) {
 	return stream, loaded
 }
 
+// endedStreams remembers the streams that ended recently.
+//
+// A stream ends here before the peer hears about it, so what it already sent for
+// it keeps arriving for a while. Without a memory of the end, a frame for an
+// ended stream looks exactly like the first frame of a stream being opened, and
+// the application would be handed bytes it already read. The memory is a fixed
+// ring, because a peer that opens streams forever must not grow the association;
+// what arrives after the whole ring turned over is dropped too, and by then the
+// path kept it longer than any reordering.
+const endedStreamsCount = 64
+
+type endedStreams struct {
+	ids    [endedStreamsCount]uint32
+	filled int
+	next   int
+}
+
+func (e *endedStreams) add(id uint32) {
+	e.ids[e.next] = id
+	e.next = (e.next + 1) % endedStreamsCount
+	if e.filled < endedStreamsCount {
+		e.filled++
+	}
+}
+
+func (e *endedStreams) has(id uint32) bool {
+	for _, ended := range e.ids[:e.filled] {
+		if ended == id {
+			return true
+		}
+	}
+	return false
+}
+
+// removeStream forgets a stream that ended, which frees both the entry and the
+// slot it held against maxStreams.
 func (a *association) removeStream(id uint32) {
 	a.streamsMu.Lock()
 	defer a.streamsMu.Unlock()
 	delete(a.streams, id)
+	a.endedStreams.add(id)
+}
+
+// streamEnded reports whether a stream ended recently, which is what a frame that
+// arrives for a stream this end no longer knows is checked against.
+func (a *association) streamEnded(id uint32) bool {
+	a.streamsMu.Lock()
+	defer a.streamsMu.Unlock()
+	return a.endedStreams.has(id)
+}
+
+// resetStream ends a stream the application abandoned: the peer is told to stop
+// writing into it, and the stream is forgotten here at once rather than when the
+// peer's half closes, which may never happen.
+func (a *association) resetStream(id uint32) {
+	a.removeStream(id)
+	_ = a.send(appendResetStream(nil, id, resetCodeNormal))
+}
+
+// handleResetStream ends a stream the peer is done with. The stream is one stream,
+// not the association: what is on its way out stops, and the application sees the
+// code instead of the rest of the data.
+func (a *association) handleResetStream(reset streamReset) {
+	stream, loaded := a.stream(reset.streamID)
+	if !loaded {
+		return
+	}
+	stream.resetFromPeer(reset.code)
+	a.removeStream(reset.streamID)
 }
 
 // initiatorBit is the bit of a stream id that says this end opened the stream.
@@ -430,6 +602,12 @@ func (a *association) initiatorBit() uint32 {
 func (a *association) handleStreamFrame(data streamData) error {
 	stream, loaded := a.stream(data.streamID)
 	if !loaded {
+		// A stream that just ended is not a stream the peer is opening now: what
+		// is still in flight for it arrives after the end and is dropped, the
+		// same way a stream that ended on both sides drops it.
+		if a.streamEnded(data.streamID) {
+			return nil
+		}
 		if data.streamID&streamInitiatorBit == a.initiatorBit() {
 			return E.New("stream frame for stream ", data.streamID, " that was never opened")
 		}

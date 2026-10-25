@@ -3,7 +3,9 @@ package udpx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"net"
 	"testing"
 	"time"
 )
@@ -366,5 +368,189 @@ func TestStreamLargeTransfer(t *testing.T) {
 	}
 	if !bytes.Equal(read, payload) {
 		t.Fatal("the payload changed on the way")
+	}
+}
+
+// streamCount is how many streams the association still knows about, which is what
+// says whether a stream that ended was released or left behind.
+func streamCount(t *testing.T, conn Association) int {
+	t.Helper()
+	a := conn.(*association)
+	a.streamsMu.Lock()
+	defer a.streamsMu.Unlock()
+	return len(a.streams)
+}
+
+func waitStreamCount(t *testing.T, conn Association, expected int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		count := streamCount(t, conn)
+		if count == expected {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d streams are still open, expected %d", count, expected)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestStreamResetByClose requires closing a stream the peer still writes to to tell
+// the peer, to release the stream here at once, and to leave the association
+// working.
+func TestStreamResetByClose(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 10*time.Second)
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = stream.Write([]byte("request"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read := readAll(t, accepted, 7); string(read) != "request" {
+		t.Fatalf("the request arrived as %q", read)
+	}
+	// The peer never closed its half, so the stream is abandoned rather than
+	// finished, and the peer is what hears about it.
+	err = stream.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := streamCount(t, client); count != 0 {
+		t.Fatalf("%d streams are still open after a close", count)
+	}
+	buffer := make([]byte, 1)
+	_, err = accepted.Read(buffer)
+	if !errors.Is(err, net.ErrClosed) && err != io.EOF {
+		t.Fatalf("read on a closed stream returned %v", err)
+	}
+	waitStreamCount(t, server, 0)
+	if _, err = accepted.Write([]byte("reply")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("write on a stream the peer closed returned %v", err)
+	}
+
+	// The association is one stream wider than before, not closed.
+	other, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		_, _ = other.Write([]byte("next"))
+		_ = other.CloseWrite()
+	}()
+	next, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read := readAll(t, next, 4); string(read) != "next" {
+		t.Fatalf("the next stream carried %q", read)
+	}
+}
+
+// TestStreamResetEndsWrite requires a stream the peer ended to stop a write that
+// waits for credit, instead of leaving it waiting for a window that will never
+// move.
+func TestStreamResetEndsWrite(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 10*time.Second)
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Twice the stream window, so the write has to wait for the peer to read.
+	blocked := make(chan error, 1)
+	go func() {
+		_, writeErr := stream.Write(testPayload(2 * initialStreamWindow))
+		blocked <- writeErr
+	}()
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err = <-blocked:
+		t.Fatalf("the write returned before the peer ended the stream: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	err = accepted.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err = <-blocked:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("the write returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the write waited for a stream the peer ended")
+	}
+}
+
+// TestStreamEndedIgnoresLateFrames requires data that arrives for a stream this end
+// already ended to be dropped, not taken for a stream the peer opens now.
+func TestStreamEndedIgnoresLateFrames(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 10*time.Second)
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = stream.Write([]byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read := readAll(t, accepted, 5); string(read) != "hello" {
+		t.Fatalf("the stream carried %q", read)
+	}
+	id := accepted.ID()
+	if err = accepted.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitStreamCount(t, server, 0)
+	// What the client sent before it heard about the end arrives now.
+	err = server.(*association).handleStreamFrame(streamData{streamID: id, data: []byte("late")})
+	if err != nil {
+		t.Fatalf("a frame for an ended stream was rejected: %v", err)
+	}
+	if count := streamCount(t, server); count != 0 {
+		t.Fatalf("a frame for an ended stream opened %d streams", count)
+	}
+	select {
+	case late := <-server.(*association).acceptStream:
+		t.Fatalf("a frame for an ended stream was accepted as stream %d", late.ID())
+	default:
+	}
+	// The client hears about the end too, and its write half goes with it.
+	waitStreamCount(t, client, 0)
+	if _, err = stream.Write([]byte("still open")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("write on a stream the peer ended returned %v", err)
+	}
+}
+
+// TestStreamResetCode requires the code of a reset to reach the application as an
+// error it can tell apart from a stream that ended on purpose.
+func TestStreamResetCode(t *testing.T) {
+	normal := resetCodeNormal.err()
+	if !errors.Is(normal, net.ErrClosed) {
+		t.Fatalf("a normal reset is reported as %v", normal)
+	}
+	failed := resetCode(3).err()
+	if errors.Is(failed, net.ErrClosed) {
+		t.Fatal("a failed stream is reported as a closed connection")
+	}
+	var resetErr StreamResetError
+	if !errors.As(failed, &resetErr) || resetErr.Code != 3 {
+		t.Fatalf("a failed stream is reported as %v", failed)
 	}
 }

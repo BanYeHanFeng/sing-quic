@@ -55,6 +55,43 @@ func TestStreamFrameRejects(t *testing.T) {
 	}
 }
 
+// TestResetStreamFrame requires a reset to name the stream it ends and the code it
+// carries, and to be rejected when it is cut short or flagged.
+func TestResetStreamFrame(t *testing.T) {
+	encoded := appendResetStream(nil, 1<<30, resetCodeNormal)
+	if len(encoded) != resetStreamFixedLen {
+		t.Fatalf("reset frame is %d bytes", len(encoded))
+	}
+	f, rest, err := nextFrame(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rest) != 0 {
+		t.Fatalf("%d bytes after the frame", len(rest))
+	}
+	if f.frameType != frameTypeResetStream {
+		t.Fatalf("frame of type %d", f.frameType)
+	}
+	if reset := f.streamReset(); reset.streamID != 1<<30 || reset.code != resetCodeNormal {
+		t.Fatalf("reset %+v", f.streamReset())
+	}
+	for _, truncated := range []int{0, 1, resetStreamFixedLen - 1} {
+		if _, _, err = nextFrame(encoded[:truncated]); err == nil {
+			t.Fatalf("reset frame truncated to %d bytes parsed", truncated)
+		}
+	}
+	flagged := append([]byte(nil), encoded...)
+	flagged[0] |= frameFlagFIN
+	if _, _, err = nextFrame(flagged); err == nil {
+		t.Fatal("a reset with the end-of-stream flag parsed")
+	}
+	// A reset is what a stream needs to hear about even when its packet was lost,
+	// while an acknowledgement and a ping are never sent again.
+	if !frameTypeResetStream.retransmittable() {
+		t.Fatal("a reset is not retransmitted")
+	}
+}
+
 // TestFramesMix requires several frames of different types to be split back out
 // of one payload in the order they were written.
 func TestFramesMix(t *testing.T) {
@@ -63,9 +100,10 @@ func TestFramesMix(t *testing.T) {
 	var ranges pnRanges
 	fillRanges(&ranges, 0, 2)
 	payload = ranges.ack().appendTo(payload)
+	payload = appendResetStream(payload, 5, resetCodeNormal)
 	payload = appendClose(payload, closeCodeIdleTimeout)
 
-	expected := []frameType{frameTypePing, frameTypeStream, frameTypeAck, frameTypeClose}
+	expected := []frameType{frameTypePing, frameTypeStream, frameTypeAck, frameTypeResetStream, frameTypeClose}
 	for index := range expected {
 		f, rest, err := nextFrame(payload)
 		if err != nil {
@@ -76,6 +114,9 @@ func TestFramesMix(t *testing.T) {
 		}
 		if f.frameType == frameTypeClose && f.closeCode() != closeCodeIdleTimeout {
 			t.Fatalf("close code %d", f.closeCode())
+		}
+		if f.frameType == frameTypeResetStream && f.streamReset().streamID != 5 {
+			t.Fatalf("reset of stream %d", f.streamReset().streamID)
 		}
 		payload = rest
 	}

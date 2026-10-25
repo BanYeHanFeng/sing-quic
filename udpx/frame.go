@@ -43,6 +43,12 @@ const (
 
 	// frameTypeMaxStreamData moves one stream's window forward.
 	frameTypeMaxStreamData
+
+	// frameTypeResetStream ends one stream in both directions before its data
+	// is complete. It is what a proxied connection that failed in the middle
+	// needs: the stream is done, and the association and the streams beside it
+	// are not.
+	frameTypeResetStream
 )
 
 // Layout of the type byte.
@@ -59,6 +65,13 @@ const (
 	streamBodyLen  = 4 + 8 + 2
 )
 
+// Layout of a reset-stream frame: the type byte, the stream it ends, and the
+// code. There is no offset: a stream that is reset has no end.
+const (
+	resetStreamFixedLen = 1 + 4 + 1
+	resetStreamBodyLen  = 4 + 1
+)
+
 // frame is one parsed frame of a payload. The body points into the payload, so
 // a frame must be used before the packet it came from is reused.
 type frame struct {
@@ -71,10 +84,11 @@ type frame struct {
 // again. Frames that carry data, and frames that move a window forward, do: a
 // window update that was lost would leave the peer waiting for credit that was
 // already granted, while repeating one that arrived is harmless because a window
-// only ever moves forward.
+// only ever moves forward. A stream reset does too, and for the same reason in
+// reverse: a peer that never hears it keeps writing into a stream nobody reads.
 func (t frameType) retransmittable() bool {
 	switch t {
-	case frameTypeStream, frameTypeMaxData, frameTypeMaxStreamData:
+	case frameTypeStream, frameTypeMaxData, frameTypeMaxStreamData, frameTypeResetStream:
 		return true
 	default:
 		return false
@@ -130,6 +144,14 @@ func nextFrame(payload []byte) (frame, []byte, error) {
 			return frame{}, nil, errShortFrame
 		}
 		return frame{frameType: frameTypeMaxStreamData, body: payload[1:13]}, payload[13:], nil
+	case frameTypeResetStream:
+		if flags != 0 || len(payload) < resetStreamFixedLen {
+			return frame{}, nil, errShortFrame
+		}
+		return frame{
+			frameType: frameTypeResetStream,
+			body:      payload[1:resetStreamFixedLen],
+		}, payload[resetStreamFixedLen:], nil
 	default:
 		return frame{}, nil, E.New("unknown frame type ", int(payload[0]))
 	}
@@ -164,6 +186,45 @@ func appendStream(dst []byte, streamID uint32, offset uint64, fin bool, data []b
 	dst = binary.BigEndian.AppendUint64(dst, offset)
 	dst = binary.BigEndian.AppendUint16(dst, uint16(len(data)))
 	return append(dst, data...)
+}
+
+// streamReset is what a reset-stream frame carries.
+type streamReset struct {
+	streamID uint32
+	code     resetCode
+}
+
+// streamReset returns what a reset-stream frame carries.
+func (f frame) streamReset() streamReset {
+	return streamReset{
+		streamID: binary.BigEndian.Uint32(f.body),
+		code:     resetCode(f.body[resetStreamBodyLen-1]),
+	}
+}
+
+// appendResetStream appends a reset-stream frame to dst.
+func appendResetStream(dst []byte, streamID uint32, code resetCode) []byte {
+	dst = append(dst, byte(frameTypeResetStream))
+	dst = binary.BigEndian.AppendUint32(dst, streamID)
+	return append(dst, byte(code))
+}
+
+// resetCode is why a stream ended before both halves of it closed. It is not the
+// code of a close frame: a stream ending is one stream, not the association.
+type resetCode uint8
+
+const (
+	// resetCodeNormal is a stream the resetting end was done with: it stopped
+	// reading, and it is not a failure of the connection the stream carries.
+	resetCodeNormal resetCode = iota
+)
+
+// err maps the code a stream was reset with to what the application sees. The
+// code stays in the error, so that a caller can tell an abort from a stream that
+// ended on purpose, which is what the difference between an ERROR line and a
+// closed connection comes down to.
+func (c resetCode) err() error {
+	return StreamResetError{Code: uint8(c)}
 }
 
 // closeCode returns the code of a close frame.
