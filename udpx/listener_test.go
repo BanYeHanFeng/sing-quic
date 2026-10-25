@@ -282,3 +282,44 @@ func TestPacketTamperedOnTheWire(t *testing.T) {
 	}
 	_ = client.CloseWithError(nil)
 }
+
+// TestAcknowledgementOverSocket requires an ack-eliciting packet to be
+// acknowledged within the delay budget, and an acknowledgement not to be
+// acknowledged in turn.
+func TestAcknowledgementOverSocket(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	clientAssociation, isAssociation := client.(*association)
+	if !isAssociation {
+		t.Fatal("client is not an association")
+	}
+	serverAssociation := server.(*association)
+
+	start := time.Now()
+	err := clientAssociation.sendPayload(appendPing(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, sampled := clientAssociation.roundTrip(); sampled {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the single packet was never acknowledged")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	elapsed := time.Since(start)
+	if elapsed < maxAckDelay/2 {
+		t.Fatalf("a single packet was acknowledged after %v, before the delay expired", elapsed)
+	}
+	if elapsed > maxAckDelay+500*time.Millisecond {
+		t.Fatalf("a single packet was acknowledged after %v", elapsed)
+	}
+
+	time.Sleep(3 * maxAckDelay)
+	roundTrip, sampled := serverAssociation.roundTrip()
+	if sampled {
+		t.Fatalf("the server measured %v from an acknowledgement of an acknowledgement", roundTrip)
+	}
+}

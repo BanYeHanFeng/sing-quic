@@ -120,6 +120,20 @@ type association struct {
 	// both sides.
 	idleTimer *time.Timer
 
+	// ackMu guards the receive side's acknowledgement state, which is driven by
+	// the goroutine that reads the socket and by the timer that sends a delayed
+	// acknowledgement.
+	ackMu    sync.Mutex
+	ack      ackScheduler
+	ackTimer *time.Timer
+
+	// statsMu guards the send history and the round trip estimate: the send path
+	// records when a packet left, and the receive path turns an acknowledgement
+	// into a sample.
+	statsMu sync.Mutex
+	sent    sentHistory
+	rtt     rttEstimator
+
 	// ownsConn says whether closing the association closes the socket. A client
 	// owns the socket it dialled on; a server association writes on the socket
 	// its listener accepts on.
@@ -128,6 +142,11 @@ type association struct {
 	onClose   func()
 	closeOnce sync.Once
 }
+
+// sentHistorySize is how many send times are remembered. A packet older than
+// that is either lost already or acknowledged long ago, and neither needs a
+// sample.
+const sentHistorySize = 256
 
 func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, options Options, ownsConn bool) *association {
 	ctx, cancel := context.WithCancelCause(context.Background())
@@ -141,12 +160,14 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		sendRing:    result.send,
 		recvRing:    result.recv,
 		sendBuffer:  make([]byte, 0, maxPacketSize),
+		sent:        newSentHistory(sentHistorySize),
 		ownsConn:    ownsConn,
 	}
 	a.peerAddr.Store(&peer)
 	a.idleTimer = time.AfterFunc(a.options.IdleTimeout, func() {
 		a.shutdown(ErrIdleTimeout, true)
 	})
+	a.ackTimer = time.AfterFunc(maxAckDelay, a.flushAck)
 	if a.options.KeepAlivePeriod > 0 {
 		go a.keepAliveLoop()
 	}
@@ -181,6 +202,7 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 			_ = a.sendPayload(appendClose(nil, closeCodeOf(cause)))
 		}
 		a.idleTimer.Stop()
+		a.ackTimer.Stop()
 		a.cancel(cause)
 		if a.ownsConn {
 			_ = a.conn.Close()
@@ -215,6 +237,9 @@ func (a *association) sendPayload(payload []byte) error {
 		return err
 	}
 	a.sendBuffer = packet
+	a.statsMu.Lock()
+	a.sent.record(h.PacketNumber, time.Now())
+	a.statsMu.Unlock()
 	_, err = a.conn.WriteTo(packet, a.RemoteAddr())
 	if err != nil {
 		return E.Cause(err, "write packet")
@@ -246,6 +271,7 @@ func (a *association) handlePacket(packet []byte, source net.Addr) error {
 	// peer that rebinds its NAT is the same peer.
 	a.peerAddr.Store(&source)
 	a.resetIdle()
+	ackEliciting := false
 	for len(payload) > 0 {
 		var f frame
 		f, payload, err = nextFrame(payload)
@@ -255,12 +281,76 @@ func (a *association) handlePacket(packet []byte, source net.Addr) error {
 		}
 		switch f.frameType {
 		case frameTypePing:
-			// It carries nothing, and the idle timer was already reset.
+			ackEliciting = true
 		case frameTypeClose:
-			a.shutdown(f.closeCode.err(), false)
+			a.shutdown(f.closeCode().err(), false)
+			return nil
+		case frameTypeAck:
+			a.handleAck(f.body, time.Now())
 		}
 	}
+	if ackEliciting {
+		a.scheduleAck(packetHeader.PacketNumber, time.Now())
+	}
 	return nil
+}
+
+// scheduleAck records an ack-eliciting packet and acknowledges it now or after
+// the delay, whichever the policy asks for.
+func (a *association) scheduleAck(packetNumber uint32, now time.Time) {
+	a.ackMu.Lock()
+	immediate := a.ack.received(packetNumber, now)
+	var acknowledgement []byte
+	if immediate {
+		acknowledgement = a.ack.pack(now)
+	}
+	a.ackMu.Unlock()
+	if immediate {
+		if len(acknowledgement) > 0 {
+			_ = a.sendPayload(acknowledgement)
+		}
+		return
+	}
+	a.ackTimer.Reset(maxAckDelay)
+}
+
+// flushAck sends the acknowledgement the delay was waiting for.
+func (a *association) flushAck() {
+	a.ackMu.Lock()
+	acknowledgement := a.ack.pack(time.Now())
+	a.ackMu.Unlock()
+	if len(acknowledgement) == 0 {
+		return
+	}
+	_ = a.sendPayload(acknowledgement)
+}
+
+// handleAck turns an acknowledgement into a round trip sample. The sample comes
+// from the largest acknowledged packet, because that is the one the peer's delay
+// refers to; the delay is subtracted because it is time the peer held the
+// acknowledgement rather than time the packet spent in flight.
+func (a *association) handleAck(body []byte, now time.Time) {
+	acknowledgement, err := parseAck(body)
+	if err != nil {
+		return
+	}
+	a.statsMu.Lock()
+	defer a.statsMu.Unlock()
+	sentAt, loaded := a.sent.sentAt(acknowledgement.largest)
+	if !loaded {
+		return
+	}
+	a.rtt.sample(now.Sub(sentAt) - acknowledgement.delay)
+}
+
+// roundTrip returns the current round trip estimate.
+func (a *association) roundTrip() (time.Duration, bool) {
+	a.statsMu.Lock()
+	defer a.statsMu.Unlock()
+	if !a.rtt.sampled {
+		return 0, false
+	}
+	return a.rtt.smoothed, true
 }
 
 // handleReset accepts a reset packet, the one packet type that is not
