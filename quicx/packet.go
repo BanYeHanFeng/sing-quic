@@ -3,262 +3,74 @@ package quicx
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"io"
-	"math"
 	"net"
 	"net/netip"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/quic-go"
+	"github.com/sagernet/sing-quic/udpx"
 	"github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/cache"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/pipe"
 )
 
-var udpMessagePool = sync.Pool{
-	New: func() interface{} {
-		return new(udpMessage)
-	},
+// Forwarded UDP packets
+//
+// A packet connection is a channel of its session: the transport carries the
+// message of one forwarded packet as one datagram, tagged with the number of the
+// channel it belongs to, and it hands a message over only once it is whole. What
+// is left here is the message format — which command it is and where it goes —
+// and the net.PacketConn the router sees.
+//
+// Each message carries its own destination instead of announcing it once per
+// channel. The address costs a handful of bytes, and it buys the property that
+// matters more: a message is routed by what is in it, so the first message of a
+// channel is not special, a reordered one still routes, and nothing has to be
+// remembered to read the next one.
+
+// udpMessage is one forwarded UDP packet.
+type udpMessage struct {
+	destination M.Socksaddr
+	data        []byte
 }
 
-func releaseDatagramOwner(owner quic.DatagramBufferOwner) {
-	if owner != nil {
-		owner.ReleaseDatagramBuffer()
-	}
-}
+// udpMessageHeaderLen is the fixed part of a packet message:
+// [version(1)][command(1)][address(variable)][data].
+const udpMessageHeaderLen = 2
 
-func allocMessage() *udpMessage {
-	message := udpMessagePool.Get().(*udpMessage)
-	message.referenced = true
+func (m *udpMessage) pack() []byte {
+	message := make([]byte, udpMessageHeaderLen+AddressSerializer.AddrPortLen(m.destination)+len(m.data))
+	message[0] = Version
+	message[1] = CommandPacket
+	addressLen := writeAddrPort(message[udpMessageHeaderLen:], m.destination)
+	copy(message[udpMessageHeaderLen+addressLen:], m.data)
 	return message
 }
 
-func releaseMessages(messages []*udpMessage) {
-	for _, message := range messages {
-		if message != nil {
-			message.releaseMessage()
-		}
+// decodeUDPMessage parses one packet message. The payload points into data, which
+// the caller owns.
+func decodeUDPMessage(data []byte) (udpMessage, error) {
+	if len(data) < udpMessageHeaderLen {
+		return udpMessage{}, io.ErrUnexpectedEOF
 	}
-}
-
-type udpMessage struct {
-	sessionID     uint16
-	packetID      uint16
-	fragmentTotal uint8
-	fragmentID    uint8
-	destination   M.Socksaddr
-	// data is the payload of the message.
-	//
-	// On the receive path it points into a payload buffer of quic-go, which is
-	// released through owner once the message is done with. On the send path it
-	// points into the buffer the caller handed over, which is released through
-	// buffer. Neither is copied: a forwarded datagram used to be copied into a
-	// buf.Buffer of its own only to be copied again by quic-go.
-	data       []byte
-	buffer     *buf.Buffer
-	owner      quic.DatagramBufferOwner
-	referenced bool
-}
-
-func (m *udpMessage) release() {
-	if !m.referenced {
-		return
+	if data[0] != Version {
+		return udpMessage{}, E.New("unknown version ", data[0])
 	}
-	*m = udpMessage{}
-	udpMessagePool.Put(m)
-}
-
-func (m *udpMessage) releaseMessage() {
-	if m.buffer != nil {
-		m.buffer.Release()
-		m.buffer = nil
+	if data[1] != CommandPacket {
+		return udpMessage{}, E.New("unknown command ", data[1])
 	}
-	if m.owner != nil {
-		m.owner.ReleaseDatagramBuffer()
-		m.owner = nil
+	destination, addressLen, err := decodeAddrPort(data[udpMessageHeaderLen:])
+	if err != nil {
+		return udpMessage{}, E.Cause(err, "decode destination")
 	}
-	m.release()
-}
-
-// wireBuffer is a pooled packet buffer.
-//
-// It holds the serialized UDP message, and it is handed over to quic-go as the
-// owner of the DATAGRAM payload: quic-go returns it to the pool once the
-// datagram was sent out or dropped, which is what keeps the send path free of
-// per-packet allocations. Reassembly uses the same type for the buffer holding
-// a reassembled payload.
-type wireBuffer struct {
-	data []byte
-}
-
-var wireBufferPool = sync.Pool{
-	New: func() interface{} {
-		return new(wireBuffer)
-	},
-}
-
-func getWireBuffer(size int) *wireBuffer {
-	buffer := wireBufferPool.Get().(*wireBuffer)
-	buffer.data = buf.Get(size)
-	if buffer.data == nil {
-		buffer.data = make([]byte, size)
-	}
-	return buffer
-}
-
-// ReleaseDatagramBuffer implements quic.DatagramBufferOwner.
-func (b *wireBuffer) ReleaseDatagramBuffer() {
-	if b.data != nil {
-		_ = buf.Put(b.data)
-		b.data = nil
-	}
-	wireBufferPool.Put(b)
-}
-
-func (m *udpMessage) pack() *wireBuffer {
-	buffer := getWireBuffer(m.headerSize() + len(m.data))
-	data := buffer.data
-	// The fixed part of the header is written in one go: binary.Write goes
-	// through reflection and a separate io.Writer call per field, and this
-	// function runs once per forwarded datagram.
-	data[0] = Version
-	data[1] = CommandPacket
-	binary.BigEndian.PutUint16(data[2:4], m.sessionID)
-	binary.BigEndian.PutUint16(data[4:6], m.packetID)
-	data[6] = m.fragmentTotal
-	data[7] = m.fragmentID
-	binary.BigEndian.PutUint16(data[8:10], uint16(len(m.data)))
-	addressLen := writeAddrPort(data[udpMessageHeaderLen:], m.destination)
-	copy(data[udpMessageHeaderLen+addressLen:], m.data)
-	return buffer
-}
-
-// udpMessageBodyHeaderLen is the size of the fixed part of a packet message
-// after the leading version and command bytes, which the caller already
-// consumed.
-const udpMessageBodyHeaderLen = udpMessageHeaderLen - 2
-
-// udpMessageHeaderLen is the size of the fixed part of a packet message:
-// [version(1)][command(1)][session id(2)][packet id(2)][fragment total(1)]
-// [fragment id(1)][data length(2)].
-const udpMessageHeaderLen = 10
-
-func (m *udpMessage) headerSize() int {
-	return udpMessageHeaderLen + AddressSerializer.AddrPortLen(m.destination)
-}
-
-const (
-	// initialUDPMTU is the packet size used before the peer reported its own
-	// DATAGRAM limit. It matches the QUIC minimum initial packet size.
-	initialUDPMTU = 1200 - udpMTUSafetyMargin
-	// udpMTUSafetyMargin is subtracted from the size reported by quic-go, as
-	// the reported maximum payload is only a conservative estimate.
-	udpMTUSafetyMargin = 3
-	// maxFragmentCount is the maximum number of fragments a UDP message may be
-	// split into: fragmentTotal is a single byte on the wire.
-	maxFragmentCount = 255
-	// maxDefragmentSize is the maximum size of a reassembled UDP message. The
-	// length field of a UDP message is a uint16, so larger messages cannot be
-	// represented on the wire.
-	maxDefragmentSize = 0xffff
-	// maxDefragmentEntries bounds the number of incomplete reassemblies tracked
-	// per packet connection. Without a bound an authenticated peer could
-	// allocate unbounded state by sending fragments under many packet IDs.
-	maxDefragmentEntries = 256
-)
-
-// fragUDPMessage splits message so that every fragment fits into maxPacketSize
-// bytes. maxPacketSize is derived from the peer-reported DATAGRAM limit, which
-// is attacker-controlled: a value which cannot even carry the fragment header
-// would make the slicing below panic or the loop below run forever, so it is
-// rejected instead.
-func fragUDPMessage(message *udpMessage, maxPacketSize int) ([]*udpMessage, error) {
-	headerSize := message.headerSize()
-	udpMTU := maxPacketSize - headerSize
-	if udpMTU <= 0 {
-		return nil, E.New("invalid UDP packet size ", maxPacketSize, " for header size ", headerSize)
-	}
-	if len(message.data) <= udpMTU {
-		return []*udpMessage{message}, nil
-	}
-	fragmentCount := (len(message.data) + udpMTU - 1) / udpMTU
-	if fragmentCount > maxFragmentCount {
-		return nil, E.New("UDP message of ", len(message.data), " bytes requires ", fragmentCount, " fragments with packet size ", maxPacketSize)
-	}
-	fragments := make([]*udpMessage, 0, fragmentCount)
-	originPacket := message.data
-	for remaining := len(originPacket); remaining > 0; remaining -= udpMTU {
-		fragment := allocMessage()
-		*fragment = *message
-		// The payload buffer and its owner stay with the message the fragments
-		// were cut from: every fragment points into that buffer, so releasing it
-		// with one of them would return memory the others still use. The message
-		// is released by its sender once all fragments have been packed.
-		fragment.buffer = nil
-		fragment.owner = nil
-		if remaining > udpMTU {
-			fragment.data = originPacket[:udpMTU]
-			originPacket = originPacket[udpMTU:]
-		} else {
-			fragment.data = originPacket
-			originPacket = nil
-		}
-		fragments = append(fragments, fragment)
-	}
-	// Every fragment keeps the destination of the message it belongs to.
-	// Fragments used to carry it in the head fragment only, while the peer
-	// creates its session — and makes the routing decision for it — from the
-	// first DATAGRAM it receives. DATAGRAM frames are neither retransmitted nor
-	// reordered back into place, so the first fragment to arrive may well be a
-	// tail one, and the session was then created with an empty destination
-	// (":0") and routed by it: with per-destination routing rules in place, such
-	// a session ends up on the wrong outbound.
-	for index, fragment := range fragments {
-		fragment.fragmentID = uint8(index)
-		fragment.fragmentTotal = uint8(len(fragments))
-	}
-	return fragments, nil
-}
-
-// datagramMTU converts the maximum DATAGRAM payload size reported by quic-go
-// into the packet size used for fragmentation. The peer declares that limit in
-// its max_datagram_frame_size transport parameter, so it may be zero, negative
-// or too small to carry even a fragment header.
-func datagramMTU(maxDatagramPayloadSize int64, headerSize int) (int, error) {
-	if maxDatagramPayloadSize <= 0 || maxDatagramPayloadSize > math.MaxInt32 {
-		return 0, E.New("invalid datagram payload size reported by peer: ", maxDatagramPayloadSize)
-	}
-	udpMTU := int(maxDatagramPayloadSize) - udpMTUSafetyMargin
-	if udpMTU <= headerSize {
-		return 0, E.New("datagram payload size reported by peer (", maxDatagramPayloadSize, ") cannot carry the fragmentation header (", headerSize, ")")
-	}
-	return udpMTU, nil
-}
-
-// initialUDPPacketSize seeds the packet size used for fragmentation from the
-// DATAGRAM payload limit the connection reports for the peer. Without it every
-// session starts at the QUIC minimum of 1200 bytes and learns the real limit
-// only from a rejected DATAGRAM: a path which can carry 1400 bytes then keeps
-// splitting every message above ~1180 bytes into two frames for its whole
-// lifetime. A limit which cannot carry the fragment header is ignored, and the
-// per-message validation in writeMessage rejects it if the peer reported it
-// anyway.
-func initialUDPPacketSize(maxDatagramPayloadSize int64) int {
-	if maxDatagramPayloadSize <= 0 {
-		return initialUDPMTU
-	}
-	udpMTU := int(maxDatagramPayloadSize) - udpMTUSafetyMargin
-	if udpMTU <= 0 {
-		return initialUDPMTU
-	}
-	return udpMTU
+	return udpMessage{
+		destination: destination,
+		data:        data[udpMessageHeaderLen+addressLen:],
+	}, nil
 }
 
 var (
@@ -266,17 +78,16 @@ var (
 	_ N.PacketReadWaiter = (*udpPacketConn)(nil)
 )
 
+// udpPacketConn is one packet connection of a session: a channel of the session
+// with its own receive buffer, its own deadline and its own lifetime.
 type udpPacketConn struct {
 	ctx             context.Context
 	cancel          context.CancelCauseFunc
-	sessionID       uint16
-	quicConn        *quic.Conn
-	data            chan *udpMessage
-	udpMTU          atomic.Int64
-	packetId        atomic.Uint32
+	sessionID       uint32
+	association     udpx.Association
+	data            chan udpMessage
 	closeOnce       sync.Once
 	isServer        bool
-	defragger       *udpDefragger
 	onDestroy       func()
 	readWaitOptions N.ReadWaitOptions
 	readDeadline    pipe.Deadline
@@ -291,43 +102,25 @@ type udpPacketConn struct {
 	}
 }
 
-func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, sessionID uint16, isServer bool, onDestroy func()) *udpPacketConn {
+func newUDPPacketConn(ctx context.Context, association udpx.Association, sessionID uint32, isServer bool, onDestroy func()) *udpPacketConn {
 	ctx, cancel := context.WithCancelCause(ctx)
-	packetConn := &udpPacketConn{
+	return &udpPacketConn{
 		ctx:          ctx,
 		cancel:       cancel,
 		sessionID:    sessionID,
-		quicConn:     quicConn,
-		data:         make(chan *udpMessage, 64),
+		association:  association,
+		data:         make(chan udpMessage, 64),
 		isServer:     isServer,
-		defragger:    newUDPDefragger(),
 		onDestroy:    onDestroy,
 		readDeadline: pipe.MakeDeadline(),
-	}
-	packetConn.udpMTU.Store(int64(initialUDPPacketSize(quicConn.MaxDatagramPayloadSize())))
-	return packetConn
-}
-
-// refreshUDPMTU adopts the DATAGRAM payload limit of the connection when it
-// grew, which is how a session follows path MTU discovery: the estimate only
-// rises while the path is probed, and a limit which shrank is still handled by
-// the DatagramTooLargeError retry in writeMessage. The peer's own DATAGRAM
-// limit is fixed for the connection, so the connection's limit never falls
-// below the value seeded at session creation unless the path changed.
-func (c *udpPacketConn) refreshUDPMTU() {
-	udpMTU := initialUDPPacketSize(c.quicConn.MaxDatagramPayloadSize())
-	if udpMTU > int(c.udpMTU.Load()) {
-		c.udpMTU.Store(int64(udpMTU))
 	}
 }
 
 func (c *udpPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
 	select {
-	case p := <-c.data:
-		_, err = buffer.Write(p.data)
-		destination = p.destination
-		p.releaseMessage()
-		return
+	case message := <-c.data:
+		_, err = buffer.Write(message.data)
+		return message.destination, err
 	case <-c.ctx.Done():
 		return M.Socksaddr{}, io.ErrClosedPipe
 	case <-c.readDeadline.Wait():
@@ -337,14 +130,13 @@ func (c *udpPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr,
 
 func (c *udpPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	select {
-	case pkt := <-c.data:
-		n = copy(p, pkt.data)
-		if pkt.destination.IsDomain() {
-			addr = pkt.destination
+	case message := <-c.data:
+		n = copy(p, message.data)
+		if message.destination.IsDomain() {
+			addr = message.destination
 		} else {
-			addr = c.destinationAddr(pkt.destination)
+			addr = c.destinationAddr(message.destination)
 		}
-		pkt.releaseMessage()
 		return n, addr, nil
 	case <-c.ctx.Done():
 		return 0, nil, io.ErrClosedPipe
@@ -366,59 +158,15 @@ func (c *udpPacketConn) destinationAddr(destination M.Socksaddr) *net.UDPAddr {
 }
 
 func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	select {
-	case <-c.ctx.Done():
-		buffer.Release()
-		return net.ErrClosed
-	default:
-	}
-	if buffer.Len() > 0xffff {
-		buffer.Release()
-		return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: 0xffff}
-	}
-	if !destination.IsValid() {
-		buffer.Release()
-		return E.New("invalid destination address")
-	}
-	packetId := uint16(c.packetId.Add(1) % math.MaxUint16)
-	message := allocMessage()
-	// The buffer is taken over by the message: it holds the payload until the
-	// message was packed, and releaseMessage returns it to the pool.
-	*message = udpMessage{
-		sessionID:     c.sessionID,
-		packetID:      packetId,
-		fragmentTotal: 1,
-		destination:   destination,
-		data:          buffer.Bytes(),
-		buffer:        buffer,
-	}
-	defer message.releaseMessage()
-	return c.writeMessage(message)
+	message := udpMessage{destination: destination, data: buffer.Bytes()}
+	err := c.writeMessage(message)
+	buffer.Release()
+	return err
 }
 
 func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	select {
-	case <-c.ctx.Done():
-		return 0, net.ErrClosed
-	default:
-	}
-	if len(p) > 0xffff {
-		return 0, &quic.DatagramTooLargeError{MaxDatagramPayloadSize: 0xffff}
-	}
 	destination := M.SocksaddrFromNet(addr)
-	if !destination.IsValid() {
-		return 0, E.New("invalid destination address")
-	}
-	packetId := uint16(c.packetId.Add(1) % math.MaxUint16)
-	message := allocMessage()
-	*message = udpMessage{
-		sessionID:     c.sessionID,
-		packetID:      packetId,
-		fragmentTotal: 1,
-		destination:   destination,
-		data:          p,
-	}
-	defer message.releaseMessage()
+	message := udpMessage{destination: destination, data: p}
 	err = c.writeMessage(message)
 	if err != nil {
 		return 0, err
@@ -426,82 +174,34 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	return len(p), nil
 }
 
-// writeMessage sends message, fragmenting it when it does not fit into the
-// current MTU, and retries once with the MTU reported by quic-go when the
-// DATAGRAM was rejected as too large.
-func (c *udpPacketConn) writeMessage(message *udpMessage) error {
-	c.refreshUDPMTU()
-	udpMTU := int(c.udpMTU.Load())
-	var err error
-	if len(message.data) > udpMTU-message.headerSize() {
-		err = c.writeFragments(message, udpMTU)
-	} else {
-		err = c.writePacket(message)
+// writeMessage sends one forwarded packet on the channel of this connection, as
+// one datagram of the session.
+func (c *udpPacketConn) writeMessage(message udpMessage) error {
+	select {
+	case <-c.ctx.Done():
+		return net.ErrClosed
+	default:
 	}
-	if err == nil {
-		return nil
+	if !message.destination.IsValid() {
+		return E.New("invalid destination address")
 	}
-	var tooLargeErr *quic.DatagramTooLargeError
-	if !errors.As(err, &tooLargeErr) {
-		return err
-	}
-	udpMTU, mtuErr := datagramMTU(tooLargeErr.MaxDatagramPayloadSize, message.headerSize())
-	if mtuErr != nil {
-		return E.Errors(err, mtuErr)
-	}
-	c.udpMTU.Store(int64(udpMTU))
-	return c.writeFragments(message, udpMTU)
-}
-
-func (c *udpPacketConn) writeFragments(message *udpMessage, udpMTU int) error {
-	fragments, err := fragUDPMessage(message, udpMTU)
+	err := c.association.SendDatagram(c.sessionID, message.pack())
 	if err != nil {
-		return err
-	}
-	return c.writePackets(fragments)
-}
-
-func (c *udpPacketConn) inputPacket(message *udpMessage) error {
-	if message.fragmentTotal <= 1 {
-		select {
-		case c.data <- message:
-		default:
-			message.releaseMessage()
-		}
-		return nil
-	}
-	newMessage, err := c.defragger.feed(message)
-	if err != nil {
-		return err
-	}
-	if newMessage != nil {
-		select {
-		case c.data <- newMessage:
-		default:
-			newMessage.releaseMessage()
-		}
+		return E.Cause(err, "send message")
 	}
 	return nil
 }
 
-func (c *udpPacketConn) writePackets(messages []*udpMessage) error {
-	defer releaseMessages(messages)
-	for _, message := range messages {
-		err := c.writePacket(message)
-		if err != nil {
-			return err
-		}
+// inputPacket hands one received message to the reader of this connection. A full
+// receive buffer drops it, which is what the receive buffer of a UDP socket does
+// as well: a datagram that arrived too late to be kept is dropped, not queued.
+func (c *udpPacketConn) inputPacket(message udpMessage) {
+	select {
+	case c.data <- message:
+	default:
 	}
-	return nil
 }
 
-func (c *udpPacketConn) writePacket(message *udpMessage) error {
-	// The packed message is handed over to quic-go instead of being copied into
-	// a datagram: quic-go writes it into the packet as it is and returns the
-	// buffer to the pool once the datagram was sent out or dropped.
-	buffer := message.pack()
-	return c.quicConn.SendDatagramOwned(buffer.data, buffer)
-}
 func (c *udpPacketConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.closeWithError(os.ErrClosed)
@@ -510,25 +210,21 @@ func (c *udpPacketConn) Close() error {
 	return nil
 }
 
+// closeWithError ends this connection only: the session and every other packet
+// connection on it keep running. The peer is told that the channel is over, so
+// it releases what it holds for it instead of waiting for a timeout.
 func (c *udpPacketConn) closeWithError(err error) {
 	c.cancel(err)
-	if !c.isServer {
-		buffer := buf.NewSize(4)
-		defer buffer.Release()
-		buffer.WriteByte(Version)
-		buffer.WriteByte(CommandDissociate)
-		binary.Write(buffer, binary.BigEndian, c.sessionID)
-		sendStream, openErr := c.quicConn.OpenUniStream()
-		if openErr != nil {
-			return
-		}
-		defer sendStream.Close()
-		sendStream.Write(buffer.Bytes())
+	if c.isServer {
+		return
 	}
+	message := []byte{Version, CommandDissociate}
+	message = binary.BigEndian.AppendUint32(message, c.sessionID)
+	_ = c.association.SendDatagram(c.sessionID, message)
 }
 
 func (c *udpPacketConn) LocalAddr() net.Addr {
-	return c.quicConn.LocalAddr()
+	return c.association.LocalAddr()
 }
 
 func (c *udpPacketConn) SetDeadline(t time.Time) error {
@@ -542,164 +238,6 @@ func (c *udpPacketConn) SetReadDeadline(t time.Time) error {
 
 func (c *udpPacketConn) SetWriteDeadline(t time.Time) error {
 	return os.ErrInvalid
-}
-
-type udpDefragger struct {
-	packetMap *cache.LruCache[uint16, *packetItem]
-}
-
-func newUDPDefragger() *udpDefragger {
-	return &udpDefragger{
-		packetMap: cache.New(
-			cache.WithAge[uint16, *packetItem](10),
-			cache.WithUpdateAgeOnGet[uint16, *packetItem](),
-			// Reassembly state is created from peer-controlled packet IDs, so
-			// both the number of tracked packets and the size of a single
-			// reassembly are bounded.
-			cache.WithSize[uint16, *packetItem](maxDefragmentEntries),
-			cache.WithEvict[uint16, *packetItem](func(_ uint16, value *packetItem) {
-				releasePacketItem(value)
-			}),
-		),
-	}
-}
-
-// releasePacketItem drops the messages buffered by an evicted or aborted
-// reassembly. The eviction callback runs while the cache lock is held, so it
-// must not call back into the cache, and it takes the item lock to stay safe
-// against a concurrent feed.
-func releasePacketItem(item *packetItem) {
-	item.access.Lock()
-	messages := item.messages
-	item.messages = nil
-	item.count = 0
-	item.length = 0
-	item.access.Unlock()
-	releaseMessages(messages)
-}
-
-type packetItem struct {
-	access   sync.Mutex
-	messages []*udpMessage
-	count    uint8
-	length   int
-}
-
-// feed adds a fragment to its reassembly buffer and returns the complete
-// message once the last fragment arrived. Every error is a protocol violation
-// reported by the peer.
-func (d *udpDefragger) feed(m *udpMessage) (*udpMessage, error) {
-	if m.fragmentTotal <= 1 {
-		return m, nil
-	}
-	// The message is returned to the pool as soon as it was buffered, so every
-	// field which is used afterwards has to be captured first.
-	packetID := m.packetID
-	fragmentID := m.fragmentID
-	fragmentTotal := m.fragmentTotal
-	if fragmentID >= fragmentTotal {
-		m.releaseMessage()
-		return nil, E.New("invalid fragment ", fragmentID, " of ", fragmentTotal)
-	}
-	item, _ := d.packetMap.LoadOrStore(packetID, newPacketItem)
-	item.access.Lock()
-	if len(item.messages) != int(fragmentTotal) {
-		releaseMessages(item.messages)
-		item.messages = make([]*udpMessage, fragmentTotal)
-		item.count = 0
-		item.length = 0
-	}
-	if item.messages[fragmentID] != nil {
-		item.access.Unlock()
-		m.releaseMessage()
-		return nil, nil
-	}
-	if item.length+len(m.data) > maxDefragmentSize {
-		// The reassembled message cannot be represented by the uint16 length
-		// field of the wire format. Drop the whole entry instead of
-		// accumulating further fragments.
-		releaseMessages(item.messages)
-		item.messages = nil
-		item.count = 0
-		item.length = 0
-		item.access.Unlock()
-		d.packetMap.Delete(packetID)
-		m.releaseMessage()
-		return nil, E.New("reassembled UDP message exceeds ", maxDefragmentSize, " bytes")
-	}
-	item.messages[fragmentID] = m
-	item.count++
-	item.length += len(m.data)
-	if int(item.count) != len(item.messages) {
-		item.access.Unlock()
-		return nil, nil
-	}
-	newMessage := allocMessage()
-	*newMessage = *item.messages[0]
-	newMessage.fragmentTotal = 1
-	newMessage.fragmentID = 0
-	// The payload of the first fragment is not what the reassembled message
-	// carries, and the fragments release their own payloads below.
-	newMessage.buffer = nil
-	// The accumulated length was bounded above, so this buffer fits every
-	// fragment.
-	reassembled := getWireBuffer(item.length)
-	newMessage.owner = reassembled
-	newMessage.data = reassembled.data[:0]
-	var writeErr error
-	for _, message := range item.messages {
-		if writeErr == nil {
-			newMessage.data = append(newMessage.data, message.data...)
-		}
-		message.releaseMessage()
-	}
-	item.messages = nil
-	item.count = 0
-	item.length = 0
-	item.access.Unlock()
-	// The reassembly is complete: the entry is not kept until its age expires.
-	d.packetMap.Delete(packetID)
-	if writeErr != nil {
-		newMessage.releaseMessage()
-		return nil, E.Cause(writeErr, "reassemble UDP message")
-	}
-	return newMessage, nil
-}
-
-func newPacketItem() *packetItem {
-	return new(packetItem)
-}
-
-// decodeUDPMessage parses the payload of a packet message, which is the message
-// carrying one forwarded UDP packet.
-//
-// It is parsed by offset instead of through binary.Read on a bytes.Reader: that
-// decoder is reflection based, allocates a reader plus one allocation per field
-// and showed up as the single largest QUICX cost in a datagram forwarding
-// profile (around 8% of the client CPU, most of it in the address parser).
-func decodeUDPMessage(message *udpMessage, data []byte, owner quic.DatagramBufferOwner) error {
-	// The payload owner is taken over right away, so that every error path below
-	// releases it together with the message.
-	message.owner = owner
-	if len(data) < udpMessageBodyHeaderLen {
-		return io.ErrUnexpectedEOF
-	}
-	message.sessionID = binary.BigEndian.Uint16(data[0:2])
-	message.packetID = binary.BigEndian.Uint16(data[2:4])
-	message.fragmentTotal = data[4]
-	message.fragmentID = data[5]
-	dataLength := int(binary.BigEndian.Uint16(data[6:8]))
-	destination, addressLen, err := decodeAddrPort(data[udpMessageBodyHeaderLen:])
-	if err != nil {
-		return err
-	}
-	payload := data[udpMessageBodyHeaderLen+addressLen:]
-	if len(payload) != dataLength {
-		return io.ErrUnexpectedEOF
-	}
-	message.destination = destination
-	message.data = payload
-	return nil
 }
 
 // Address family bytes of AddressSerializer, see the serializer options in

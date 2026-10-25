@@ -1,27 +1,21 @@
 package quicx
 
 import (
-	"context"
-
-	"github.com/sagernet/quic-go"
-	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
+	"github.com/sagernet/sing-quic/congestion"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-func parseBBRProfile(profile string) (congestion_meta2.Profile, error) {
+// parseBBRProfile turns the configured profile name into the one the transport
+// runs. Congestion control belongs to the transport in this protocol, so what is
+// left here is the name: the zero value is the conservative profile, which is
+// also what an empty option means.
+func parseBBRProfile(profile string) (congestion.Profile, error) {
 	if profile == "" {
-		return congestion_meta2.ProfileConservative, nil
+		return congestion.ProfileConservative, nil
 	}
-	parsed, err := congestion_meta2.ParseProfile(profile)
+	parsed, err := congestion.ParseProfile(profile)
 	if err != nil {
-		return congestion_meta2.Profile{}, E.Cause(err, "parse BBR profile")
+		return congestion.Profile{}, E.Cause(err, "parse BBR profile")
 	}
 	return parsed, nil
-}
-
-func setCongestion(ctx context.Context, connection *quic.Conn, profile congestion_meta2.Profile) {
-	connection.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
-		connection.InitialPacketSize(),
-		profile,
-	))
 }

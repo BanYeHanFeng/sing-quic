@@ -1,27 +1,30 @@
 package quicx
 
-const (
-	Version = 1
+// Version is the version of the protocol above the transport. It closes the
+// stream and datagram headers of every session, and a peer that does not find it
+// there is speaking something else: an old QUICX, or a probe.
+//
+// This is not the version of the transport. That one is negotiated in the
+// handshake before a session exists, so a peer speaking the old QUIC-based
+// protocol never reaches this code at all — the port simply does not answer it.
+const Version = 2
 
-	// AuthNonceLen is the length of the random nonce a client attaches to its
-	// authentication request, which is what makes an authentication request
-	// unusable for anyone but the session it was created for.
-	//
-	// QUIC 0-RTT data is not replay protected: an attacker who captured a
-	// client's 0-RTT flight can send it to the server again, and the transport
-	// has no way to tell the copy from the original. The nonce lets the server
-	// tell them apart, because it remembers the nonce of every recently
-	// authenticated session and rejects a nonce another session already used. A
-	// replayed flight therefore fails authentication and never reaches the
-	// handler, so the CONNECT request and the first payload of the proxied
-	// connection it carries are not delivered to the destination a second time.
-	AuthNonceLen = 16
+// The command of a stream: what the connection it carries is for. There is only
+// one, because a session is a set of proxied connections and nothing else.
+const (
+	// CommandConnect starts a proxied connection to the destination that follows.
+	CommandConnect = iota
 )
 
+// The commands of a datagram: what the message it carries is. A forwarded UDP
+// packet is one datagram of a channel, and a channel ends with the other command.
 const (
-	CommandAuthenticate = iota
-	CommandConnect
-	CommandPacket
+	// CommandPacket carries one forwarded UDP packet of the channel it arrived
+	// on, with the destination it goes to.
+	CommandPacket = iota
+
+	// CommandDissociate ends the channel it arrived on, which is what a client
+	// sends when a packet connection it opened is done: without it the server
+	// keeps the channel until the session ends or the connection times out.
 	CommandDissociate
-	CommandHeartbeat
 )

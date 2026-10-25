@@ -16,24 +16,22 @@ func (c *udpPacketConn) InitializeReadWaiter(options N.ReadWaitOptions) (needCop
 
 func (c *udpPacketConn) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksaddr, err error) {
 	select {
-	case p := <-c.data:
-		destination = p.destination
+	case message := <-c.data:
+		destination = message.destination
 		if c.readWaitOptions.NeedHeadroom() {
 			buffer = c.readWaitOptions.NewPacketBuffer()
-			_, err = buffer.Write(p.data)
-			p.releaseMessage()
+			_, err = buffer.Write(message.data)
 			if err != nil {
 				buffer.Release()
 				return
 			}
 			c.readWaitOptions.PostReturn(buffer)
 		} else {
-			// The caller takes the buffer over and releases it, so the payload
-			// has to be copied out of the message: the payload itself is
-			// recycled together with the message.
-			buffer = buf.NewSize(len(p.data))
-			_, err = buffer.Write(p.data)
-			p.releaseMessage()
+			// The caller takes the buffer over and releases it. The message is
+			// the one thing that holds its payload, so the payload is copied out
+			// of it rather than handed over.
+			buffer = buf.NewSize(len(message.data))
+			_, err = buffer.Write(message.data)
 			if err != nil {
 				buffer.Release()
 				return nil, M.Socksaddr{}, err
