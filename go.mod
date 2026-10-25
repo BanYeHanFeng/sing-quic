@@ -10,6 +10,7 @@ require (
 	golang.org/x/crypto v0.54.0
 	golang.org/x/exp v0.0.0-20250911091902-df9299821621
 	golang.org/x/sync v0.22.0
+	golang.org/x/sys v0.47.0
 )
 
 require (
@@ -23,7 +24,6 @@ require (
 	github.com/metacubex/utls v1.8.7 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 )
 
