@@ -112,6 +112,7 @@ type Options struct {
 	// protects one direction only, so an association that should survive a lossy
 	// path in both directions sets it on both ends.
 	FEC FECOptions
+
 }
 
 // FECOptions is how a sender protects its packets with forward error correction.
@@ -286,6 +287,11 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		isClient:     isClient,
 		ownsConn:     ownsConn,
 	}
+	// The controller comes first: a timer that fires before it exists would send
+	// through a half built association, and the idle timer is armed with the
+	// configured timeout, which may be short enough to win the race.
+	a.cc = newCongestionController(a.options)
+	a.cc.SetRTTStatsProvider(&a.rttStats)
 	if a.fecSender != nil {
 		a.maxPayload = a.fecSender.payloadBudget()
 		a.fecSender.timer = time.AfterFunc(time.Hour, a.flushFECGroup)
@@ -298,8 +304,6 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 	a.ackTimer = time.AfterFunc(maxAckDelay, a.flushAck)
 	a.ptoTimer = time.AfterFunc(initialPTO, a.probe)
 	a.ptoTimer.Stop()
-	a.cc = newCongestionController(a.options)
-	a.cc.SetRTTStatsProvider(&a.rttStats)
 	a.paceTimer = time.AfterFunc(time.Hour, func() { _ = a.flush() })
 	a.paceTimer.Stop()
 	if a.options.KeepAlivePeriod > 0 {
