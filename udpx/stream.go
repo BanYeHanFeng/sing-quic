@@ -30,11 +30,14 @@ const (
 	// streamInitiatorBit is the bit of a stream id that says which end opened the
 	// stream.
 	streamInitiatorBit = 0x01
-
-	// maxStreamDataLen is how much stream data one frame may carry, so that a
-	// frame always fits in a packet with the rest of what a packet holds.
-	maxStreamDataLen = maxPacketSize - headerLen - tagLen - streamFixedLen
 )
+
+// streamDataLen is how much stream data one frame may carry, so that a frame always
+// fits in a packet with the rest of what a packet holds. What a packet holds depends
+// on whether this end protects its packets: the parity has to fit as well.
+func (a *association) streamDataLen() int {
+	return a.maxPayload - streamFixedLen
+}
 
 // Stream is one stream of an association: a net.Conn whose two halves close
 // separately.
@@ -225,7 +228,7 @@ func (s *Stream) sendQueued() error {
 		s.sendMu.Lock()
 		var frame []byte
 		if len(s.sendBuffer) > 0 {
-			length := min(len(s.sendBuffer), maxStreamDataLen)
+			length := min(len(s.sendBuffer), s.association.streamDataLen())
 			frame = appendStream(nil, s.id, s.sendOffset-uint64(len(s.sendBuffer)), false, s.sendBuffer[:length])
 			s.sendBuffer = s.sendBuffer[length:]
 		} else if s.closeWrite && !s.finSent {

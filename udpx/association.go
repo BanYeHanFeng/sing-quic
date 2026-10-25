@@ -100,6 +100,29 @@ type Options struct {
 	// Congestion is the BBR profile of the congestion controller. The zero value
 	// is the conservative one.
 	Congestion congestion.Profile
+
+	// FEC is the forward error correction applied to what this end sends. It
+	// protects one direction only, so an association that should survive a lossy
+	// path in both directions sets it on both ends.
+	FEC FECOptions
+}
+
+// FECOptions is how a sender protects its packets with forward error correction.
+//
+// A group is a fixed number of packets and the redundancy that covers them, and
+// the cost of it is the redundancy: what a group buys is that a lost member is
+// recovered from the parity that already arrived instead of waiting a round trip
+// for a retransmission. The number of members is a constant of the sender, while
+// the redundancy follows the loss it sees, because a path that loses nothing has
+// nothing to replace.
+type FECOptions struct {
+	// DataShards is how many packets a group holds. Zero disables forward error
+	// correction.
+	DataShards int
+
+	// ParityShards is how many redundant packets a group gets, up to the number of
+	// members. Zero leaves it to the losses the path is showing.
+	ParityShards int
 }
 
 func (o Options) withDefaults() Options {
@@ -140,8 +163,17 @@ type association struct {
 	sendBuffer  []byte
 	buildBuffer []byte
 	queue       frameQueue
+	// maxPayload is how many payload bytes a packet may carry, which is smaller
+	// than what the MTU allows once this end protects its packets: the parity
+	// shards and the description in their headers have to fit as well.
+	maxPayload int
+	// fecSender assembles the groups this end sends, or nil when it sends none.
+	fecSender *fecSender
 
 	recvRing keyRing
+	// fec assembles the groups the peer sends. It belongs to the receive side and
+	// needs no lock of its own.
+	fec fecReceiver
 
 	// idleTimer closes the association when it falls silent. It is reset from
 	// both sides.
@@ -227,6 +259,9 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		sendRing:     result.send,
 		recvRing:     result.recv,
 		sendBuffer:   make([]byte, 0, maxPacketSize),
+		maxPayload:   maxPacketSize - headerLen - tagLen,
+		fecSender:    newFECSender(options.FEC),
+		fec:          newFECReceiver(),
 		streams:      make(map[uint32]*Stream),
 		acceptStream: make(chan *Stream, acceptStreamBacklog),
 		defragger:    newDatagramDefragger(),
@@ -235,6 +270,11 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		recvLimit:    initialConnectionWindow,
 		isClient:     isClient,
 		ownsConn:     ownsConn,
+	}
+	if a.fecSender != nil {
+		a.maxPayload = a.fecSender.payloadBudget()
+		a.fecSender.timer = time.AfterFunc(time.Hour, a.flushFECGroup)
+		a.fecSender.timer.Stop()
 	}
 	a.peerAddr.Store(&peer)
 	a.idleTimer = time.AfterFunc(a.options.IdleTimeout, func() {
@@ -288,6 +328,9 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 		a.ackTimer.Stop()
 		a.ptoTimer.Stop()
 		a.paceTimer.Stop()
+		if a.fecSender != nil {
+			a.fecSender.timer.Stop()
+		}
 		a.cancel(cause)
 		a.closeStreams(cause)
 		if a.ownsConn {
@@ -344,6 +387,15 @@ func (a *association) handlePacket(packet []byte, source net.Addr) error {
 	}
 	if packetHeader.Type == packetTypeReset {
 		return a.handleReset(packet, source)
+	}
+	if packetHeader.Type == packetTypeFEC {
+		return a.handleParity(packet, packetHeader, source)
+	}
+	if packetHeader.Type == packetTypeData && a.fec.active {
+		// The packet is kept before it is opened, which is what makes it
+		// recoverable: what a member is recovered as is the bytes the sender
+		// wrote, and the ones in this buffer are about to be decrypted in place.
+		a.fec.remember(packetHeader.PacketNumber, packet)
 	}
 	_, _, payload, err := a.recvRing.open(packet)
 	if err != nil {
@@ -438,6 +490,37 @@ func (a *association) roundTrip() (time.Duration, bool) {
 		return 0, false
 	}
 	return a.rtt.smoothed, true
+}
+
+// handleParity takes one parity shard of a group the peer sent, recovers whatever
+// the group is missing, and hands every recovered packet to the ordinary receive
+// path.
+//
+// That is the whole promise of the packet number being in the clear: a recovered
+// member is the bytes the sender wrote, so it authenticates, opens and is
+// acknowledged like a packet that arrived on its own, and the acknowledgement is
+// what tells the sender it does not have to send it again.
+func (a *association) handleParity(packet []byte, packetHeader header, source net.Addr) error {
+	_, description, payload, err := a.recvRing.open(packet)
+	if err != nil {
+		return err
+	}
+	if description == nil {
+		return errShortPacket
+	}
+	a.peerAddr.Store(&source)
+	a.resetIdle()
+	// The shard is a view of the buffer the next packet will be read into, and the
+	// group outlives this call.
+	recovered := a.fec.parity(description, append([]byte(nil), payload...))
+	for _, member := range recovered {
+		_ = a.handlePacket(member, source)
+	}
+	// Parity is ack-eliciting like anything else: it takes room in flight, and a
+	// packet in flight that nothing acknowledges is a packet that keeps the window
+	// closed until the association ends.
+	a.scheduleAck(packetHeader.PacketNumber, time.Now())
+	return nil
 }
 
 // handleReset accepts a reset packet, the one packet type that is not

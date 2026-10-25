@@ -70,18 +70,29 @@ func newCongestionController(options Options) congestion.Controller {
 // may not.
 func (a *association) congestionBudget() (bool, time.Time) {
 	a.flightMu.Lock()
-	inFlight := congestion.ByteCount(a.inFlight.bytes)
+	inFlight := a.inFlight.bytes
+	parityBytes := a.inFlight.parityBytes
 	a.flightMu.Unlock()
+	charged := congestion.ByteCount(inFlight)
+	if a.fecSender != nil && a.fecSender.dataShards > 0 {
+		// The parity of the group being assembled has not left yet, so it is charged
+		// to the data that is going to need it: a window that holds only data leaves
+		// no room for the redundancy, and redundancy that never leaves is the same
+		// as none. What is already in flight as redundancy was charged this way
+		// when it went out, so it is not charged twice.
+		data := int64(inFlight - parityBytes)
+		charged = congestion.ByteCount(data + data*int64(a.fecSender.parityShards)/int64(a.fecSender.dataShards) + int64(parityBytes))
+	}
 	now := time.Now()
 	a.ccMu.Lock()
 	defer a.ccMu.Unlock()
-	if !a.cc.CanSend(inFlight) {
+	if !a.cc.CanSend(charged) {
 		return false, time.Time{}
 	}
 	if a.cc.HasPacingBudget(now) {
 		return true, time.Time{}
 	}
-	return false, a.cc.TimeUntilSend(inFlight)
+	return false, a.cc.TimeUntilSend(charged)
 }
 
 // congestionSent records a packet that left.

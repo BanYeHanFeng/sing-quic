@@ -189,6 +189,12 @@ func (d *datagramDefragger) remove(key datagramKey) {
 	delete(d.entries, key)
 }
 
+// datagramDataLen is how much of a datagram one fragment carries, so that the
+// frame it is packed into fits in a packet alone.
+func (a *association) datagramDataLen() int {
+return a.maxPayload - datagramFixedLen
+}
+
 // SendDatagram sends one message to the peer. The message is split here, and a
 // message that is lost is not sent again: a datagram is a datagram.
 func (a *association) SendDatagram(channel uint32, data []byte) error {
@@ -200,7 +206,8 @@ func (a *association) SendDatagram(channel uint32, data []byte) error {
 	if len(data) > maxDatagramSize {
 		return E.New("datagram of ", len(data), " bytes is larger than ", maxDatagramSize)
 	}
-	fragmentCount := (len(data) + datagramFragmentLen - 1) / datagramFragmentLen
+	fragmentLen := a.datagramDataLen()
+fragmentCount := (len(data) + fragmentLen - 1) / fragmentLen
 	if fragmentCount == 0 {
 		fragmentCount = 1
 	}

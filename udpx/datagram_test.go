@@ -64,7 +64,7 @@ func TestDatagramEmpty(t *testing.T) {
 func TestDatagramFragments(t *testing.T) {
 	client, server, _ := testSetup(t, Options{}, Options{})
 	ctx := testContext(t, 10*time.Second)
-	payload := testPayload(8 * datagramFragmentLen)
+	payload := testPayload(8 * client.(*association).datagramDataLen())
 	if err := client.SendDatagram(2, payload); err != nil {
 		t.Fatal(err)
 	}

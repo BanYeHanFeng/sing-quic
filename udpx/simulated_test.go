@@ -203,7 +203,7 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	sampler := startBoundsSampler(t, client, server)
 	upload := testPayload(payloadSize)
 	download := otherPayload(payloadSize)
-	datagramPayload := testPayload(2 * datagramFragmentLen)
+	datagramPayload := testPayload(2 * client.(*association).datagramDataLen())
 	var wg sync.WaitGroup
 
 	// This way: the client opens a stream and the server reads it.
@@ -332,7 +332,7 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	}
 	// A stream may queue what its window allows, and the frames of the other
 	// stream and of the association go beside it.
-	if frames := bounds.queuedFrames; frames > 8*(initialStreamWindow/maxStreamDataLen) {
+	if frames := bounds.queuedFrames; frames > 8*(initialStreamWindow/client.(*association).streamDataLen()) {
 		t.Errorf("%d frames were queued at once", frames)
 	}
 	if bounds.streamSegments > 2*initialStreamWindow {

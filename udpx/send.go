@@ -114,6 +114,11 @@ type sentPacket struct {
 	size         int
 	packetNumber uint32
 	ackEliciting bool
+	// parity says the packet is a redundancy shard of a group. It counts into the
+	// window like any other packet and is acknowledged like any other, and the only
+	// thing it does not carry is a frame to send again: a parity shard that is lost
+	// cost a shard, not a promise.
+	parity bool
 	// removed says the packet left the flight table. The entry stays in the
 	// ordered slice until the next compaction, because an acknowledgement covers
 	// a range of packet numbers and rewriting the whole table once per range is
@@ -132,12 +137,19 @@ type sentPacket struct {
 type sentPackets struct {
 	packets []*sentPacket
 	bytes   int
-	removed int
+	// parityBytes is how much of bytes is redundancy, which the send path needs to
+	// charge the redundancy of the group being assembled without charging the one
+	// already in flight twice.
+	parityBytes int
+	removed     int
 }
 
 func (s *sentPackets) append(packet *sentPacket) {
 	s.packets = append(s.packets, packet)
 	s.bytes += packet.size
+	if packet.parity {
+		s.parityBytes += packet.size
+	}
 }
 
 // len is how many packets are in flight, not how many entries the table holds.
@@ -217,6 +229,9 @@ func (s *sentPackets) markRemoved(packet *sentPacket) bool {
 	packet.removed = true
 	s.removed++
 	s.bytes -= packet.size
+	if packet.parity {
+		s.parityBytes -= packet.size
+	}
 	return true
 }
 
@@ -271,7 +286,7 @@ func (a *association) flush() error {
 	for a.queue.len() > 0 {
 		allowed, waitUntil := a.congestionBudget()
 		if !allowed {
-			acknowledgement := a.queue.takeAckOnly(maxPacketSize - headerLen - tagLen)
+			acknowledgement := a.queue.takeAckOnly(a.maxPayload)
 			if len(acknowledgement) > 0 {
 				// The window is closed, but this packet is what the peer needs
 				// before it can send anything, and an acknowledgement is not
@@ -291,7 +306,7 @@ func (a *association) flush() error {
 			a.paceTimer.Reset(time.Until(waitUntil))
 			return nil
 		}
-		frames := a.queue.take(maxPacketSize - headerLen - tagLen)
+		frames := a.queue.take(a.maxPayload)
 		if len(frames) == 0 {
 			return E.New("frame of ", len(a.queue.frames[0].payload), " bytes does not fit in a packet")
 		}
@@ -338,12 +353,23 @@ func (a *association) sendFramesLocked(frames []outFrame) error {
 		frames[index].lastSent = h.PacketNumber
 		sent.ackEliciting = sent.ackEliciting || frames[index].ackEliciting
 	}
+	err = a.writePacketLocked(sent, packet)
+	if err != nil {
+		return err
+	}
+	return a.fecMemberLocked(packet, h.PacketNumber)
+}
+
+// writePacketLocked puts one sealed packet on the wire and records what it means
+// for what is in flight, for the congestion controller and for the probe timer.
+// The caller holds sendMu.
+func (a *association) writePacketLocked(sent *sentPacket, packet []byte) error {
 	if !sent.ackEliciting {
 		// Nothing in this packet asks for an acknowledgement, so nothing will
 		// ever acknowledge it: putting it in flight would leave an entry that can
 		// only be given up on, and would keep the probe timer aimed at a packet
 		// nobody is waiting for.
-		_, err = a.conn.WriteTo(packet, a.RemoteAddr())
+		_, err := a.conn.WriteTo(packet, a.RemoteAddr())
 		if err != nil {
 			return E.Cause(err, "write packet")
 		}
@@ -355,19 +381,19 @@ func (a *association) sendFramesLocked(frames []outFrame) error {
 	priorInFlight := a.inFlight.bytes
 	a.inFlight.append(sent)
 	a.flightMu.Unlock()
-	_, err = a.conn.WriteTo(packet, a.RemoteAddr())
+	_, err := a.conn.WriteTo(packet, a.RemoteAddr())
 	if err != nil {
 		a.flightMu.Lock()
 		a.inFlight.remove(sent)
 		a.flightMu.Unlock()
 		return E.Cause(err, "write packet")
 	}
-	a.congestionSent(h.PacketNumber, len(packet), priorInFlight, true)
+	a.congestionSent(sent.packetNumber, sent.size, priorInFlight, true)
 	a.resetIdle()
 	// The probe timer belongs to the oldest packet in flight, so it is armed when
 	// there was nothing in flight before this one. A packet that follows a
 	// pending one is already covered by the wait that packet armed.
-	if wasEmpty && sent.ackEliciting {
+	if wasEmpty {
 		a.armPTO()
 	}
 	return nil
