@@ -244,6 +244,11 @@ func (a *association) ReceiveDatagram(ctx context.Context) (Datagram, error) {
 // whole. A datagram that cannot be reassembled is dropped, not an error: it is the
 // peer's own message that is lost, and the streams beside it are not affected.
 func (a *association) handleDatagram(data datagramData) error {
+	// The reassemblies are one lock with the messages waiting for the
+	// application: both are state the receive side owns and the caller of
+	// ReceiveDatagram reads, and neither is worth two locks.
+	a.datagramMu.Lock()
+	defer a.datagramMu.Unlock()
 	message, complete, err := a.defragger.feed(data, time.Now())
 	if err != nil {
 		return err
@@ -251,7 +256,6 @@ func (a *association) handleDatagram(data datagramData) error {
 	if !complete {
 		return nil
 	}
-	a.datagramMu.Lock()
 	select {
 	case a.datagrams <- Datagram{Channel: data.channel, Data: message}:
 	default:
@@ -259,6 +263,5 @@ func (a *association) handleDatagram(data datagramData) error {
 		// loop waiting for room: an unreliable message that waited is still
 		// unreliable, and the streams of this association are not.
 	}
-	a.datagramMu.Unlock()
 	return nil
 }
