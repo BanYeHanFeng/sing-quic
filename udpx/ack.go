@@ -36,10 +36,18 @@ const (
 	//
 	// Two is what a transport with one packet per system call can afford; here a
 	// fast path leaves in batches of many packets, and answering every second one
-	// of them turns most of what leaves the host into answers. Eight packets say
-	// the same thing in one packet: the ranges an acknowledgement names cover
-	// what arrived, and a run of eight of them costs one range.
-	ackThreshold = 8
+	// of them turns most of what leaves the host into answers. Sixteen packets
+	// say the same thing in one packet: the ranges an acknowledgement names
+	// cover what arrived, and a run of sixteen of them costs one range. It is
+	// also the batch size, so a full batch costs one answer instead of two, and
+	// the same transfer leaves the host with a third fewer calls to the socket.
+	//
+	// The threshold cannot be made arbitrarily large: a window that holds fewer
+	// packets than this sends that many and then waits, and the wait is the delay
+	// below. That is why the delay follows the round trip (see ackDelay) rather
+	// than being a constant: a path fast enough to have a window this small must
+	// not be answered on the timescale of a slow one.
+	ackThreshold = 16
 
 	// minAckDelay is the shortest time an acknowledgement may wait for another
 	// packet. A delay below the time a batch takes to arrive answers batches that
