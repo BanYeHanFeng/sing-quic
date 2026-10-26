@@ -45,6 +45,14 @@ type linkOptions struct {
 	// jitter is how much shorter or longer than delay a datagram may spend, which
 	// is what reorders them.
 	jitter time.Duration
+	// rate is how many bytes per second the path carries, each direction.
+	//
+	// Zero is a path that carries whatever it is given at once, which is a link
+	// without a capacity: a measurement over one of those is a measurement of how
+	// fast a window can ramp and not of what the path can carry, and a window larger
+	// than the bandwidth-delay product builds a queue on a path that has one instead
+	// of arriving sooner.
+	rate float64
 }
 
 func newSimulatedLink(t *testing.T, server net.Addr, options linkOptions) *simulatedLink {
@@ -71,6 +79,9 @@ func newSimulatedLink(t *testing.T, server net.Addr, options linkOptions) *simul
 // the path and remembering where the client is.
 func (l *simulatedLink) forward(from, to net.PacketConn, destination func() net.Addr) {
 	buffer := make([]byte, maxPacketSize)
+	// The path is one queue in each direction: free is when the datagram that
+	// follows may leave.
+	var free time.Time
 	for {
 		n, source, err := from.ReadFrom(buffer)
 		if err != nil {
@@ -84,18 +95,26 @@ func (l *simulatedLink) forward(from, to net.PacketConn, destination func() net.
 		// The buffer is reused for the next datagram, so what the path decided to
 		// keep has to be its own copy.
 		packet := append([]byte(nil), buffer[:n]...)
-		l.send(packet, to, destination)
+		l.send(packet, to, destination, &free)
 		if l.roll(l.options.duplicate) {
-			l.send(packet, to, destination)
+			l.send(packet, to, destination, &free)
 		}
 	}
 }
 
 // send puts one datagram on the path, which either drops it or arrives after the
-// delay the path picked for it.
-func (l *simulatedLink) send(packet []byte, to net.PacketConn, destination func() net.Addr) {
+// delay the path picked for it. A path with a capacity takes its time carrying one
+// datagram, and the next one waits for it.
+func (l *simulatedLink) send(packet []byte, to net.PacketConn, destination func() net.Addr, free *time.Time) {
 	if l.roll(l.options.loss) {
 		return
+	}
+	arrival := time.Now()
+	if l.options.rate > 0 {
+		if free.After(arrival) {
+			arrival = *free
+		}
+		*free = arrival.Add(time.Duration(float64(len(packet)) / l.options.rate * float64(time.Second)))
 	}
 	delay := l.options.delay
 	if l.options.jitter > 0 {
@@ -107,11 +126,12 @@ func (l *simulatedLink) send(packet []byte, to net.PacketConn, destination func(
 			delay = 0
 		}
 	}
-	if delay == 0 {
+	arrival = arrival.Add(delay)
+	if !arrival.After(time.Now()) {
 		l.write(packet, to, destination)
 		return
 	}
-	time.AfterFunc(delay, func() {
+	time.AfterFunc(time.Until(arrival), func() {
 		l.write(packet, to, destination)
 	})
 }
@@ -220,6 +240,83 @@ func TestTransferUnderLoss(t *testing.T) {
 				t.Fatalf("%d packets in flight after the transfer", inFlight)
 			}
 		})
+	}
+}
+
+// TestWindowGrowsOverALossyCapacityPath requires the window to grow over a path that
+// has a capacity and loses packets, which is the case the growth exists for: a lost
+// packet leaves a hole, the application cannot read past it, and the credit update
+// that the hole delayed is a round trip the peer spends waiting. Growing the window
+// is what puts that round trip back to work (on a 50 Mbit/s path of the same shape,
+// 16 MiB went from 2.1 to 2.9 MiB/s; here 8 MiB went from 2.1 to 2.3–2.5 and 16 MiB
+// to 3.3–3.5).
+//
+// Two things are pinned and only one of them is a rate. A window that never grew
+// would leave the path idle after every hole, which is what the first check is for
+// and what fails without the growth; the rate is a floor against a collapse and not a
+// measurement, because most of the distance to the capacity is the congestion
+// controller's startup and not the window.
+func TestWindowGrowsOverALossyCapacityPath(t *testing.T) {
+	if testing.Short() {
+		t.Skip("a path with a capacity takes its time")
+	}
+	const capacity = 12.5 * 1024 * 1024
+	password := NewPassword("password")
+	listenerConn := udpConn(t)
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
+	defer listener.Close()
+	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
+		loss:   0.05,
+		delay:  100 * time.Millisecond,
+		jitter: 2 * time.Millisecond,
+		rate:   capacity,
+	})
+
+	ctx := testContext(t, 60*time.Second)
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseWithError(nil)
+	server, err := listener.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Several times the window the peer starts with, so the one it has is filled and
+	// the reads after that double it, without spending seconds on a path this slow.
+	payload := testPayload(4 * initialStreamWindow)
+	start := time.Now()
+	go func() {
+		if _, writeErr := stream.Write(payload); writeErr != nil {
+			t.Errorf("write: %v", writeErr)
+		}
+	}()
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := make([]byte, 0, len(payload))
+	buffer := make([]byte, 64*1024)
+	for len(read) < len(payload) {
+		n, readErr := accepted.Read(buffer)
+		if readErr != nil {
+			t.Fatalf("read %d of %d bytes: %v", len(read), len(payload), readErr)
+		}
+		read = append(read, buffer[:n]...)
+	}
+	elapsed := time.Since(start)
+	if granted := grantedTo(t, server, accepted.ID()); granted.window <= initialStreamWindow {
+		t.Fatalf("the window stayed at %d bytes over a path that loses packets", granted.window)
+	}
+	if window, _, _ := associationWindowOf(t, server); window <= initialConnectionWindow {
+		t.Fatalf("the association window stayed at %d bytes", window)
+	}
+	if rate := float64(len(payload)) / elapsed.Seconds(); rate < capacity/8 {
+		t.Fatalf("%.2f MiB/s over a path of %.2f MiB/s", rate/1024/1024, capacity/1024/1024)
 	}
 }
 
