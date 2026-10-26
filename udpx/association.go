@@ -111,7 +111,7 @@ type Options struct {
 	KeepAlivePeriod time.Duration
 
 	// Congestion is the BBR profile of the congestion controller. The zero value
-	// is the conservative one.
+	// is the default one (defaultCongestionProfile).
 	Congestion congestion.Profile
 
 	// InitialCongestionWindow is how many packets the congestion window holds
@@ -157,7 +157,7 @@ func (o Options) withDefaults() Options {
 		o.KeepAlivePeriod = 0
 	}
 	if o.Congestion == (congestion.Profile{}) {
-		o.Congestion = congestion.ProfileConservative
+		o.Congestion = defaultCongestionProfile
 	}
 	if o.InitialCongestionWindow <= 0 {
 		o.InitialCongestionWindow = initialCongestionWindowPackets
