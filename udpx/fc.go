@@ -18,11 +18,24 @@ package udpx
 const (
 	// initialStreamWindow is how much data one stream may have in flight before
 	// the receiver has to raise the window.
-	initialStreamWindow = 256 * 1024
+	//
+	// The size is the ceiling a single stream cannot pass: a path that takes
+	// 200 ms per round trip carries one window per round trip, so 2 MiB is a
+	// little over 3 MiB/s for one stream and 40 MiB/s for a path of 50 ms. A
+	// smaller window is what kept a single stream at 0.6 MiB/s on that path, and
+	// the memory a larger one would cost is spent on nothing: what a receiver may
+	// hold in total is the association window below, whichever stream it belongs
+	// to.
+	initialStreamWindow = 2 * 1024 * 1024
 
 	// initialConnectionWindow is how much data all streams together may have in
 	// flight.
-	initialConnectionWindow = 4 * 1024 * 1024
+	//
+	// This is the number that bounds the memory one association costs on either
+	// end: what arrived and was not read yet on one side, and what was sent and
+	// not acknowledged yet on the other. Four streams of the stream window fill
+	// it.
+	initialConnectionWindow = 8 * 1024 * 1024
 
 	// maxStreams is how many streams an association may have open at once. It is
 	// a constant of the protocol rather than a number to negotiate: the number is
