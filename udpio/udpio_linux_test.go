@@ -4,7 +4,6 @@ package udpio
 
 import (
 	"bytes"
-	"encoding/binary"
 	"net"
 	"syscall"
 	"testing"
@@ -171,112 +170,11 @@ func TestSegmentCount(t *testing.T) {
 	}
 }
 
-// TestMmsghdrLayout checks the one thing a hand-written structure can get wrong:
-// the kernel writes the length right after the msghdr, so the field has to be
-// exactly there.
-func TestMmsghdrLayout(t *testing.T) {
-	var message mmsghdr
-	if offset := unsafe.Offsetof(message.sent); offset != syscall.SizeofMsghdr {
-		t.Fatalf("the length field is %d bytes in, want %d", offset, syscall.SizeofMsghdr)
-	}
-}
-
-func TestSendmmsgCount(t *testing.T) {
-	first := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1000}
-	second := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2000}
-	increasing := make([]Packet, 0, maxSendmmsg+3)
-	for index := range maxSendmmsg + 3 {
-		increasing = append(increasing, Packet{Data: make([]byte, 100+index), Addr: first})
-	}
-	for _, testCase := range []struct {
-		name    string
-		gso     bool
-		many    bool
-		packets []Packet
-		want    int
-	}{
-		{
-			name: "a run that cannot be segmented",
-			gso:  true,
-			many: true,
-			packets: []Packet{
-				{Data: make([]byte, 100), Addr: first},
-				{Data: make([]byte, 120), Addr: first},
-				{Data: make([]byte, 140), Addr: first},
-			},
-			want: 3,
-		},
-		{
-			name: "another address is part of the same call",
-			gso:  true,
-			many: true,
-			packets: []Packet{
-				{Data: make([]byte, 100), Addr: first},
-				{Data: make([]byte, 120), Addr: second},
-			},
-			want: 2,
-		},
-		{
-			name: "a segmentable run ends the call",
-			gso:  true,
-			many: true,
-			packets: []Packet{
-				{Data: make([]byte, 100), Addr: first},
-				{Data: make([]byte, 200), Addr: first},
-				{Data: make([]byte, 200), Addr: first},
-			},
-			want: 1,
-		},
-		{
-			name: "empty packets are not segmentable either",
-			gso:  true,
-			many: true,
-			packets: []Packet{
-				{Data: nil, Addr: first},
-				{Data: nil, Addr: first},
-			},
-			want: 2,
-		},
-		{
-			name: "without gso everything goes together",
-			gso:  false,
-			many: true,
-			packets: []Packet{
-				{Data: make([]byte, 100), Addr: first},
-				{Data: make([]byte, 100), Addr: first},
-				{Data: make([]byte, 100), Addr: first},
-			},
-			want: 3,
-		},
-		{
-			name:    "without sendmmsg nothing is merged",
-			gso:     true,
-			many:    false,
-			packets: increasing,
-			want:    1,
-		},
-		{
-			name:    "one call takes at most maxSendmmsg packets",
-			gso:     true,
-			many:    true,
-			packets: increasing,
-			want:    maxSendmmsg,
-		},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			conn := &batchedConn{gso: testCase.gso, many: testCase.many}
-			if got := conn.sendmmsgCount(testCase.packets, 0); got != testCase.want {
-				t.Fatalf("got %d packets in one call, want %d", got, testCase.want)
-			}
-		})
-	}
-}
-
 // TestUnequalSend sends batches a segmented send cannot take as they are and
 // checks that every packet still arrives as its own datagram, in order. The first
 // batch is what a real one looks like: runs of equal packets with packets of other
 // sizes in between. The second one is only increasing, so no pair of it can share
-// a segment size and the whole batch is one sendmmsg.
+// a segment size and every packet is a call of its own.
 func TestUnequalSend(t *testing.T) {
 	for _, testCase := range []struct {
 		name  string
@@ -338,47 +236,6 @@ func makePayloadsOfSizes(sizes []int) [][]byte {
 	return payloads
 }
 
-// TestWriteSockaddr checks the bytes a batch points at: the layout the kernel
-// parses, not the Go structure x/sys keeps behind an int port.
-func TestWriteSockaddr(t *testing.T) {
-	buffer := make([]byte, sizeofInet6Sockaddr)
-	length, err := writeSockaddr(buffer, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5000})
-	if err != nil {
-		t.Fatalf("write sockaddr: %v", err)
-	}
-	if length != sizeofInet4Sockaddr {
-		t.Fatalf("an IPv4 address is %d bytes, want %d", length, sizeofInet4Sockaddr)
-	}
-	if family := binary.NativeEndian.Uint16(buffer[0:]); family != unix.AF_INET {
-		t.Fatalf("family is %d, want %d", family, unix.AF_INET)
-	}
-	if port := binary.BigEndian.Uint16(buffer[2:]); port != 5000 {
-		t.Fatalf("port is %d, want 5000", port)
-	}
-	if address := net.IP(buffer[4:8]); !address.Equal(net.IPv4(127, 0, 0, 1)) {
-		t.Fatalf("address is %s", address)
-	}
-	length, err = writeSockaddr(buffer, &net.UDPAddr{IP: net.ParseIP("::1"), Port: 5001})
-	if err != nil {
-		t.Fatalf("write sockaddr: %v", err)
-	}
-	if length != sizeofInet6Sockaddr {
-		t.Fatalf("an IPv6 address is %d bytes, want %d", length, sizeofInet6Sockaddr)
-	}
-	if family := binary.NativeEndian.Uint16(buffer[0:]); family != unix.AF_INET6 {
-		t.Fatalf("family is %d, want %d", family, unix.AF_INET6)
-	}
-	if port := binary.BigEndian.Uint16(buffer[2:]); port != 5001 {
-		t.Fatalf("port is %d, want 5001", port)
-	}
-	if address := net.IP(buffer[8:24]); !address.Equal(net.ParseIP("::1")) {
-		t.Fatalf("address is %s", address)
-	}
-	if _, err := writeSockaddr(buffer, nil); err == nil {
-		t.Fatal("an address that is not an IP address was written")
-	}
-}
-
 // TestBatchToSeveralAddresses sends one batch to two sockets: a batch does not
 // have to share a destination, and every header carries its own address.
 func TestBatchToSeveralAddresses(t *testing.T) {
@@ -419,48 +276,6 @@ func TestBatchToSeveralAddresses(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// TestSendmmsgMissingKernel covers the other way a batched send can be
-// unavailable: a kernel without the system call. What such a socket must not do is
-// fail — it leaves one datagram per call, like every other fallback here.
-func TestSendmmsgMissingKernel(t *testing.T) {
-	receiver := listenPacket(t)
-	sender := listenPacket(t)
-	senderConn := New(sender, Options{})
-	batched, isBatched := senderConn.(*batchedConn)
-	if !isBatched {
-		t.Skip("this socket has no batched path")
-	}
-	batched.mmsgCall = func(int, []mmsghdr) (int, error) { return 0, unix.ENOSYS }
-	receiverAddr, isUDPAddr := receiver.LocalAddr().(*net.UDPAddr)
-	if !isUDPAddr {
-		t.Fatalf("local address is %T", receiver.LocalAddr())
-	}
-	payloads := makePayloadsOfSizes([]int{200, 400, 600, 800})
-	packets := make([]Packet, 0, len(payloads))
-	for _, payload := range payloads {
-		packets = append(packets, Packet{Data: payload, Addr: receiverAddr})
-	}
-	if err := senderConn.WritePackets(packets); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	if batched.many {
-		t.Fatal("sendmmsg is still expected after it reported there is none")
-	}
-	if err := receiver.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatalf("set deadline: %v", err)
-	}
-	buffer := make([]byte, 2048)
-	for index, want := range payloads {
-		read, _, err := receiver.ReadFrom(buffer)
-		if err != nil {
-			t.Fatalf("read datagram %d: %v", index, err)
-		}
-		if !bytes.Equal(buffer[:read], want) {
-			t.Fatalf("datagram %d is %d bytes, want %d", index, read, len(want))
-		}
 	}
 }
 

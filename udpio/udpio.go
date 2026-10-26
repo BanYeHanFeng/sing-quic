@@ -7,8 +7,6 @@
 //
 //   - UDP_SEGMENT (GSO) takes one buffer and cuts it into datagrams of a fixed
 //     size, so a run of equal packets leaves in one call.
-//   - sendmmsg takes several datagrams in one call whatever their sizes are, so
-//     what a segmented send cannot take leaves in one call too.
 //   - UDP_GRO hands several datagrams up in one buffer, so a run that arrived
 //     back to back is read once.
 //
