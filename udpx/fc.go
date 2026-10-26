@@ -15,17 +15,23 @@ package udpx
 // memory a receiver holds bounded by the windows rather than by how fast the peer
 // sends. A window is only moved when half of it has been read, so the two ends
 // exchange one update per half window instead of one per read.
+//
+// A window also grows, because half of a window that is too small for the path is
+// still too small. The evidence a receiver has is the peer spending the whole window
+// and nothing coming after it: what stopped the peer was this window and not the
+// path. The window is then doubled, up to a ceiling, and a stream window that grew
+// takes the association window with it — a receiver that moved its window forward by
+// reading is the only one that can tell, since moving it forward on arrival instead
+// would let the memory grow with the peer's speed rather than with the application's.
 const (
-	// initialStreamWindow is how much data one stream may have in flight before
-	// the receiver has to raise the window.
+	// initialStreamWindow is where the window of one stream starts: how much data
+	// it may have in flight before the receiver has to raise the window.
 	//
-	// The size is the ceiling a single stream cannot pass: a path that takes
-	// 200 ms per round trip carries one window per round trip, so 2 MiB is a
-	// little over 3 MiB/s for one stream and 40 MiB/s for a path of 50 ms. A
-	// smaller window is what kept a single stream at 0.6 MiB/s on that path, and
-	// the memory a larger one would cost is spent on nothing: what a receiver may
-	// hold in total is the association window below, whichever stream it belongs
-	// to.
+	// A path that takes 200 ms per round trip carries one window per round trip, so
+	// 2 MiB is a little over 3 MiB/s for one stream and 40 MiB/s for a path of
+	// 50 ms. A smaller window is what kept a single stream at 0.6 MiB/s on that
+	// path; a path that loses packets needs more than 2 MiB even when its round trip
+	// is short, and that is what the growth is for.
 	initialStreamWindow = 2 * 1024 * 1024
 
 	// initialConnectionWindow is how much data all streams together may have in
@@ -37,6 +43,20 @@ const (
 	// it.
 	initialConnectionWindow = 8 * 1024 * 1024
 
+	// maxStreamWindow is how far the window of one stream may grow.
+	//
+	// Growth stops here because a window costs memory the peer may fill before the
+	// application reads, and because the numbers on a slow path stop improving
+	// before it: 8 MiB is more than six times what a 200 ms path of 50 Mbit/s
+	// carries in a round trip, and the next doubling is spent on memory alone.
+	maxStreamWindow = 8 * 1024 * 1024
+
+	// maxConnectionWindow is how far the association window may grow: four stream
+	// windows, the ratio the two start in. The ratio is not a matter of taste —
+	// what arrived is counted against what was read plus this window, so a stream
+	// window that grew past it would leave one hole able to end the association.
+	maxConnectionWindow = 4 * maxStreamWindow
+
 	// maxStreams is how many streams an association may have open at once. It is
 	// a constant of the protocol rather than a number to negotiate: the number is
 	// what the receiver is willing to remember, and the sender has to stay inside
@@ -47,6 +67,16 @@ const (
 	// AcceptStream.
 	acceptStreamBacklog = 64
 )
+
+// growWindow is the size a window takes when the peer filled the one it had: twice
+// as large, or the ceiling. Doubling is what makes the path the limit again within a
+// few windows rather than within a few dozen.
+func growWindow(window, ceiling uint64) uint64 {
+	if window >= ceiling {
+		return window
+	}
+	return min(2*window, ceiling)
+}
 
 // credit is a send-side window: how much data may still be sent.
 type credit struct {

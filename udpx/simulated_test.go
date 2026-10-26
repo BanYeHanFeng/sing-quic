@@ -15,12 +15,18 @@ import (
 // point of sampling it is that the bound is a property of the transfer and not of
 // the moment it ended: an unbounded queue or an unbounded reassembly looks fine
 // again as soon as it is empty.
+//
+// The windows are part of it because the bounds are read as multiples of them: a
+// window grows while a transfer runs, and a bound that was a multiple of the window
+// it started with would be a bound on the wrong number.
 type transferBounds struct {
-	streams        int
-	inFlightBytes  int
-	queuedFrames   int
-	streamSegments int
-	reassembly     int
+	streams          int
+	inFlightBytes    int
+	queuedFrames     int
+	streamSegments   int
+	reassembly       int
+	streamWindow     uint64
+	connectionWindow uint64
 }
 
 // sampleBounds reads the state of one end, one lock at a time.
@@ -40,20 +46,27 @@ func sampleBounds(association *association) transferBounds {
 	association.datagramMu.Lock()
 	reassembly := association.defragger.bytes
 	association.datagramMu.Unlock()
+	association.fcMu.Lock()
+	connectionWindow := association.recvWindow
+	association.fcMu.Unlock()
 	streamSegments := 0
+	streamWindow := uint64(0)
 	for _, stream := range streams {
 		stream.recvMu.Lock()
 		for _, segment := range stream.segments {
 			streamSegments += len(segment.data)
 		}
+		streamWindow = max(streamWindow, stream.recvWindow)
 		stream.recvMu.Unlock()
 	}
 	return transferBounds{
-		streams:        len(streams),
-		inFlightBytes:  inFlightBytes,
-		queuedFrames:   queuedFrames,
-		streamSegments: streamSegments,
-		reassembly:     reassembly,
+		streams:          len(streams),
+		inFlightBytes:    inFlightBytes,
+		queuedFrames:     queuedFrames,
+		streamSegments:   streamSegments,
+		reassembly:       reassembly,
+		streamWindow:     streamWindow,
+		connectionWindow: connectionWindow,
 	}
 }
 
@@ -87,6 +100,8 @@ func startBoundsSampler(t *testing.T, associations ...Association) *boundsSample
 				sampler.worst.queuedFrames = max(sampler.worst.queuedFrames, bounds.queuedFrames)
 				sampler.worst.streamSegments = max(sampler.worst.streamSegments, bounds.streamSegments)
 				sampler.worst.reassembly = max(sampler.worst.reassembly, bounds.reassembly)
+				sampler.worst.streamWindow = max(sampler.worst.streamWindow, bounds.streamWindow)
+				sampler.worst.connectionWindow = max(sampler.worst.connectionWindow, bounds.connectionWindow)
 				sampler.mu.Unlock()
 			}
 		}
@@ -327,16 +342,16 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	if bounds.streams > maxStreams {
 		t.Errorf("%d streams were open at once", bounds.streams)
 	}
-	if bounds.inFlightBytes > 2*initialConnectionWindow {
-		t.Errorf("%d bytes were in flight at once", bounds.inFlightBytes)
+	if bounds.inFlightBytes > int(2*bounds.connectionWindow) {
+		t.Errorf("%d bytes were in flight at once, with a window of %d", bounds.inFlightBytes, bounds.connectionWindow)
 	}
 	// A stream may queue what its window allows, and the frames of the other
 	// stream and of the association go beside it.
-	if frames := bounds.queuedFrames; frames > 8*(initialStreamWindow/client.(*association).streamDataLen()) {
-		t.Errorf("%d frames were queued at once", frames)
+	if dataLen := client.(*association).streamDataLen(); bounds.queuedFrames > int(8*(max(bounds.streamWindow, initialStreamWindow)/uint64(dataLen))) {
+		t.Errorf("%d frames were queued at once, with a window of %d", bounds.queuedFrames, bounds.streamWindow)
 	}
-	if bounds.streamSegments > 2*initialStreamWindow {
-		t.Errorf("%d bytes were waiting to be read on the streams at once", bounds.streamSegments)
+	if bounds.streamSegments > int(2*bounds.streamWindow) {
+		t.Errorf("%d bytes were waiting to be read on the streams at once, with a window of %d", bounds.streamSegments, bounds.streamWindow)
 	}
 	if bounds.reassembly > maxDatagramReassemblyBytes {
 		t.Errorf("%d bytes of datagrams were reassembled at once", bounds.reassembly)

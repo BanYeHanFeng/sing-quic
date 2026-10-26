@@ -278,10 +278,14 @@ type association struct {
 	datagrams       chan Datagram
 
 	// fcMu guards the association window: what the peer allows this end to send,
-	// and what this end allows the peer to send.
+	// and what this end allows the peer to send. recvWindow is how large that
+	// credit is, which starts at initialConnectionWindow and doubles while the
+	// streams together are what fills it.
 	fcMu         sync.Mutex
 	sendCredit   credit
 	recvLimit    uint64
+	recvWindow   uint64
+	windowSpent  bool
 	recvRead     uint64
 	recvReceived uint64
 
@@ -325,6 +329,7 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		datagrams:    make(chan Datagram, datagramBacklog),
 		sendCredit:   credit{limit: initialConnectionWindow},
 		recvLimit:    initialConnectionWindow,
+		recvWindow:   initialConnectionWindow,
 		isClient:     isClient,
 		ownsConn:     ownsConn,
 	}

@@ -117,12 +117,15 @@ type Stream struct {
 	writeDeadline pipe.Deadline
 
 	// The recv half: data received out of order, how much was read, and the credit
-	// this end granted.
+	// this end granted. recvWindow is how large that credit is, which starts at
+	// initialStreamWindow and doubles while the peer is what fills it.
 	recvMu       sync.Mutex
 	segments     []recvSegment
 	readOffset   uint64
 	recvHighest  uint64
 	recvLimit    uint64
+	recvWindow   uint64
+	windowSpent  bool
 	finOffset    uint64
 	finReceived  bool
 	readDeadline pipe.Deadline
@@ -215,6 +218,7 @@ func newStream(association *association, id uint32, sendLimit uint64) *Stream {
 		id:            id,
 		sendCredit:    credit{limit: sendLimit},
 		recvLimit:     initialStreamWindow,
+		recvWindow:    initialStreamWindow,
 		writeDeadline: pipe.MakeDeadline(),
 		readDeadline:  pipe.MakeDeadline(),
 		done:          make(chan struct{}),
@@ -466,12 +470,17 @@ func (s *Stream) Read(p []byte) (int, error) {
 				s.segments[0] = segment
 			}
 			s.readOffset += uint64(read)
-			limit, moved := s.windowMoved()
+			limit, window, moved := s.windowMoved()
 			s.recvMu.Unlock()
+			// What was read is counted before the windows move, so that the
+			// association window a stream asks for is measured from where this
+			// read left it.
+			s.association.dataRead(read)
 			if moved {
 				_ = s.association.send(appendMaxStreamData(nil, s.id, limit))
+				// A stream window that grew takes the association window with it.
+				s.association.raiseRecvWindow(4 * window)
 			}
-			s.association.dataRead(read)
 			s.endIfDone()
 			return read, nil
 		}
@@ -573,6 +582,11 @@ func (s *Stream) push(offset uint64, data []byte, fin bool) (int, error) {
 	if end > s.recvHighest {
 		received = int(end - s.recvHighest)
 		s.recvHighest = end
+	}
+	// Everything the peer was allowed to send arrived: the window is where it
+	// stopped, which is what says a larger one would let it go further.
+	if s.recvHighest >= s.recvLimit {
+		s.windowSpent = true
 	}
 	if len(data) > 0 && end > s.readOffset {
 		if offset < s.readOffset {
@@ -683,13 +697,21 @@ func (s *Stream) insertSegment(segment recvSegment) {
 }
 
 // windowMoved reports whether the window this end granted has to be moved forward,
-// and to where. The caller holds recvMu.
-func (s *Stream) windowMoved() (uint64, bool) {
-	if s.recvLimit-s.readOffset > initialStreamWindow/2 {
-		return 0, false
+// to where, and how large it is now. The caller holds recvMu.
+//
+// A window the peer spent is doubled as it moves: half of a window that is too small
+// for the path is still too small, and the window is the one thing a receiver can
+// move that the peer cannot move itself.
+func (s *Stream) windowMoved() (uint64, uint64, bool) {
+	if s.recvLimit-s.readOffset > s.recvWindow/2 {
+		return 0, s.recvWindow, false
 	}
-	s.recvLimit = s.readOffset + initialStreamWindow
-	return s.recvLimit, true
+	if s.windowSpent {
+		s.windowSpent = false
+		s.recvWindow = growWindow(s.recvWindow, maxStreamWindow)
+	}
+	s.recvLimit = s.readOffset + s.recvWindow
+	return s.recvLimit, s.recvWindow, true
 }
 
 // signalSend wakes the writer: credit moved forward, or the stream ended.
@@ -906,15 +928,39 @@ func (a *association) takeConnectionCredit(n uint64) {
 }
 
 // dataRead records bytes handed to an application and moves the association window
-// forward once half of it was read.
+// forward once half of it was read. A window the peer spent is doubled as it moves,
+// for the same reason as on a stream: the association window is what several streams
+// share, so it has to follow them when one of them grew.
 func (a *association) dataRead(n int) {
 	a.fcMu.Lock()
 	a.recvRead += uint64(n)
-	if a.recvLimit-a.recvRead > initialConnectionWindow/2 {
+	if a.recvLimit-a.recvRead > a.recvWindow/2 {
 		a.fcMu.Unlock()
 		return
 	}
-	a.recvLimit = a.recvRead + initialConnectionWindow
+	if a.windowSpent {
+		a.windowSpent = false
+		a.recvWindow = growWindow(a.recvWindow, maxConnectionWindow)
+	}
+	a.recvLimit = a.recvRead + a.recvWindow
+	limit := a.recvLimit
+	a.fcMu.Unlock()
+	_ = a.send(appendMaxData(nil, limit))
+}
+
+// raiseRecvWindow moves the association window forward to at least want, which is
+// what a stream that grew asks for: four streams of the largest stream window fill
+// it, so a stream window left larger than a quarter of it would let one hole end the
+// association — what arrived is counted against what was read plus this window.
+func (a *association) raiseRecvWindow(want uint64) {
+	want = min(want, maxConnectionWindow)
+	a.fcMu.Lock()
+	if want <= a.recvWindow {
+		a.fcMu.Unlock()
+		return
+	}
+	a.recvWindow = want
+	a.recvLimit = a.recvRead + a.recvWindow
 	limit := a.recvLimit
 	a.fcMu.Unlock()
 	_ = a.send(appendMaxData(nil, limit))
@@ -931,6 +977,11 @@ func (a *association) dataReceived(n int) error {
 	a.recvReceived += uint64(n)
 	if a.recvReceived > a.recvLimit {
 		return E.New("association received ", a.recvReceived, " bytes beyond its window ", a.recvLimit)
+	}
+	// Everything the streams together were allowed to send arrived, so the
+	// association window and not the path is what the peer ran out of.
+	if a.recvReceived >= a.recvLimit {
+		a.windowSpent = true
 	}
 	return nil
 }
