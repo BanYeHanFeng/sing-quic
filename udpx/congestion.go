@@ -61,9 +61,26 @@ func (s *rttSnapshot) LatestRTT() time.Duration {
 	return s.latest
 }
 
+// initialCongestionWindowPackets is how much an association may have in flight
+// before the path has said anything about itself.
+//
+// It is not the controller's default (32 packets) because the first window is not
+// a property of the algorithm: it is what the path can hold and what the peer has
+// room for, and this end knows both. The ramp from 46 KB costs a round trip per
+// doubling, which on a path with capacity is worth 19 to 25 percent of a sixteen
+// megabyte transfer; 128 packets is 186 KB, well inside the 2 MiB a stream starts
+// with. What a larger first window costs is the burst it arrives as: on loopback,
+// where the bandwidth-delay product is a few packets, ten megabytes through a FEC
+// sender are 5 percent slower and everything else is unchanged.
+const initialCongestionWindowPackets = 128
+
 // newCongestionController builds the controller of an association.
 func newCongestionController(options Options) congestion.Controller {
-	return congestion.NewBbrController(congestion.ByteCount(maxPacketSize), options.Congestion)
+	return congestion.NewBbrControllerWithInitialWindow(
+		congestion.ByteCount(maxPacketSize),
+		options.Congestion,
+		int64(options.InitialCongestionWindow),
+	)
 }
 
 // congestionCharged is what the window is asked about: what is in flight, plus

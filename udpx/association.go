@@ -114,6 +114,11 @@ type Options struct {
 	// is the conservative one.
 	Congestion congestion.Profile
 
+	// InitialCongestionWindow is how many packets the congestion window holds
+	// before the path has said anything about itself. Zero means the default
+	// (initialCongestionWindowPackets).
+	InitialCongestionWindow int
+
 	// FEC is the forward error correction applied to what this end sends. It
 	// protects one direction only, so an association that should survive a lossy
 	// path in both directions sets it on both ends.
@@ -153,6 +158,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.Congestion == (congestion.Profile{}) {
 		o.Congestion = congestion.ProfileConservative
+	}
+	if o.InitialCongestionWindow <= 0 {
+		o.InitialCongestionWindow = initialCongestionWindowPackets
 	}
 	return o
 }

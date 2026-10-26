@@ -52,3 +52,22 @@ func TestCongestionWindowBounds(t *testing.T) {
 		t.Fatal("nothing was in flight")
 	}
 }
+
+// TestInitialCongestionWindow requires the transport to hand the controller the
+// window it was told to use rather than the controller's own default. The first
+// window is what the peer was told to expect and what the path can take, both of
+// which are known here and neither of which is known in the controller.
+func TestInitialCongestionWindow(t *testing.T) {
+	for _, test := range []struct {
+		option int
+		window int
+	}{
+		{option: 0, window: initialCongestionWindowPackets * maxPacketSize},
+		{option: 64, window: 64 * maxPacketSize},
+	} {
+		controller := newCongestionController(Options{InitialCongestionWindow: test.option}.withDefaults())
+		if window := int(controller.GetCongestionWindow()); window != test.window {
+			t.Errorf("initial window of %d bytes for %d packets asked for, want %d", window, test.option, test.window)
+		}
+	}
+}
