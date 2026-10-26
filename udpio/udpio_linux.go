@@ -311,7 +311,8 @@ func (c *batchedConn) sendMany(packets []Packet) error {
 			c.messages, c.iovs = c.messages[:0], c.iovs[:0]
 			return err
 		}
-		c.iovs[index] = unix.Iovec{Base: unsafe.SliceData(packet.Data), Len: uint64(len(packet.Data))}
+		c.iovs[index] = unix.Iovec{Base: unsafe.SliceData(packet.Data)}
+		c.iovs[index].SetLen(len(packet.Data))
 		c.messages[index] = mmsghdr{header: unix.Msghdr{
 			Name:    &names[start],
 			Namelen: uint32(nameLen),
