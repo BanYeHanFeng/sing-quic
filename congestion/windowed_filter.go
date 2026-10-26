@@ -1,10 +1,6 @@
 package congestion
 
-import (
-	"cmp"
-
-	"golang.org/x/exp/constraints"
-)
+import "cmp"
 
 // Implements Kathleen Nichols' algorithm for tracking the minimum (or maximum)
 // estimate of a stream of samples over some fixed time interval. (E.g.,
@@ -32,24 +28,16 @@ import (
 // turn is replaced by the third best. The newest sample replaces the third
 // best.
 
-type WindowedFilterValue interface {
-	any
-}
-
-type WindowedFilterTime interface {
-	constraints.Integer | constraints.Float
-}
-
-type WindowedFilter[V WindowedFilterValue, T WindowedFilterTime] struct {
+type WindowedFilter[V any] struct {
 	// Time length of window.
-	windowLength T
-	estimates    []entry[V, T]
+	windowLength roundTripCount
+	estimates    []entry[V]
 	comparator   func(V, V) int
 }
 
-type entry[V WindowedFilterValue, T WindowedFilterTime] struct {
+type entry[V any] struct {
 	sample V
-	time   T
+	time   roundTripCount
 }
 
 // Compares two values and returns true if the first is greater than or equal
@@ -74,34 +62,34 @@ func MinFilter[O cmp.Ordered](a, b O) int {
 	return 0
 }
 
-func NewWindowedFilter[V WindowedFilterValue, T WindowedFilterTime](windowLength T, comparator func(V, V) int) *WindowedFilter[V, T] {
-	return &WindowedFilter[V, T]{
+func NewWindowedFilter[V any](windowLength roundTripCount, comparator func(V, V) int) *WindowedFilter[V] {
+	return &WindowedFilter[V]{
 		windowLength: windowLength,
-		estimates:    make([]entry[V, T], 3),
+		estimates:    make([]entry[V], 3),
 		comparator:   comparator,
 	}
 }
 
 // Changes the window length.  Does not update any current samples.
-func (f *WindowedFilter[V, T]) SetWindowLength(windowLength T) {
+func (f *WindowedFilter[V]) SetWindowLength(windowLength roundTripCount) {
 	f.windowLength = windowLength
 }
 
-func (f *WindowedFilter[V, T]) GetBest() V {
+func (f *WindowedFilter[V]) GetBest() V {
 	return f.estimates[0].sample
 }
 
-func (f *WindowedFilter[V, T]) GetSecondBest() V {
+func (f *WindowedFilter[V]) GetSecondBest() V {
 	return f.estimates[1].sample
 }
 
-func (f *WindowedFilter[V, T]) GetThirdBest() V {
+func (f *WindowedFilter[V]) GetThirdBest() V {
 	return f.estimates[2].sample
 }
 
 // Updates best estimates with |sample|, and expires and updates best
 // estimates as necessary.
-func (f *WindowedFilter[V, T]) Update(newSample V, newTime T) {
+func (f *WindowedFilter[V]) Update(newSample V, newTime roundTripCount) {
 	// Reset all estimates if they have not yet been initialized, if new sample
 	// is a new best, or if the newest recorded estimate is too old.
 	if f.comparator(f.estimates[0].sample, *new(V)) == 0 ||
@@ -112,10 +100,10 @@ func (f *WindowedFilter[V, T]) Update(newSample V, newTime T) {
 	}
 
 	if f.comparator(newSample, f.estimates[1].sample) >= 0 {
-		f.estimates[1] = entry[V, T]{newSample, newTime}
+		f.estimates[1] = entry[V]{newSample, newTime}
 		f.estimates[2] = f.estimates[1]
 	} else if f.comparator(newSample, f.estimates[2].sample) >= 0 {
-		f.estimates[2] = entry[V, T]{newSample, newTime}
+		f.estimates[2] = entry[V]{newSample, newTime}
 	}
 
 	// Expire and update estimates as necessary.
@@ -124,7 +112,7 @@ func (f *WindowedFilter[V, T]) Update(newSample V, newTime T) {
 		// second and third best estimates.
 		f.estimates[0] = f.estimates[1]
 		f.estimates[1] = f.estimates[2]
-		f.estimates[2] = entry[V, T]{newSample, newTime}
+		f.estimates[2] = entry[V]{newSample, newTime}
 		// Need to iterate one more time. Check if the new best estimate is
 		// outside the window as well, since it may also have been recorded a
 		// long time ago. Don't need to iterate once more since we cover that
@@ -139,7 +127,7 @@ func (f *WindowedFilter[V, T]) Update(newSample V, newTime T) {
 		newTime-f.estimates[1].time > f.windowLength/4 {
 		// A quarter of the window has passed without a better sample, so the
 		// second-best estimate is taken from the second quarter of the window.
-		f.estimates[1] = entry[V, T]{newSample, newTime}
+		f.estimates[1] = entry[V]{newSample, newTime}
 		f.estimates[2] = f.estimates[1]
 		return
 	}
@@ -148,17 +136,17 @@ func (f *WindowedFilter[V, T]) Update(newSample V, newTime T) {
 		newTime-f.estimates[2].time > f.windowLength/2 {
 		// We've passed a half of the window without a better estimate, so take
 		// a third-best estimate from the second half of the window.
-		f.estimates[2] = entry[V, T]{newSample, newTime}
+		f.estimates[2] = entry[V]{newSample, newTime}
 	}
 }
 
 // Resets all estimates to new sample.
-func (f *WindowedFilter[V, T]) Reset(newSample V, newTime T) {
-	f.estimates[2] = entry[V, T]{newSample, newTime}
+func (f *WindowedFilter[V]) Reset(newSample V, newTime roundTripCount) {
+	f.estimates[2] = entry[V]{newSample, newTime}
 	f.estimates[1] = f.estimates[2]
 	f.estimates[0] = f.estimates[1]
 }
 
-func (f *WindowedFilter[V, T]) Clear() {
-	f.estimates = make([]entry[V, T], 3)
+func (f *WindowedFilter[V]) Clear() {
+	f.estimates = make([]entry[V], 3)
 }
