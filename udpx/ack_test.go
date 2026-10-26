@@ -308,6 +308,31 @@ func TestAckDelayBudget(t *testing.T) {
 	}
 }
 
+// TestAckDelay requires the delay an acknowledgement waits to follow the round
+// trip, so that a sender whose window holds fewer packets than the threshold is
+// not left idle for a delay that only a slow path can afford.
+func TestAckDelay(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		rtt      time.Duration
+		measured bool
+		expected time.Duration
+	}{
+		{name: "unmeasured", expected: maxAckDelay},
+		{name: "long path", rtt: 200 * time.Millisecond, measured: true, expected: maxAckDelay},
+		{name: "short path", rtt: 80 * time.Millisecond, measured: true, expected: 10 * time.Millisecond},
+		{name: "local", rtt: 200 * time.Microsecond, measured: true, expected: minAckDelay},
+	} {
+		var association association
+		association.rtt.sampled = testCase.measured
+		association.rtt.smoothed = testCase.rtt
+		delay := association.ackDelay()
+		if delay != testCase.expected {
+			t.Fatalf("%s: a round trip of %v waits %v, expected %v", testCase.name, testCase.rtt, delay, testCase.expected)
+		}
+	}
+}
+
 func TestRTTEstimator(t *testing.T) {
 	var estimator rttEstimator
 	estimator.sample(100 * time.Millisecond)

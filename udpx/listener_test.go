@@ -330,6 +330,12 @@ func TestAcknowledgementOverSocket(t *testing.T) {
 	if elapsed > maxAckDelay+500*time.Millisecond {
 		t.Fatalf("a single packet was acknowledged after %v", elapsed)
 	}
+	// The path answered, so from now on the delay an acknowledgement may wait is
+	// the one this path can afford rather than the one a slow path is allowed.
+	roundTrip, _ := clientAssociation.roundTrip()
+	if delay := clientAssociation.ackDelay(); delay >= maxAckDelay {
+		t.Fatalf("a path with a round trip of %v waits %v for an acknowledgement", roundTrip, delay)
+	}
 
 	time.Sleep(3 * maxAckDelay)
 	roundTrip, sampled := serverAssociation.roundTrip()

@@ -492,7 +492,26 @@ func (a *association) scheduleAck(packetNumber uint32, now time.Time) {
 		}
 		return
 	}
-	a.ackTimer.Reset(maxAckDelay)
+	a.ackTimer.Reset(a.ackDelay())
+}
+
+// ackDelay is how long an acknowledgement waits for the packet that would reach
+// the threshold: an eighth of the round trip, so that what the wait costs is a
+// fraction of it.
+//
+// The delay is what a sender waits for when its window holds fewer packets than
+// the threshold, and that wait is on top of the round trip the sender needs to
+// spend the window. A constant delay is therefore a constant multiple of the
+// round trip on a fast path: a millisecond path whose window holds fewer packets
+// than the threshold sends that many and then idles for twenty-five round trips.
+// On a path long enough for the cap to be the smaller term the delay is the cap,
+// which is what the loss timer accounts for.
+func (a *association) ackDelay() time.Duration {
+	rtt, measured := a.roundTrip()
+	if !measured {
+		return maxAckDelay
+	}
+	return min(maxAckDelay, max(minAckDelay, rtt/8))
 }
 
 // flushAck sends the acknowledgement the delay was waiting for.

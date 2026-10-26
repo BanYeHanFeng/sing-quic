@@ -41,7 +41,16 @@ const (
 	// what arrived, and a run of eight of them costs one range.
 	ackThreshold = 8
 
-	// maxAckDelay is how long an acknowledgement may wait for a second packet.
+	// minAckDelay is the shortest time an acknowledgement may wait for another
+	// packet. A delay below the time a batch takes to arrive answers batches that
+	// are still being assembled, which is the cost the threshold exists to avoid:
+	// on loopback a floor of a millisecond left one transfer in five in a steady
+	// state at half the throughput, and a floor of four milliseconds left none of
+	// thirty-four there.
+	minAckDelay = 4 * time.Millisecond
+
+	// maxAckDelay is how long an acknowledgement may wait for another packet on a
+	// path long enough for the round trip to be the larger term.
 	maxAckDelay = 25 * time.Millisecond
 
 	// ackDelayLimit is the largest delay an acknowledgement can report, as the
