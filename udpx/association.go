@@ -43,6 +43,12 @@ type Association interface {
 	// the account of a connection it just accepted, and a client to know which
 	// of its credentials was used.
 	KeyID() [keyIDLen]byte
+	// Offload reports whether this end batches in each direction: segmentation
+	// on send and merged reads on receive. It is here because the batching is
+	// decided by what the socket underneath is, and the decision is silent: a
+	// socket wrapped in something that hides its descriptor moves one datagram
+	// per call, and nothing about that is visible from anywhere else.
+	Offload() (gso, gro bool)
 	// SendDatagram sends one message to the peer on a channel of the caller's
 	// choosing. The message is not retransmitted: a datagram is a datagram.
 	SendDatagram(channel uint32, data []byte) error
@@ -331,6 +337,10 @@ func (a *association) Context() context.Context {
 
 func (a *association) KeyID() [keyIDLen]byte {
 	return a.keyID
+}
+
+func (a *association) Offload() (gso, gro bool) {
+	return a.batchIO.Offload()
 }
 
 func (a *association) CloseWithError(err error) error {
