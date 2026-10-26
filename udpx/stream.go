@@ -102,10 +102,50 @@ func (e StreamResetError) Is(target error) bool {
 	return e.Code == 0 && target == net.ErrClosed
 }
 
-// recvSegment is a piece of a stream that arrived but was not read yet.
+// recvSegment is a piece of a stream that arrived but was not read yet. Segments are
+// kept apart rather than folded into one buffer: folding means copying everything
+// already received every time data arrives in order, which on a bulk transfer is the
+// whole window copied again and again.
 type recvSegment struct {
 	data   []byte
 	offset uint64
+	// buffer is what data is a window into. A segment is read from its front, so what
+	// is left of it has to know which slice to hand back once it is empty.
+	buffer []byte
+}
+
+// recvSegmentPool recycles the buffers segments are copied into. A receiver of bulk
+// data takes one buffer per packet, and a receiver that allocates them instead spends
+// more time collecting garbage than copying: a gigabyte of transfer would be a
+// gigabyte of garbage, freed as fast as it is made.
+var recvSegmentPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, maxPacketSize)
+		return &buffer
+	},
+}
+
+// storeSegment copies a run of received bytes into a buffer of its own, because the
+// buffer the packet was read into is the next packet's buffer as well.
+func (s *Stream) storeSegment(offset uint64, data []byte) {
+	var buffer []byte
+	if len(data) <= maxPacketSize {
+		pooled := recvSegmentPool.Get().(*[]byte)
+		buffer = (*pooled)[:len(data)]
+	} else {
+		buffer = make([]byte, len(data))
+	}
+	copy(buffer, data)
+	s.insertSegment(recvSegment{data: buffer, offset: offset, buffer: buffer})
+}
+
+// releaseSegment hands a buffer back once nothing reads from it any more.
+func releaseSegment(segment recvSegment) {
+	if cap(segment.buffer) != maxPacketSize {
+		return
+	}
+	buffer := segment.buffer[:maxPacketSize]
+	recvSegmentPool.Put(&buffer)
 }
 
 func newStream(association *association, id uint32, sendLimit uint64) *Stream {
@@ -290,16 +330,25 @@ func (s *Stream) Read(p []byte) (int, error) {
 		// Only data that starts where the last read ended is handed out: a hole
 		// means the bytes behind it wait, however much of them already arrived.
 		if len(s.segments) > 0 && s.segments[0].offset == s.readOffset {
-			segment := s.segments[0]
-			read := copy(p, segment.data)
-			s.readOffset += uint64(read)
-			// The segment moves with the read, so that a segment always covers the
-			// offset the stream was read to and the next read can take it.
-			s.segments[0].data = segment.data[read:]
-			s.segments[0].offset = s.readOffset
-			if len(s.segments[0].data) == 0 {
-				s.segments = s.segments[1:]
+			// A read takes everything that follows the last one, which is several
+			// segments when the data arrived in packets smaller than the caller's
+			// buffer. Each segment moves with the read, so that a segment always
+			// covers the offset the stream was read to.
+			read := 0
+			for read < len(p) && len(s.segments) > 0 && s.segments[0].offset == s.readOffset+uint64(read) {
+				segment := s.segments[0]
+				copied := copy(p[read:], segment.data)
+				read += copied
+				segment.data = segment.data[copied:]
+				segment.offset += uint64(copied)
+				if len(segment.data) == 0 {
+					releaseSegment(segment)
+					s.segments = s.segments[1:]
+					continue
+				}
+				s.segments[0] = segment
 			}
+			s.readOffset += uint64(read)
 			limit, moved := s.windowMoved()
 			s.recvMu.Unlock()
 			if moved {
@@ -354,6 +403,7 @@ func (s *Stream) discardUnread() {
 	dropped := 0
 	for _, segment := range s.segments {
 		dropped += len(segment.data)
+		releaseSegment(segment)
 	}
 	s.segments = nil
 	s.recvMu.Unlock()
@@ -414,7 +464,7 @@ func (s *Stream) push(offset uint64, data []byte, fin bool) (int, error) {
 			data = data[s.readOffset-offset:]
 			offset = s.readOffset
 		}
-		s.insertSegment(recvSegment{offset: offset, data: append([]byte(nil), data...)})
+		s.storeSegment(offset, data)
 	}
 	if fin {
 		// The end of the stream is an offset like any other: a FIN that arrives
@@ -460,32 +510,55 @@ func (s *Stream) finQueued() bool {
 // by offset and free of overlaps so that reading is a matter of taking whatever
 // starts where the last read ended. The caller holds recvMu.
 func (s *Stream) insertSegment(segment recvSegment) {
+	// Data that arrives in order goes at the end, which is the case that matters:
+	// the list would otherwise be scanned from its front for every packet.
+	if count := len(s.segments); count > 0 {
+		last := s.segments[count-1]
+		if last.offset+uint64(len(last.data)) <= segment.offset {
+			s.segments = append(s.segments, segment)
+			return
+		}
+	}
 	end := segment.offset + uint64(len(segment.data))
 	index := 0
 	for index < len(s.segments) && s.segments[index].offset < segment.offset {
 		index++
 	}
-	// Fold in every segment the new one reaches into or touches.
-	for index < len(s.segments) && s.segments[index].offset <= end {
-		overlapped := s.segments[index]
-		overlappedEnd := overlapped.offset + uint64(len(overlapped.data))
-		if overlappedEnd > end {
-			segment.data = append(segment.data, overlapped.data[end-overlapped.offset:]...)
-			end = overlappedEnd
-		}
-		s.segments = append(s.segments[:index], s.segments[index+1:]...)
-	}
-	// The segment in front of it may reach into the new one, which is what a
-	// retransmission that overlaps what is already stored looks like.
+	// What a retransmission repeats is dropped rather than folded in: the bytes are
+	// the same ones, and one copy of them is enough.
 	if index > 0 {
-		previous := &s.segments[index-1]
+		previous := s.segments[index-1]
 		previousEnd := previous.offset + uint64(len(previous.data))
-		if previousEnd >= segment.offset {
-			if end > previousEnd {
-				previous.data = append(previous.data, segment.data[previousEnd-segment.offset:]...)
+		if previousEnd > segment.offset {
+			skip := previousEnd - segment.offset
+			if skip >= uint64(len(segment.data)) {
+				releaseSegment(segment)
+				return
 			}
-			return
+			segment.data = segment.data[skip:]
+			segment.offset = previousEnd
 		}
+	}
+	for index < len(s.segments) {
+		following := s.segments[index]
+		if following.offset >= end {
+			break
+		}
+		followingEnd := following.offset + uint64(len(following.data))
+		if followingEnd <= end {
+			// Wholly covered by the new segment, so the bytes are the same ones.
+			releaseSegment(following)
+			s.segments = append(s.segments[:index], s.segments[index+1:]...)
+			continue
+		}
+		// Half covered: keep the new one up to where the stored one starts.
+		segment.data = segment.data[:following.offset-segment.offset]
+		end = following.offset
+		break
+	}
+	if len(segment.data) == 0 {
+		releaseSegment(segment)
+		return
 	}
 	s.segments = append(s.segments, recvSegment{})
 	copy(s.segments[index+1:], s.segments[index:])
