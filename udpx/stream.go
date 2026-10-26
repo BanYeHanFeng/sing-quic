@@ -48,8 +48,9 @@ type Stream struct {
 	// The send half: data the application wrote, the offset it goes to, and the
 	// credit the peer granted for it.
 	sendMu        sync.Mutex
-	sendBuffer    []byte
+	sendChunks    [][]byte
 	sendOffset    uint64
+	sendFramed    uint64
 	sendCredit    credit
 	closeWrite    bool
 	finSent       bool
@@ -238,7 +239,10 @@ func (s *Stream) queueData(p []byte) (int, error) {
 	}
 	s.sendCredit.take(allowed)
 	s.association.takeConnectionCredit(allowed)
-	s.sendBuffer = append(s.sendBuffer, p[:allowed]...)
+	// One copy per write, into a chunk of its own: appending to one long buffer
+	// would copy what is left of it every time a frame leaves the front, which is
+	// per packet rather than per write.
+	s.sendChunks = append(s.sendChunks, append([]byte(nil), p[:allowed]...))
 	s.sendOffset += allowed
 	return int(allowed), nil
 }
@@ -267,10 +271,16 @@ func (s *Stream) sendQueued() error {
 		}
 		s.sendMu.Lock()
 		var frame []byte
-		if len(s.sendBuffer) > 0 {
-			length := min(len(s.sendBuffer), s.association.streamDataLen())
-			frame = appendStream(nil, s.id, s.sendOffset-uint64(len(s.sendBuffer)), false, s.sendBuffer[:length])
-			s.sendBuffer = s.sendBuffer[length:]
+		if len(s.sendChunks) > 0 {
+			head := s.sendChunks[0]
+			length := min(len(head), s.association.streamDataLen())
+			frame = appendStream(nil, s.id, s.sendFramed, false, head[:length])
+			s.sendFramed += uint64(length)
+			if length < len(head) {
+				s.sendChunks[0] = head[length:]
+			} else {
+				s.sendChunks = s.sendChunks[1:]
+			}
 		} else if s.closeWrite && !s.finSent {
 			// The FIN carries the offset the data ends at, so it does not have to
 			// wait for anything else, only for the data before it to be framed.
@@ -388,7 +398,7 @@ func (s *Stream) end(cause error) {
 	close(s.done)
 	s.endMu.Unlock()
 	s.sendMu.Lock()
-	s.sendBuffer = nil
+	s.sendChunks = nil
 	s.sendMu.Unlock()
 	s.signalSend()
 	s.signalRecv()
