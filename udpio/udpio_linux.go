@@ -86,12 +86,10 @@ func newBatched(conn net.PacketConn, options Options) Conn {
 	err = raw.Control(func(fd uintptr) {
 		setBuffer(int(fd), unix.SO_RCVBUF, unix.SO_RCVBUFFORCE, desiredReceiveBuffer)
 		setBuffer(int(fd), unix.SO_SNDBUF, unix.SO_SNDBUFFORCE, desiredSendBuffer)
-		if !options.DisableGSO {
-			// A kernel that does not know UDP_SEGMENT answers with an error,
-			// which is the whole capability check.
-			_, gsoErr := unix.GetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_SEGMENT)
-			gso = gsoErr == nil
-		}
+		// A kernel that does not know UDP_SEGMENT answers with an error, which
+		// is the whole capability check.
+		_, gsoErr := unix.GetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_SEGMENT)
+		gso = gsoErr == nil
 		if options.GRO {
 			gro = unix.SetsockoptInt(int(fd), unix.IPPROTO_UDP, udpGRO, 1) == nil
 		}

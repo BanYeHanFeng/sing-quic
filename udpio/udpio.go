@@ -87,10 +87,6 @@ type Options struct {
 	// changes what ReadPackets returns, so it is off by default: a caller that
 	// does not split the result by Segments would read several datagrams as one.
 	GRO bool
-
-	// DisableGSO keeps the send path one datagram per call. It exists for tests
-	// and for a caller that has already seen segmentation fail on this socket.
-	DisableGSO bool
 }
 
 // New wraps a packet socket. It reports what the socket can do through Offload
