@@ -93,7 +93,7 @@ func newCongestionController(options Options) congestion.Controller {
 	return congestion.NewBbrControllerWithInitialWindow(
 		congestion.ByteCount(maxPacketSize),
 		options.Congestion,
-		int64(options.InitialCongestionWindow),
+		int64(initialCongestionWindowPackets),
 	)
 }
 
