@@ -1,7 +1,5 @@
 package congestion
 
-import ()
-
 // packetNumberIndexedQueue is a queue of mostly continuous numbered entries
 // which supports the following operations:
 // - adding elements to the end of the queue, or at some point past the end
