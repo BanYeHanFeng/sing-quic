@@ -115,9 +115,7 @@ func (q *frameQueue) takeAckOnly(budget int) []outFrame {
 	if count == 0 {
 		return nil
 	}
-	taken := q.frames[:count:count]
-	q.frames = q.frames[count:]
-	return taken
+	return q.takePrefix(count)
 }
 
 // take removes and returns the frames that fit in budget bytes. A frame that
@@ -138,8 +136,23 @@ func (q *frameQueue) take(budget int) []outFrame {
 	if count == 0 {
 		return nil
 	}
+	return q.takePrefix(count)
+}
+
+// takePrefix removes the first count frames and returns them.
+//
+// The array they live in is not written to again where they were: a frame that
+// left the queue is what a packet in flight carries and what a retransmission
+// sends, so it has to stay readable for as long as that packet is out. An empty
+// queue therefore drops its array instead of starting over at its front, which is
+// also what keeps the array from growing for the length of a whole transfer: it is
+// written from its front once and only the frames of one flush are ever in it.
+func (q *frameQueue) takePrefix(count int) []outFrame {
 	taken := q.frames[:count:count]
 	q.frames = q.frames[count:]
+	if len(q.frames) == 0 {
+		q.frames = nil
+	}
 	return taken
 }
 
