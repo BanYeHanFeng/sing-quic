@@ -318,9 +318,37 @@ func NewBbrSenderWithProfile(
 	initialMaxDatagramSize ByteCount,
 	profile Profile,
 ) *bbrSender {
+	return NewBbrSenderWithInitialWindow(
+		initialMaxDatagramSize,
+		profile,
+		initialCongestionWindowPackets,
+	)
+}
+
+// NewBbrSenderWithInitialWindow builds a sender whose window starts at
+// initialWindowPackets packets. Zero or less asks for the default.
+//
+// The first window is the caller's answer, not the algorithm's: how much may leave
+// before the path has said anything about itself is the path's bandwidth-delay
+// product and the room the peer is holding, and a transport that knows either of
+// them knows more about it than a constant here does. Raising it shortens the
+// ramp at the start of a transfer by a round trip per doubling; the cost is that
+// the first window arrives as one burst, so it is bounded by what the peer was
+// told to expect.
+func NewBbrSenderWithInitialWindow(
+	initialMaxDatagramSize ByteCount,
+	profile Profile,
+	initialWindowPackets int64,
+) *bbrSender {
+	if initialWindowPackets <= 0 {
+		initialWindowPackets = initialCongestionWindowPackets
+	}
+	if initialWindowPackets < minCongestionWindowPackets {
+		initialWindowPackets = minCongestionWindowPackets
+	}
 	return newBbrSender(
 		initialMaxDatagramSize,
-		initialCongestionWindowPackets*initialMaxDatagramSize,
+		ByteCount(initialWindowPackets)*initialMaxDatagramSize,
 		MaxCongestionWindowPackets*initialMaxDatagramSize,
 		profile,
 	)

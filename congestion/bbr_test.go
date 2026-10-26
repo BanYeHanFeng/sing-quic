@@ -134,3 +134,27 @@ func TestBbrWindowFallsOnLoss(t *testing.T) {
 		t.Fatalf("window of %d after the path recovered from %d", window, recovered)
 	}
 }
+
+// TestBbrInitialWindowIsTheCallers requires the first window to be what the caller
+// asked for and nothing else. The window a transfer starts with is what a path with
+// room is measured against: every doubling from there costs a round trip, which is
+// why the transport, and not this package, decides it.
+func TestBbrInitialWindowIsTheCallers(t *testing.T) {
+	for _, test := range []struct {
+		packets int64
+		window  ByteCount
+	}{
+		{packets: 0, window: initialCongestionWindowPackets * testDatagramSize},
+		{packets: 128, window: 128 * testDatagramSize},
+		{packets: 2, window: minCongestionWindowPackets * testDatagramSize},
+	} {
+		sender := NewBbrSenderWithInitialWindow(testDatagramSize, ProfileConservative, test.packets)
+		window := sender.GetCongestionWindow()
+		if window != test.window {
+			t.Errorf("window of %d for %d packets asked for, want %d", window, test.packets, test.window)
+		}
+		if floor := sender.minCongestionWindow; window < floor {
+			t.Errorf("window of %d under the floor of %d", window, floor)
+		}
+	}
+}

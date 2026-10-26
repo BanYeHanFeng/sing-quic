@@ -83,3 +83,9 @@ type RTTStatsProvider interface {
 func NewBbrController(initialMaxDatagramSize ByteCount, profile Profile) Controller {
 	return NewBbrSenderWithProfile(initialMaxDatagramSize, profile)
 }
+
+// NewBbrControllerWithInitialWindow is NewBbrController with the first window
+// chosen by the transport, in packets. Zero or less asks for the default.
+func NewBbrControllerWithInitialWindow(initialMaxDatagramSize ByteCount, profile Profile, initialWindowPackets int64) Controller {
+	return NewBbrSenderWithInitialWindow(initialMaxDatagramSize, profile, initialWindowPackets)
+}
