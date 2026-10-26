@@ -19,10 +19,18 @@ package udpx
 // A window also grows, because half of a window that is too small for the path is
 // still too small. The evidence a receiver has is the peer spending the whole window
 // and nothing coming after it: what stopped the peer was this window and not the
-// path. The window is then doubled, up to a ceiling, and a stream window that grew
-// takes the association window with it — a receiver that moved its window forward by
-// reading is the only one that can tell, since moving it forward on arrival instead
-// would let the memory grow with the peer's speed rather than with the application's.
+// path, which stops a peer wherever it happens to be. The window is then doubled, up
+// to a ceiling, and a stream window that grew takes the association window with it —
+// a receiver that moved its window forward by reading is the only one that can tell,
+// since moving it forward on arrival instead would let the memory grow with the peer's
+// speed rather than with the application's.
+//
+// What is compared is the ceiling the peer was told about, not the one this end holds:
+// a window moves forward on the read, so by the time the packet that reached a ceiling
+// arrives, that ceiling has usually been replaced by a larger one, and a peer whose
+// data always arrives one round trip behind the read would then never be seen to reach
+// any ceiling at all. A peer that fills the window it was given is the same evidence
+// whether or not the read has moved the limit since.
 const (
 	// initialStreamWindow is where the window of one stream starts: how much data
 	// it may have in flight before the receiver has to raise the window.

@@ -280,10 +280,14 @@ type association struct {
 	// fcMu guards the association window: what the peer allows this end to send,
 	// and what this end allows the peer to send. recvWindow is how large that
 	// credit is, which starts at initialConnectionWindow and doubles while the
-	// streams together are what fills it.
+	// streams together are what fills it. recvLimit is the ceiling the peer was last
+	// told about and recvLimitWas the one before it, for the reason a stream keeps
+	// both: the peer's last packet arrives after the ceiling it knew may have been
+	// replaced.
 	fcMu         sync.Mutex
 	sendCredit   credit
 	recvLimit    uint64
+	recvLimitWas uint64
 	recvWindow   uint64
 	windowSpent  bool
 	recvRead     uint64

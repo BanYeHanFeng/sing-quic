@@ -231,3 +231,54 @@ func TestStreamWindowStopsAtTheCeiling(t *testing.T) {
 		t.Fatalf("the association window reached %d bytes of a ceiling of %d", window, maxConnectionWindow)
 	}
 }
+
+// TestStreamWindowGrowsWhileTheApplicationKeepsUp requires the window to grow when
+// the peer spends it even though the application reads everything that arrives, which
+// is the case a transfer of one bulk stream is.
+//
+// The ceiling is not where the peer stops: a window moves forward on the read, so by
+// the time the peer's last packet arrives, the ceiling it was given has already been
+// replaced by a larger one, and the packet that reached it "did not". The window is
+// therefore compared against the ceiling the peer was last told about, and a peer that
+// spends its window is a peer that a larger window would let go further whether or not
+// the read has already moved the limit.
+func TestStreamWindowGrowsWhileTheApplicationKeepsUp(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 60*time.Second)
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A stream exists on the peer only once something was written on it.
+	if _, err = stream.Write([]byte{0}); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// More than the largest window, written as fast as the credit allows and read as
+	// fast as it arrives.
+	const size = 8 * initialStreamWindow
+	wrote := make(chan error, 1)
+	go func() {
+		if _, writeErr := stream.Write(testPayload(size)); writeErr != nil {
+			wrote <- writeErr
+			return
+		}
+		wrote <- stream.CloseWrite()
+	}()
+	if _, err = readExactly(accepted, size); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if err = <-wrote; err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if granted := grantedTo(t, server, accepted.ID()); granted.window != maxStreamWindow {
+		t.Fatalf("the window is %d bytes after %d bytes through it, expected %d",
+			granted.window, size, uint64(maxStreamWindow))
+	}
+	if window, _, _ := associationWindowOf(t, server); window != maxConnectionWindow {
+		t.Fatalf("the association window reached %d bytes of %d", window, maxConnectionWindow)
+	}
+}
