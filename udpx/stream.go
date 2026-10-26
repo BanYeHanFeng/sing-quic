@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing/common/pipe"
@@ -39,6 +40,65 @@ func (a *association) streamDataLen() int {
 	return a.maxPayload - streamFixedLen
 }
 
+// sendChunkSize is how much one chunk of a send buffer holds. A chunk is the unit
+// that is taken from the pool and given back, so it is sized to stay worth keeping
+// whole: a write of a few kilobytes leaves most of one behind, and the next write
+// fills that part instead of taking another.
+const sendChunkSize = 64 << 10
+
+// sendChunk is one chunk of a stream's send buffer: the bytes the application wrote
+// and the frames cut from them.
+//
+// It counts the holders that still read from it, because the memory is handed out
+// again as soon as there are none: the send buffer drops a chunk when it has framed
+// all of it, and every frame cut from it drops it again when the peer acknowledged
+// that frame. A write lives until the last frame carrying it is acknowledged, and
+// that lifetime used to be left to the garbage collector — which meant a fresh
+// allocation of the whole write, a gigabyte of garbage for every gigabyte sent.
+type sendChunk struct {
+	buf []byte
+	// start is where the next frame begins and end is where the bytes that were
+	// written end, so what is left to frame is buf[start:end].
+	start int
+	end   int
+	// holds is how many holders the chunk has: the send buffer while it still has
+	// bytes to frame, plus one for every frame cut from it that the peer has not
+	// acknowledged yet.
+	holds atomic.Int32
+}
+
+// sendChunkPool recycles the chunks of every stream. A chunk is in the pool only
+// while nothing reads from it, so what it hands out needs no clearing: whoever
+// takes it writes over the part it uses before that part is read.
+var sendChunkPool = sync.Pool{
+	New: func() any {
+		sendChunksAllocated.Add(1)
+		return &sendChunk{buf: make([]byte, sendChunkSize)}
+	},
+}
+
+// sendChunksAllocated counts the chunks the pool had to make, which is what says
+// whether the memory a transfer went into was reused: what the peer acknowledged is
+// back in the pool, so the same transfer made again allocates nothing. It is a
+// number for the tests, and one add per chunk is nothing next to copying it.
+var sendChunksAllocated atomic.Int64
+
+// retain records one more holder of the chunk.
+func (c *sendChunk) retain() {
+	c.holds.Add(1)
+}
+
+// release gives up one holder of the chunk, and gives the chunk back to the pool
+// once the last one is gone.
+func (c *sendChunk) release() {
+	if c.holds.Add(-1) != 0 {
+		return
+	}
+	c.start = 0
+	c.end = 0
+	sendChunkPool.Put(c)
+}
+
 // Stream is one stream of an association: a net.Conn whose two halves close
 // separately.
 type Stream struct {
@@ -48,7 +108,7 @@ type Stream struct {
 	// The send half: data the application wrote, the offset it goes to, and the
 	// credit the peer granted for it.
 	sendMu        sync.Mutex
-	sendChunks    [][]byte
+	sendChunks    []*sendChunk
 	sendOffset    uint64
 	sendFramed    uint64
 	sendCredit    credit
@@ -239,13 +299,42 @@ func (s *Stream) queueData(p []byte) (int, error) {
 	}
 	s.sendCredit.take(allowed)
 	s.association.takeConnectionCredit(allowed)
-	// One copy per write, into a chunk of its own: appending to one long buffer
-	// would copy what is left of it every time a frame leaves the front, which is
-	// per packet rather than per write. The chunk is what the frames of this write
-	// point into, so it stays alive until the last of them leaves the flight table.
-	s.sendChunks = append(s.sendChunks, append([]byte(nil), p[:allowed]...))
+	// One copy per write, into the send buffer: the bytes have to be taken over
+	// here because the caller may reuse its slice as soon as this returns, and they
+	// have to live until the last frame cut from them is acknowledged. The chunks
+	// they are copied into are recycled, which is what keeps a transfer from
+	// allocating a copy of everything it sends.
+	s.bufferSendData(p[:allowed])
 	s.sendOffset += allowed
 	return int(allowed), nil
+}
+
+// bufferSendData copies p into the send buffer, filling whatever room the last
+// chunk has left before taking another one from the pool. The caller holds sendMu.
+func (s *Stream) bufferSendData(p []byte) {
+	for len(p) > 0 {
+		if count := len(s.sendChunks); count == 0 || s.sendChunks[count-1].end == len(s.sendChunks[count-1].buf) {
+			chunk := sendChunkPool.Get().(*sendChunk)
+			chunk.retain()
+			s.sendChunks = append(s.sendChunks, chunk)
+		}
+		last := s.sendChunks[len(s.sendChunks)-1]
+		written := copy(last.buf[last.end:], p)
+		last.end += written
+		p = p[written:]
+	}
+}
+
+// releaseSendChunks drops what was written and not framed, and with it the hold the
+// send buffer has on the chunks that hold those bytes. The frames already cut from
+// them hold it themselves, so the memory still lives until the peer acknowledged
+// what was sent.
+func (s *Stream) releaseSendChunks() {
+	for index, chunk := range s.sendChunks {
+		s.sendChunks[index] = nil
+		chunk.release()
+	}
+	s.sendChunks = nil
 }
 
 // waitForCredit waits until a window moves forward, the write deadline expires, or
@@ -274,18 +363,25 @@ func (s *Stream) sendQueued() error {
 		var frame streamFrame
 		if len(s.sendChunks) > 0 {
 			head := s.sendChunks[0]
-			length := min(len(head), s.association.streamDataLen())
+			pending := head.buf[head.start:head.end]
+			length := min(len(pending), s.association.streamDataLen())
+			// The frame holds the chunk it was cut from, which is what keeps the
+			// bytes alive from here until the peer acknowledged them.
+			head.retain()
 			frame = streamFrame{
 				carried:  true,
-				data:     head[:length],
+				data:     pending[:length],
+				chunk:    head,
 				offset:   s.sendFramed,
 				streamID: s.id,
 			}
 			s.sendFramed += uint64(length)
-			if length < len(head) {
-				s.sendChunks[0] = head[length:]
-			} else {
+			head.start += length
+			if head.start == head.end {
 				s.sendChunks = s.sendChunks[1:]
+				// The send buffer is done with the chunk; the frames cut from it
+				// still hold it themselves.
+				head.release()
 			}
 		} else if s.closeWrite && !s.finSent {
 			// The FIN carries the offset the data ends at, so it does not have to
@@ -409,7 +505,7 @@ func (s *Stream) end(cause error) {
 	close(s.done)
 	s.endMu.Unlock()
 	s.sendMu.Lock()
-	s.sendChunks = nil
+	s.releaseSendChunks()
 	s.sendMu.Unlock()
 	s.signalSend()
 	s.signalRecv()

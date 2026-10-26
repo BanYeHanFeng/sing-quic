@@ -62,6 +62,13 @@ type streamFrame struct {
 	// until it is in a packet.
 	carried bool
 
+	// chunk is the send buffer chunk data is a piece of, and the zero value for
+	// a frame that carries no data. The frame is one of the holders of it, and it
+	// gives that up when the peer acknowledged the frame: that is what makes the
+	// memory of a write reusable, rather than garbage that waits for the next
+	// collection.
+	chunk *sendChunk
+
 	data     []byte
 	offset   uint64
 	streamID uint32
@@ -82,6 +89,24 @@ func (f outFrame) appendTo(dst []byte) []byte {
 		return appendStream(dst, f.stream.streamID, f.stream.offset, f.stream.fin, f.stream.data)
 	}
 	return append(dst, f.payload...)
+}
+
+// releaseFrames gives up what the frames of an acknowledged packet hold: the send
+// buffer chunk each stream frame was cut from. A frame is in one packet at a time —
+// a lost one goes back to the queue and is planned into the next packet instead of
+// staying in the one it was lost in — so this is where its hold on the chunk ends,
+// and the last holder of a chunk is what puts it back in the pool.
+func releaseFrames(frames []outFrame) {
+	for index := range frames {
+		chunk := frames[index].stream.chunk
+		if chunk == nil {
+			continue
+		}
+		// The frame is not going to be sent again, so the reference goes with the
+		// hold: a second pass over the same frames releases nothing.
+		frames[index].stream.chunk = nil
+		chunk.release()
+	}
 }
 
 // frameQueue is the frames waiting to be sent, in the order they were produced.

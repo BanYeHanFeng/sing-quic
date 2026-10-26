@@ -156,6 +156,9 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	priorInFlight := a.inFlight.bytes
 	acked := a.inFlight.acked(acknowledgement.ranges[:acknowledgement.count])
 	for _, packet := range acked {
+		// What the packet carried is not going to be sent again, so the send
+		// buffer chunks behind its stream frames are given up here.
+		releaseFrames(packet.frames)
 		if packet.packetNumber != acknowledgement.largest {
 			continue
 		}

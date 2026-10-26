@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"runtime/debug"
 	"testing"
 	"time"
 )
@@ -619,5 +621,282 @@ func TestStreamFinBeforeData(t *testing.T) {
 	}
 	if count := streamCount(t, receiver); count != 0 {
 		t.Fatalf("%d streams are open after the stream ended", count)
+	}
+}
+
+// waitSendIdle waits until the send path has nothing left to do: nothing in flight,
+// and nothing waiting to be framed. Only then is everything that was written
+// acknowledged, and only then is the memory it went into back in the pool.
+func waitSendIdle(t *testing.T, conn *association) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		conn.flightMu.Lock()
+		packets := conn.inFlight.len()
+		conn.flightMu.Unlock()
+		queued := conn.queueLength()
+		if packets == 0 && queued == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d packets in flight and %d frames queued after an acknowledgement", packets, queued)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestSendChunkRelease requires the count a chunk carries to be what its two kinds
+// of holder say: the send buffer while it still has bytes to frame, and one per
+// frame cut from it. The memory goes back to the pool when the last one is gone,
+// and not before.
+func TestSendChunkRelease(t *testing.T) {
+	chunk := &sendChunk{buf: make([]byte, sendChunkSize)}
+	chunk.retain()
+	chunk.retain()
+	chunk.end = 100
+	chunk.start = 40
+	chunk.release()
+	if holds, start, end := chunk.holds.Load(), chunk.start, chunk.end; holds != 1 || start != 40 || end != 100 {
+		t.Fatalf("a chunk once given up is at %d:%d and held %d times", start, end, holds)
+	}
+	chunk.release()
+	if holds, start, end := chunk.holds.Load(), chunk.start, chunk.end; holds != 0 || start != 0 || end != 0 {
+		t.Fatalf("a chunk nobody holds is at %d:%d and held %d times", start, end, holds)
+	}
+}
+
+// TestSendChunksHeldByTheSendBuffer requires the send buffer to hold every chunk it
+// has bytes in: a chunk is handed out again once nobody holds it, so a chunk the
+// send buffer forgot to hold is a chunk whose bytes are overwritten while they are
+// still waiting to be framed. What the frames of a write hold is on top of that, and
+// it is what TestSendChunksHeldUntilAcknowledged is about.
+func TestSendChunksHeldByTheSendBuffer(t *testing.T) {
+	stream := newStream(&association{maxPayload: 1024}, 4, initialStreamWindow)
+	stream.bufferSendData(testPayload(2*sendChunkSize + 1000))
+	if count := len(stream.sendChunks); count != 3 {
+		t.Fatalf("%d chunks for two chunks and a bit of payload", count)
+	}
+	for index, chunk := range stream.sendChunks {
+		if holds := chunk.holds.Load(); holds != 1 {
+			t.Fatalf("chunk %d of the send buffer is held %d times", index, holds)
+		}
+	}
+	// A write smaller than what the last chunk has left fills that room rather than
+	// taking another chunk.
+	stream.bufferSendData(testPayload(24))
+	if count := len(stream.sendChunks); count != 3 {
+		t.Fatalf("%d chunks after a write that fitted in the last one", count)
+	}
+	last := stream.sendChunks[2]
+	if last.end != 1024 {
+		t.Fatalf("the last chunk ends at %d after two writes that fit in it", last.end)
+	}
+	stream.releaseSendChunks()
+	if len(stream.sendChunks) != 0 {
+		t.Fatalf("%d chunks left after the send buffer let them go", len(stream.sendChunks))
+	}
+	if holds := last.holds.Load(); holds != 0 {
+		t.Fatalf("a chunk the send buffer let go is still held %d times", holds)
+	}
+	if last.start != 0 || last.end != 0 {
+		t.Fatalf("a chunk nobody holds is at %d:%d", last.start, last.end)
+	}
+}
+
+// checkSendChunkHolds reports what the count of a send buffer chunk disagrees with:
+// the frames that still point into it. The send path is read first and the flight
+// table second, both under sendMu and in that order, because that is the order the
+// send path itself takes them in — and because a frame that is in a packet of the
+// batch being handed over is in the flight table and nowhere else.
+func checkSendChunkHolds(conn *association) string {
+	references := make(map[*sendChunk]int)
+	count := func(frames []outFrame) {
+		for index := range frames {
+			if chunk := frames[index].stream.chunk; chunk != nil {
+				references[chunk]++
+			}
+		}
+	}
+	conn.sendMu.Lock()
+	count(conn.queue.frames)
+	for index := range conn.batch.pending {
+		count(conn.batch.pending[index].sent.frames)
+	}
+	conn.flightMu.Lock()
+	for _, packet := range conn.inFlight.packets {
+		if packet.removed {
+			continue
+		}
+		count(packet.frames)
+	}
+	conn.flightMu.Unlock()
+	defer conn.sendMu.Unlock()
+	for chunk, carried := range references {
+		if holds := int(chunk.holds.Load()); holds < carried {
+			return fmt.Sprintf("a chunk of the send buffer is held %d times for %d frames that point into it", holds, carried)
+		}
+	}
+	return ""
+}
+
+// TestSendChunksHoldWhatPointsIntoThem requires the count a chunk carries to stay
+// above the frames that point into it, whatever the send path does with them: a
+// packet the peer acknowledged gives its frames up, a lost one does not, and a
+// retransmission points into the same chunk again. The transfer runs over a path
+// that loses a fifth of its packets, so chunks are released and taken again while
+// other frames of theirs are still on their way — which is where a count that is one
+// short stops being memory that is kept longer than needed and becomes bytes that
+// changed on the way.
+func TestSendChunksHoldWhatPointsIntoThem(t *testing.T) {
+	password := NewPassword("password")
+	listenerConn := udpConn(t)
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
+	defer listener.Close()
+	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: 0.2})
+	ctx := testContext(t, 60*time.Second)
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseWithError(nil)
+	conn, isAssociation := client.(*association)
+	if !isAssociation {
+		t.Fatal("client is not an association")
+	}
+	server, err := listener.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := testPayload(256 * 1024)
+	sender, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	checked := make(chan struct{})
+	go func() {
+		defer close(checked)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if problem := checkSendChunkHolds(conn); problem != "" {
+				t.Errorf("%s", problem)
+				return
+			}
+			time.Sleep(50 * time.Microsecond)
+		}
+	}()
+	go func() {
+		if _, writeErr := sender.Write(payload); writeErr != nil {
+			t.Errorf("write: %v", writeErr)
+			return
+		}
+		if closeErr := sender.CloseWrite(); closeErr != nil {
+			t.Errorf("close write: %v", closeErr)
+		}
+	}()
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read := readAll(t, accepted, len(payload)); !bytes.Equal(read, payload) {
+		t.Fatal("the payload changed on the way")
+	}
+	close(stop)
+	<-checked
+}
+
+// TestSendChunksHeldUntilAcknowledged requires the memory of a write to stay with
+// the frames that carry it: the write that follows takes memory of its own, because
+// the first one is still on its way to the peer. A chunk that came back too early
+// is a chunk whose bytes are overwritten before they are sent — the frames still
+// waiting in the queue point into it — and what the peer reads at the end is then
+// the write that came after.
+func TestSendChunksHeldUntilAcknowledged(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 30*time.Second)
+	sender, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := testPayload(1 << 20)
+	second := testPayload(1 << 20)
+	for index := range second {
+		second[index] ^= 0xff
+	}
+	// The two writes fill the stream window between them, so the second one waits
+	// for the peer to read the first: they are the shortest writes that cannot be
+	// held at the same time.
+	go func() {
+		if _, writeErr := sender.Write(first); writeErr != nil {
+			t.Errorf("write: %v", writeErr)
+			return
+		}
+		if _, writeErr := sender.Write(second); writeErr != nil {
+			t.Errorf("write: %v", writeErr)
+			return
+		}
+		if closeErr := sender.CloseWrite(); closeErr != nil {
+			t.Errorf("close write: %v", closeErr)
+		}
+	}()
+	receiver, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := readAll(t, receiver, len(first)+len(second))
+	if !bytes.Equal(read[:len(first)], first) {
+		t.Fatal("the first write did not arrive as it was written")
+	}
+	if !bytes.Equal(read[len(first):], second) {
+		t.Fatal("the second write did not arrive as it was written")
+	}
+}
+
+// TestSendChunkReused requires the memory a transfer went into to be reused by the
+// next one: what the peer acknowledged is back in the pool, so a transfer made
+// again allocates no chunk at all. Without that, every byte sent is a byte of
+// garbage, and collecting it is what the send path spends its time on.
+func TestSendChunkReused(t *testing.T) {
+	// A collection empties the pool, which would measure the collection rather
+	// than the reuse.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	client, server, _ := testSetup(t, Options{}, Options{})
+	conn, isAssociation := client.(*association)
+	if !isAssociation {
+		t.Fatal("client is not an association")
+	}
+	ctx := testContext(t, 30*time.Second)
+	sender, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := testPayload(256 << 10)
+	var receiver *Stream
+	transfer := func() int64 {
+		t.Helper()
+		allocated := sendChunksAllocated.Load()
+		if _, err = sender.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		// The stream exists on the peer as soon as data for it arrives.
+		if receiver == nil {
+			receiver, err = server.AcceptStream(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if read := readAll(t, receiver, len(payload)); !bytes.Equal(read, payload) {
+			t.Fatal("the bytes the peer read are not the ones written")
+		}
+		waitSendIdle(t, conn)
+		return sendChunksAllocated.Load() - allocated
+	}
+	transfer()
+	if allocated := transfer(); allocated != 0 {
+		t.Fatalf("a transfer the peer read whole allocated %d chunks of the send buffer", allocated)
 	}
 }
