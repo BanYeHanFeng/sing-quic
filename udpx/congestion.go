@@ -12,8 +12,7 @@ import (
 // The controller decides how much may be in flight and when the next packet may
 // leave. What it needs from the transport is only what the transport knows:
 // packets leaving, packets acknowledged, packets given up on, and how long the
-// path takes. That is why it lives in its own package: the same controller runs
-// over this protocol and over one whose packet numbers are not in the clear.
+// path takes.
 //
 // A redundant packet is a packet: it takes room in the window like any other, and
 // the pacing that comes out of the window is what the send path follows. Without

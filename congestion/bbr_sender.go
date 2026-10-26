@@ -192,7 +192,7 @@ type bbrSender struct {
 
 	// The filter that tracks the maximum bandwidth over the multiple recent
 	// round-trips.
-	maxBandwidth *WindowedFilter[Bandwidth, roundTripCount]
+	maxBandwidth *WindowedFilter[Bandwidth]
 
 	// Minimum RTT estimate.  Automatically expires within 10 seconds (and
 	// triggers PROBE_RTT mode) if no new value is sampled during that period.
@@ -397,27 +397,6 @@ func minCongestionWindowForMaxDatagramSize(maxDatagramSize ByteCount) ByteCount 
 	return minCongestionWindowPackets * maxDatagramSize
 }
 
-func scaleByteWindowForDatagramSize(window, oldMaxDatagramSize, newMaxDatagramSize ByteCount) ByteCount {
-	if oldMaxDatagramSize == newMaxDatagramSize {
-		return window
-	}
-	return ByteCount(uint64(window) * uint64(newMaxDatagramSize) / uint64(oldMaxDatagramSize))
-}
-
-func (b *bbrSender) rescalePacketSizedWindows(maxDatagramSize ByteCount) {
-	oldMaxDatagramSize := b.maxDatagramSize
-	b.maxDatagramSize = maxDatagramSize
-	b.initialCongestionWindow = scaleByteWindowForDatagramSize(b.initialCongestionWindow, oldMaxDatagramSize, maxDatagramSize)
-	b.maxCongestionWindow = scaleByteWindowForDatagramSize(b.maxCongestionWindow, oldMaxDatagramSize, maxDatagramSize)
-	b.minCongestionWindow = minCongestionWindowForMaxDatagramSize(maxDatagramSize)
-	b.cwndToCalculateMinPacingRate = scaleByteWindowForDatagramSize(b.cwndToCalculateMinPacingRate, oldMaxDatagramSize, maxDatagramSize)
-	b.maxCongestionWindowWithNetworkParametersAdjusted = scaleByteWindowForDatagramSize(
-		b.maxCongestionWindowWithNetworkParametersAdjusted,
-		oldMaxDatagramSize,
-		maxDatagramSize,
-	)
-}
-
 func (b *bbrSender) applyProfile(profile Profile) {
 	if !profile.isValid() {
 		panic(fmt.Sprintf("congestion BUG: invalid BBR profile %q", profile.Name()))
@@ -443,17 +422,17 @@ func (b *bbrSender) SetRTTStatsProvider(provider RTTStatsProvider) {
 	b.rttStats = provider
 }
 
-// TimeUntilSend implements the SendAlgorithm interface.
+// TimeUntilSend reports when the pacer would let the next packet leave.
 func (b *bbrSender) TimeUntilSend(bytesInFlight ByteCount) time.Time {
 	return b.pacer.TimeUntilSend()
 }
 
-// HasPacingBudget implements the SendAlgorithm interface.
+// HasPacingBudget reports whether the pacer has budget for one more packet.
 func (b *bbrSender) HasPacingBudget(now time.Time) bool {
 	return b.pacer.Budget(now) >= b.maxDatagramSize
 }
 
-// OnPacketSent implements the SendAlgorithm interface.
+// OnPacketSent records a packet that left and what was in flight before it.
 func (b *bbrSender) OnPacketSent(
 	sentTime time.Time,
 	bytesInFlight ByteCount,
@@ -473,52 +452,22 @@ func (b *bbrSender) OnPacketSent(
 	b.sampler.OnPacketSent(sentTime, packetNumber, bytes, bytesInFlight, isRetransmittable)
 }
 
-// CanSend implements the SendAlgorithm interface.
+// CanSend reports whether the window has room for another packet.
 func (b *bbrSender) CanSend(bytesInFlight ByteCount) bool {
 	return bytesInFlight < b.GetCongestionWindow()
 }
 
-// MaybeExitSlowStart implements the SendAlgorithm interface.
-func (b *bbrSender) MaybeExitSlowStart() {
-	// Do nothing
-}
-
-// OnRetransmissionTimeout implements the SendAlgorithm interface.
-func (b *bbrSender) OnRetransmissionTimeout(packetsRetransmitted bool) {
-	// Do nothing.
-}
-
-// SetMaxDatagramSize implements the SendAlgorithm interface.
-func (b *bbrSender) SetMaxDatagramSize(s ByteCount) {
-	if s < b.maxDatagramSize {
-		panic(fmt.Sprintf("congestion BUG: decreased max datagram size from %d to %d", b.maxDatagramSize, s))
-	}
-	oldMinCongestionWindow := b.minCongestionWindow
-	oldInitialCongestionWindow := b.initialCongestionWindow
-	b.rescalePacketSizedWindows(s)
-	switch b.congestionWindow {
-	case oldMinCongestionWindow:
-		b.congestionWindow = b.minCongestionWindow
-	case oldInitialCongestionWindow:
-		b.congestionWindow = b.initialCongestionWindow
-	default:
-		b.congestionWindow = Min(b.maxCongestionWindow, Max(b.congestionWindow, b.minCongestionWindow))
-	}
-	b.recoveryWindow = Min(b.maxCongestionWindow, Max(b.recoveryWindow, b.minCongestionWindow))
-	b.pacer.SetMaxDatagramSize(s)
-}
-
-// InSlowStart implements the SendAlgorithmWithDebugInfos interface.
+// InSlowStart reports whether the controller is still looking for more bandwidth.
 func (b *bbrSender) InSlowStart() bool {
 	return b.mode == bbrModeStartup
 }
 
-// InRecovery implements the SendAlgorithmWithDebugInfos interface.
+// InRecovery reports whether the controller is still recovering from loss.
 func (b *bbrSender) InRecovery() bool {
 	return b.recoveryState != bbrRecoveryStateNotInRecovery
 }
 
-// GetCongestionWindow implements the SendAlgorithmWithDebugInfos interface.
+// GetCongestionWindow is the window the transport may fill.
 func (b *bbrSender) GetCongestionWindow() ByteCount {
 	if b.mode == bbrModeProbeRtt {
 		return b.probeRttCongestionWindow()
@@ -531,7 +480,7 @@ func (b *bbrSender) GetCongestionWindow() ByteCount {
 	return b.congestionWindow
 }
 
-// OnCongestionEvent implements the SendAlgorithm interface. Everything BBR does
+// OnCongestionEvent is the one event a transport reports per acknowledgement. Everything BBR does
 // with an answer happens here: the window, the pacing rate and the round trip
 // counter only move when an acknowledgement and the losses it implies arrive
 // together, which is why the event is one call and not one call per packet.
@@ -1014,22 +963,4 @@ func (b *bbrSender) shouldExitStartupDueToLoss(lastPacketSendState *sendTimeStat
 
 func bdpFromRttAndBandwidth(rtt time.Duration, bandwidth Bandwidth) ByteCount {
 	return ByteCount(rtt) * ByteCount(bandwidth) / ByteCount(BytesPerSecond) / ByteCount(time.Second)
-}
-
-func (b *bbrSender) OnPacketNeutered(packetNumber PacketNumber) {
-	b.sampler.OnPacketNeutered(packetNumber)
-}
-
-// OnPacketsLost is called to notify the congestion controller about the lowest unacked packet number.
-// This allows cleanup of obsolete packet state data.
-func (b *bbrSender) OnPacketsLost(leastUnacked PacketNumber) {
-	b.sampler.RemoveObsoletePackets(leastUnacked)
-}
-
-// OnAppLimited is called when the application has no data to send but cwnd is not fully utilized.
-func (b *bbrSender) OnAppLimited(bytesInFlight ByteCount) {
-	if bytesInFlight >= b.GetCongestionWindow() {
-		return
-	}
-	b.sampler.OnAppLimited()
 }

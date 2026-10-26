@@ -99,7 +99,7 @@ func newBandwidthSample() *bandwidthSample {
 type maxAckHeightTracker struct {
 	// Tracks the maximum number of bytes acked faster than the estimated
 	// bandwidth.
-	maxAckHeightFilter *WindowedFilter[extraAckedEvent, roundTripCount]
+	maxAckHeightFilter *WindowedFilter[extraAckedEvent]
 	// The time this aggregation started and the number of bytes acked during it.
 	aggregationEpochStartTime time.Time
 	aggregationEpochBytes     ByteCount
@@ -445,9 +445,6 @@ type bandwidthSampler struct {
 	// The total number of congestion controlled bytes which were lost.
 	totalBytesLost ByteCount
 
-	// The total number of congestion controlled bytes which have been neutered.
-	totalBytesNeutered ByteCount
-
 	// The value of |total_bytes_sent_| at the time the last acknowledged packet
 	// was sent. Valid only when |last_acked_packet_sent_time_| is valid.
 	totalBytesSentAtLastAckedPacket ByteCount
@@ -679,24 +676,9 @@ func (b *bandwidthSampler) OnPacketLost(packetNumber PacketNumber, bytesLost Byt
 	return s
 }
 
-func (b *bandwidthSampler) OnPacketNeutered(packetNumber PacketNumber) {
-	b.connectionStateMap.Remove(packetNumber, func(sentPacket connectionStateOnSentPacket) {
-		b.totalBytesNeutered += sentPacket.size
-	})
-}
-
 func (b *bandwidthSampler) OnAppLimited() {
 	b.isAppLimited = true
 	b.endOfAppLimitedPhase = b.lastSentPacket
-}
-
-func (b *bandwidthSampler) RemoveObsoletePackets(leastUnacked PacketNumber) {
-	// A packet can become obsolete when it is removed from QuicUnackedPacketMap's
-	// view of inflight before it is acked or marked as lost. For example, when
-	// QuicSentPacketManager::RetransmitCryptoPackets retransmits a crypto packet,
-	// the packet is removed from QuicUnackedPacketMap's inflight, but is not
-	// marked as acked or lost in the BandwidthSampler.
-	b.connectionStateMap.RemoveUpTo(leastUnacked)
 }
 
 func (b *bandwidthSampler) TotalBytesSent() ByteCount {
@@ -709,10 +691,6 @@ func (b *bandwidthSampler) TotalBytesLost() ByteCount {
 
 func (b *bandwidthSampler) TotalBytesAcked() ByteCount {
 	return b.totalBytesAcked
-}
-
-func (b *bandwidthSampler) TotalBytesNeutered() ByteCount {
-	return b.totalBytesNeutered
 }
 
 func (b *bandwidthSampler) IsAppLimited() bool {

@@ -1,12 +1,11 @@
-// Package congestion is BBR and the pacer that goes with it, with no transport in
-// it: it is told what was sent, acknowledged and given up on, and it answers how
-// much may be in flight and when the next packet may leave.
+// Package congestion is BBR and the pacer that goes with it: it is told what was
+// sent, acknowledged and given up on, and it answers how much may be in flight and
+// when the next packet may leave.
 //
-// The types are the transport's own units — bytes, packet numbers, times — so that
-// a transport can use this package without adopting another one's. Nothing here
-// knows what a stream is, what a packet looks like, or how an acknowledgement
-// arrives; that is what makes the same code usable over a packet number that is in
-// the clear and over one that is not.
+// It is the controller of the udpx transport and nothing else: the units are the
+// ones that transport has, and what it asks for is what that transport reports. The
+// copy of the same algorithm that quic-go's hysteria2 and tuic use stays where it
+// is, in congestion_meta2, untouched by anything here.
 package congestion
 
 import "time"
@@ -67,7 +66,6 @@ type Controller interface {
 	TimeUntilSend(bytesInFlight ByteCount) time.Time
 	HasPacingBudget(now time.Time) bool
 	GetCongestionWindow() ByteCount
-	SetMaxDatagramSize(maxDatagramSize ByteCount)
 	SetRTTStatsProvider(provider RTTStatsProvider)
 }
 

@@ -66,7 +66,3 @@ func (p *Pacer) TimeUntilSend() time.Time {
 			float64(p.getBandwidth())))*time.Nanosecond,
 	))
 }
-
-func (p *Pacer) SetMaxDatagramSize(s ByteCount) {
-	p.maxDatagramSize = s
-}
