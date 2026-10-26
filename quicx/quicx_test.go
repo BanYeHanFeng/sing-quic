@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-quic/udpio"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -126,6 +127,41 @@ func testContext(t *testing.T, timeout time.Duration) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	t.Cleanup(cancel)
 	return ctx
+}
+
+// TestClientBatches requires the socket a dialer hands back to keep its
+// descriptor. The transport batches whatever the socket allows and moves one
+// datagram per call otherwise, and it decides that from the descriptor alone: a
+// dialer whose connection is wrapped in something that does not pass the
+// descriptor on makes every send and receive its own system call, silently. The
+// client is the side that dials through such a wrapper, so the client is what is
+// measured here.
+func TestClientBatches(t *testing.T) {
+	probe, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Close()
+	if gso, gro := udpio.New(probe, udpio.Options{GRO: true}).Offload(); !gso || !gro {
+		t.Skip("this kernel does not batch: gso ", gso, ", gro ", gro)
+	}
+	client, _ := testSetup(t, "password")
+	ctx := testContext(t, 20*time.Second)
+	conn, err := client.DialConn(ctx, M.ParseSocksaddr("example.com:80"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	client.connAccess.Lock()
+	session := client.conn
+	client.connAccess.Unlock()
+	if session == nil {
+		t.Fatal("a dial left no session")
+	}
+	gso, gro := session.association.Offload()
+	if !gso || !gro {
+		t.Fatalf("the client socket batches with gso %v and gro %v", gso, gro)
+	}
 }
 
 // TestConnections requires a proxied connection to carry data in both directions
