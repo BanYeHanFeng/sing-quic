@@ -17,13 +17,22 @@ import (
 // its frames go back to the head of the first queue and the packet leaves the
 // second.
 //
-// A frame is encoded when it is queued and never again. A frame that is sent
-// again is the same bytes in a new packet, so nothing about it can change
-// between attempts, and nothing about the packet it travels in is remembered by
-// the frame beyond its number.
+// A frame is encoded when it is queued and never again, with one exception: a
+// stream frame carries a piece of what the application wrote, and encoding it
+// when it is queued would copy every byte of the transfer once, only for the
+// packet to copy it again. A stream frame therefore holds what it is made of and
+// is encoded into the packet that carries it. A frame that is sent again is
+// still the same bytes in a new packet — for a stream frame, the same piece of
+// the stream's send buffer, which is why that buffer is released only once the
+// frame leaves the flight table — and nothing about the packet it travels in is
+// remembered by the frame beyond its number.
 type outFrame struct {
-	// payload is the encoded frame, ready to be copied into a packet.
+	// payload is the encoded frame, for every frame that is not a stream frame.
 	payload []byte
+
+	// stream is what a stream frame is made of, and is the zero value for an
+	// encoded one.
+	stream streamFrame
 
 	// lastSent is the packet number the frame was last sent in.
 	lastSent uint32
@@ -32,6 +41,36 @@ type outFrame struct {
 	// A packet of nothing but acknowledgements is never acknowledged in turn,
 	// which is what keeps two ends from acknowledging each other forever.
 	ackEliciting bool
+}
+
+// streamFrame is a stream frame that has not been encoded yet: the bytes are the
+// ones the application wrote, held by the send buffer of the stream.
+type streamFrame struct {
+	// carried marks the frame as a stream frame, which is what tells the two
+	// shapes of an outFrame apart: a stream frame has no payload of its own
+	// until it is in a packet.
+	carried bool
+
+	data     []byte
+	offset   uint64
+	streamID uint32
+	fin      bool
+}
+
+// size is how many bytes the frame takes in a packet.
+func (f outFrame) size() int {
+	if f.stream.carried {
+		return streamFixedLen + len(f.stream.data)
+	}
+	return len(f.payload)
+}
+
+// appendTo appends the frame to dst, encoding a stream frame now.
+func (f outFrame) appendTo(dst []byte) []byte {
+	if f.stream.carried {
+		return appendStream(dst, f.stream.streamID, f.stream.offset, f.stream.fin, f.stream.data)
+	}
+	return append(dst, f.payload...)
 }
 
 // frameQueue is the frames waiting to be sent, in the order they were produced.
@@ -66,7 +105,7 @@ func (q *frameQueue) takeAckOnly(budget int) []outFrame {
 	count := 0
 	size := 0
 	for count < len(q.frames) && !q.frames[count].ackEliciting {
-		length := len(q.frames[count].payload)
+		length := q.frames[count].size()
 		if size+length > budget {
 			break
 		}
@@ -89,7 +128,7 @@ func (q *frameQueue) take(budget int) []outFrame {
 	count := 0
 	size := 0
 	for count < len(q.frames) {
-		length := len(q.frames[count].payload)
+		length := q.frames[count].size()
 		if size+length > budget {
 			break
 		}
@@ -106,6 +145,9 @@ func (q *frameQueue) take(budget int) []outFrame {
 
 // frameType returns the type of the frame the entry carries.
 func (f outFrame) frameType() frameType {
+	if f.stream.carried {
+		return frameTypeStream
+	}
 	return frameType(f.payload[0] & frameTypeBits)
 }
 
@@ -354,7 +396,7 @@ func (a *association) flush() error {
 		}
 		frames := a.queue.take(a.maxPayload)
 		if len(frames) == 0 {
-			return E.New("frame of ", len(a.queue.frames[0].payload), " bytes does not fit in a packet")
+			return E.New("frame of ", a.queue.frames[0].size(), " bytes does not fit in a packet")
 		}
 		err := a.sendFramesLocked(frames)
 		if err != nil {
@@ -379,7 +421,7 @@ func (a *association) sendFramesLocked(frames []outFrame) error {
 	}
 	payload := a.buildBuffer[:0]
 	for _, frame := range frames {
-		payload = append(payload, frame.payload...)
+		payload = frame.appendTo(payload)
 	}
 	a.buildBuffer = payload[:0]
 	sent := &sentPacket{

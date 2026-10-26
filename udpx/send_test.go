@@ -2,6 +2,9 @@ package udpx
 
 import (
 	"bytes"
+	"errors"
+	"os"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -171,5 +174,71 @@ func TestFramesShareOnePacket(t *testing.T) {
 			t.Fatalf("%d packets still in flight after an acknowledgement", packets)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestStreamFrameSize requires the bytes a stream frame says it takes to be the
+// bytes it encodes. A stream frame is the one frame that is measured before it is
+// encoded — the queue has to know what fits in a packet — so a size that disagrees
+// with the encoding would put either more or less in a packet than the packet
+// holds.
+func TestStreamFrameSize(t *testing.T) {
+	data := bytes.Repeat([]byte{0x5a}, 100)
+	for _, fin := range []bool{false, true} {
+		frame := outFrame{
+			stream:       streamFrame{carried: true, data: data, offset: 7, streamID: 3, fin: fin},
+			ackEliciting: true,
+		}
+		encoded := frame.appendTo(nil)
+		if len(encoded) != frame.size() {
+			t.Fatalf("a stream frame of %d bytes says it takes %d", len(encoded), frame.size())
+		}
+		if !bytes.Equal(encoded, appendStream(nil, 3, 7, fin, data)) {
+			t.Fatalf("a stream frame with fin %v is not the frame it would be", fin)
+		}
+		if frame.frameType() != frameTypeStream {
+			t.Fatalf("a stream frame is of type %d", frame.frameType())
+		}
+	}
+}
+
+// TestStreamWriteAllocatesPerWrite requires writing to a stream to cost the write
+// and not the frames it becomes. A stream frame carries a piece of the write, so
+// encoding it when it is queued copies every byte of the transfer once more and
+// turns one allocation per write into one per 1.4 KB of it, which is what made the
+// send path allocate twice the payload. The peer reads none of this, so what is
+// counted here is the send path alone.
+func TestStreamWriteAllocatesPerWrite(t *testing.T) {
+	client, _, _ := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 30*time.Second)
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The write stops when it has filled the windows, which is what keeps this
+	// measurement independent of how large they are: what it wrote is what it
+	// allocated for.
+	err = stream.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := testPayload(1 << 20)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	written, err := stream.Write(payload)
+	runtime.ReadMemStats(&after)
+	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("write: %v", err)
+	}
+	if written == 0 {
+		t.Fatal("a write of 1 MiB wrote nothing")
+	}
+	allocations := after.Mallocs - before.Mallocs
+	t.Logf("a write of %d bytes allocated %d bytes in %d allocations", written, after.TotalAlloc-before.TotalAlloc, allocations)
+	// One allocation per 64 KiB of payload is generous for the chunks a write
+	// becomes, and it is an order of magnitude below the one per frame this test
+	// exists to catch.
+	if allocations > 128+uint64(written)/(64<<10) {
+		t.Fatalf("a write of %d bytes took %d allocations", written, allocations)
 	}
 }

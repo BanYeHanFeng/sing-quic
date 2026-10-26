@@ -455,17 +455,20 @@ func TestFECRecoveredOnce(t *testing.T) {
 // than with a constant, because what the transport allocates on its own is the
 // same in both and is not what this is about.
 //
-// The bound is one payload and not nothing because a protected transfer is not the
-// same traffic: it carries a quarter more packets, so its share of the in-flight
-// table and of the retransmissions is larger, and under the race detector that
-// alone is a megabyte. What the bound catches is the per-group allocation, which
-// was 3.9 payloads before the buffers were reused.
+// The bound is one and a half payloads and not nothing because a protected
+// transfer is not the same traffic: it carries a quarter more packets, so its
+// share of the in-flight table, of the receive rings and of the retransmissions is
+// larger, and now that the send path copies each byte once that per-packet share is
+// most of the difference: 1.6 MB of it without the race detector and 3.9 MB with
+// it, against an unprotected transfer of 4 MiB that allocates 11.5 MB. What the
+// bound catches is the per-group allocation, which was 3.9 payloads before the
+// buffers were reused.
 func TestFECReusesBuffers(t *testing.T) {
 	const size = 4 << 20
 	plain := allocatedForTransfer(t, size, Options{})
 	redundant := allocatedForTransfer(t, size, Options{FEC: FECOptions{DataShards: 8, ParityShards: 2}})
 	t.Logf("an unprotected transfer of %d bytes allocated %d, a protected one %d", size, plain, redundant)
-	if redundant > plain+size {
+	if redundant > plain+size+size/2 {
 		t.Fatalf("a protected transfer of %d bytes allocated %d bytes more than an unprotected one", size, redundant-plain)
 	}
 }

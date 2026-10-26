@@ -241,7 +241,8 @@ func (s *Stream) queueData(p []byte) (int, error) {
 	s.association.takeConnectionCredit(allowed)
 	// One copy per write, into a chunk of its own: appending to one long buffer
 	// would copy what is left of it every time a frame leaves the front, which is
-	// per packet rather than per write.
+	// per packet rather than per write. The chunk is what the frames of this write
+	// point into, so it stays alive until the last of them leaves the flight table.
 	s.sendChunks = append(s.sendChunks, append([]byte(nil), p[:allowed]...))
 	s.sendOffset += allowed
 	return int(allowed), nil
@@ -270,11 +271,16 @@ func (s *Stream) sendQueued() error {
 			return s.endCause()
 		}
 		s.sendMu.Lock()
-		var frame []byte
+		var frame streamFrame
 		if len(s.sendChunks) > 0 {
 			head := s.sendChunks[0]
 			length := min(len(head), s.association.streamDataLen())
-			frame = appendStream(nil, s.id, s.sendFramed, false, head[:length])
+			frame = streamFrame{
+				carried:  true,
+				data:     head[:length],
+				offset:   s.sendFramed,
+				streamID: s.id,
+			}
 			s.sendFramed += uint64(length)
 			if length < len(head) {
 				s.sendChunks[0] = head[length:]
@@ -284,14 +290,19 @@ func (s *Stream) sendQueued() error {
 		} else if s.closeWrite && !s.finSent {
 			// The FIN carries the offset the data ends at, so it does not have to
 			// wait for anything else, only for the data before it to be framed.
-			frame = appendStream(nil, s.id, s.sendOffset, true, nil)
+			frame = streamFrame{
+				carried:  true,
+				offset:   s.sendOffset,
+				streamID: s.id,
+				fin:      true,
+			}
 			s.finSent = true
 		}
 		s.sendMu.Unlock()
-		if frame == nil {
+		if !frame.carried {
 			return s.association.flush()
 		}
-		s.association.queueFrame(frame)
+		s.association.queueStreamFrame(frame)
 	}
 }
 

@@ -407,6 +407,19 @@ func (a *association) queueFrame(frame []byte) {
 	a.sendMu.Unlock()
 }
 
+// queueStreamFrame places a stream frame at the end of the send queue. The bytes it
+// carries are the ones the application wrote, so the frame holds the piece of the
+// send buffer rather than a copy of it, and the piece is what a retransmission
+// sends again.
+func (a *association) queueStreamFrame(frame streamFrame) {
+	a.sendMu.Lock()
+	a.queue.push(outFrame{
+		stream:       frame,
+		ackEliciting: true,
+	})
+	a.sendMu.Unlock()
+}
+
 // handlePacket processes a packet the demultiplexer routed to this association.
 // An error means the packet was dropped, which is not the caller's business: a
 // packet that does not parse or does not authenticate is indistinguishable from
