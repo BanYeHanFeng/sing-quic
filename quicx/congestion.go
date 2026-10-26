@@ -7,11 +7,11 @@ import (
 
 // parseBBRProfile turns the configured profile name into the one the transport
 // runs. Congestion control belongs to the transport in this protocol, so what is
-// left here is the name: the zero value is the conservative profile, which is
-// also what an empty option means.
+// left here is the name: no name means the transport's own default, which is what
+// an empty option means everywhere else in the options of this protocol.
 func parseBBRProfile(profile string) (congestion.Profile, error) {
 	if profile == "" {
-		return congestion.ProfileConservative, nil
+		return congestion.Profile{}, nil
 	}
 	parsed, err := congestion.ParseProfile(profile)
 	if err != nil {
