@@ -186,7 +186,12 @@ func TestStreamWindowStaysWhenThePeerStopsShort(t *testing.T) {
 	if window, _, _ := associationWindowOf(t, server); window != initialConnectionWindow {
 		t.Fatalf("the association window grew to %d bytes", window)
 	}
-	if limit := allowedOn(t, client, accepted.ID()); limit != initialStreamWindow {
+	// What the peer hears is either the window as it started or that window moved
+	// forward by the read, and which of the two depends on whether the update has
+	// arrived yet. The window itself not growing is what the two checks above say;
+	// this one is only about the update not carrying a larger one.
+	if limit := allowedOn(t, client, accepted.ID()); limit != initialStreamWindow &&
+		limit != uint64(len(payload))+initialStreamWindow {
 		t.Fatalf("the peer was told about %d bytes", limit)
 	}
 }
