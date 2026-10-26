@@ -33,7 +33,13 @@ const (
 
 	// ackThreshold is how many ack-eliciting packets may arrive before an
 	// acknowledgement goes out without waiting for the delay.
-	ackThreshold = 2
+	//
+	// Two is what a transport with one packet per system call can afford; here a
+	// fast path leaves in batches of many packets, and answering every second one
+	// of them turns most of what leaves the host into answers. Eight packets say
+	// the same thing in one packet: the ranges an acknowledgement names cover
+	// what arrived, and a run of eight of them costs one range.
+	ackThreshold = 8
 
 	// maxAckDelay is how long an acknowledgement may wait for a second packet.
 	maxAckDelay = 25 * time.Millisecond

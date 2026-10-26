@@ -213,34 +213,71 @@ func TestAckScheduler(t *testing.T) {
 	if scheduler.pack(now) != nil {
 		t.Fatal("the same acknowledgement was sent twice")
 	}
-	// The packet count is counted since the last acknowledgement, so the next
-	// packet waits for its companion.
-	if scheduler.received(1, now) {
-		t.Fatal("the first packet after an acknowledgement asked for an immediate acknowledgement")
+	// The packet count is counted since the last acknowledgement, so a run of
+	// packets shorter than the threshold waits for the delay.
+	for pn := uint32(1); pn < ackThreshold; pn++ {
+		if scheduler.received(pn, now) {
+			t.Fatalf("packet %d of %d asked for an immediate acknowledgement", pn, ackThreshold)
+		}
 	}
-	if !scheduler.received(2, now) {
-		t.Fatal("the second packet after an acknowledgement did not ask for an immediate acknowledgement")
+	if !scheduler.received(ackThreshold, now) {
+		t.Fatalf("the %dth packet after an acknowledgement did not ask for an immediate acknowledgement", ackThreshold)
 	}
 	if scheduler.pack(now) == nil {
 		t.Fatal("nothing was acknowledged")
 	}
 
 	// A hole is worth an acknowledgement before the delay expires.
-	if scheduler.received(5, now) {
+	if scheduler.received(ackThreshold+2, now) {
 		t.Fatal("a new largest packet asked for an immediate acknowledgement")
 	}
-	if !scheduler.received(3, now) {
+	if !scheduler.received(ackThreshold+1, now) {
 		t.Fatal("a packet below a hole did not ask for an immediate acknowledgement")
 	}
 
 	// A duplicate reports nothing new, so it neither acknowledges nor resets the
 	// delay.
 	scheduler.pack(now)
-	if scheduler.received(3, now) {
+	if scheduler.received(ackThreshold+1, now) {
 		t.Fatal("a duplicate asked for an acknowledgement")
 	}
 	if scheduler.pack(now) != nil {
 		t.Fatal("a duplicate was acknowledged")
+	}
+}
+
+// TestAckCoalescing requires a run of packets to be answered by one
+// acknowledgement that names all of them, which is what keeps a fast path from
+// spending its system calls on answers.
+func TestAckCoalescing(t *testing.T) {
+	var scheduler ackScheduler
+	now := time.Now()
+	immediate := 0
+	for pn := uint32(0); pn < 2*ackThreshold; pn++ {
+		if scheduler.received(pn, now) {
+			immediate++
+			if body := scheduler.pack(now); body == nil {
+				t.Fatalf("packet %d was not acknowledged", pn)
+			}
+		}
+	}
+	if immediate != 2 {
+		t.Fatalf("a run of %d packets was acknowledged %d times", 2*ackThreshold, immediate)
+	}
+	body := scheduler.pack(now)
+	if body != nil {
+		t.Fatalf("the run was acknowledged again")
+	}
+	var last ackScheduler
+	for pn := uint32(0); pn < ackThreshold; pn++ {
+		last.received(pn, now)
+	}
+	packed, err := nextFrameAck(t, last.pack(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packed.largest != ackThreshold-1 || packed.count != 1 || packed.ranges[0].start != 0 || packed.ranges[0].end != ackThreshold-1 {
+		t.Fatalf("acknowledged %+v", packed)
 	}
 }
 
