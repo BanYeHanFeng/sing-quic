@@ -176,19 +176,23 @@ type association struct {
 	// atomic rather than a field under sendMu.
 	peerAddr atomic.Pointer[net.Addr]
 
-	sendMu      sync.Mutex
-	sendRing    keyRing
-	sendPacket  uint32
-	buildBuffer []byte
+	sendMu     sync.Mutex
+	sendRing   keyRing
+	sendPacket uint32
 	// batchIO moves the packets of one flush in as few calls as the socket
-	// allows. pending holds the ones already sealed and numbered, batchBuffers
-	// is where they were sealed one after another so that a segmented send has
-	// nothing to copy, and writeBuffer is the list handed to the socket.
+	// allows. pending holds the packets of the batch in the order they were
+	// numbered, sealed counts the ones of them that are sealed, batchBuffers is
+	// where every one of them is assembled, and writeBuffer is the list handed to
+	// the socket.
 	batchIO      udpio.Conn
 	pending      []pendingPacket
+	sealed       int
 	batchBuffers []byte
 	writeBuffer  []udpio.Packet
-	queue        frameQueue
+	// sealNonce is the nonce of the packet being sealed, reused: twelve bytes per
+	// packet is a third of what sealing one costs.
+	sealNonce [nonceLen]byte
+	queue     frameQueue
 	// maxPayload is how many payload bytes a packet may carry, which is smaller
 	// than what the MTU allows once this end protects its packets: the parity
 	// shards and the description in their headers have to fit as well.
@@ -285,7 +289,7 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		sendRing:     result.send,
 		recvRing:     result.recv,
 		batchIO:      udpio.New(conn, udpio.Options{GRO: true, DisableGSO: options.DisableGSO}),
-		batchBuffers: make([]byte, 0, 2*maxPacketSize),
+		batchBuffers: make([]byte, 0, batchRoom),
 		maxPayload:   maxPacketSize - headerLen - tagLen,
 		fecSender:    newFECSender(options.FEC),
 		fec:          newFECReceiver(),

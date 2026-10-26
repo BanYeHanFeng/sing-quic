@@ -130,6 +130,58 @@ func TestSealOpen(t *testing.T) {
 	}
 }
 
+// TestSealInPlace checks that a packet sealed where it lies is the packet seal would
+// have produced, description and tag included: the send path assembles the packets
+// of a batch in place, so the two spellings of one packet have to agree byte for
+// byte, and the one the socket is handed has to open back into the payload.
+func TestSealInPlaceMatchesSeal(t *testing.T) {
+	ring := testRing(t, 0, 0x11)
+	description := &fecHeader{GroupID: 1, Index: 1, MemberCount: 2, ParityCount: 2, lengths: make([]byte, 2*fecLengthLen)}
+	description.setMemberLength(0, 100)
+	description.setMemberLength(1, 200)
+	for _, size := range []int{0, 1, 1000, maxPacketSize - headerLen - tagLen} {
+		for _, isParity := range []bool{false, true} {
+			payload := bytes.Repeat([]byte{0xa5}, size)
+			h := testHeader(ring.epoch())
+			h.PacketNumber = uint32(size)
+			var header *fecHeader
+			if isParity {
+				h.Type = packetTypeFEC
+				header = description
+			}
+			expected, err := ring.seal(nil, h, header, payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			room := headerLen + size + tagLen
+			if header != nil {
+				room += fecFixedLen + fecLengthLen*int(header.MemberCount)
+			}
+			packet := make([]byte, room)
+			written := h.appendTo(packet[:0])
+			if header != nil {
+				written = header.appendTo(written)
+			}
+			payloadStart := len(written)
+			copy(packet[payloadStart:], payload)
+			ring.sealInPlace(make([]byte, 0, nonceLen), packet, payloadStart, h.PacketNumber)
+			if !bytes.Equal(packet, expected) {
+				t.Fatalf("size %d: sealing in place produced %d bytes of other bytes", size, len(packet))
+			}
+			opened, openedParity, openedPayload, err := ring.open(packet)
+			if err != nil {
+				t.Fatalf("size %d: the packet does not open: %v", size, err)
+			}
+			if opened.Type != h.Type || (openedParity != nil) != isParity {
+				t.Fatalf("size %d: the packet opened as type %d", size, opened.Type)
+			}
+			if !bytes.Equal(openedPayload, payload) {
+				t.Fatalf("size %d: the payload changed", size)
+			}
+		}
+	}
+}
+
 func TestSealRejectsStaleEpoch(t *testing.T) {
 	ring := testRing(t, 0, 0x11)
 	if _, err := ring.seal(nil, testHeader(1), nil, nil); err == nil {

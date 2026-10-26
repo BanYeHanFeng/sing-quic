@@ -389,6 +389,12 @@ type fecSender struct {
 	groupID  uint32
 	shardLen int
 
+	// planned is how many members the open group has been promised. It is what
+	// closes the group, and it counts packets as they are numbered rather than as
+	// they are sealed: a group is a run of consecutive packet numbers, so the one
+	// that fills it is known before the batch is sealed.
+	planned int
+
 	// free is the buffers of the groups already encoded, lengths the room to
 	// describe the group being encoded and shards the list of shards it was
 	// encoded into. A group is 2k+m packet-sized buffers, and asking the allocator
@@ -551,36 +557,29 @@ func (s *fecSender) close() {
 	}
 	s.group = s.group[:0]
 	s.shardLen = 0
+	s.planned = 0
 	if s.timer != nil {
 		s.timer.Stop()
 	}
 }
 
-// fecMemberLocked adds a packet that just left to the open group, and encodes the
-// group once it holds a full one. The caller holds sendMu.
-func (a *association) fecMemberLocked(packet []byte, packetNumber uint32) error {
-	sender := a.fecSender
-	if sender == nil {
-		return nil
-	}
-	if len(sender.group) == 0 {
+// add hands one sealed packet to the open group. The caller holds sendMu.
+//
+// The packet bytes are kept rather than a description of them: a member is
+// recovered as the packet the sender wrote, which is what makes it authenticable
+// and what keeps recovery from being a second kind of receive.
+func (s *fecSender) add(packet []byte, packetNumber uint32) {
+	if len(s.group) == 0 {
 		// A group is named after its first member, which is what a receiver counts
 		// from: members are not enumerated, they are the packet numbers that follow.
-		sender.groupID = packetNumber
-		sender.timer.Reset(fecGroupTimeout)
+		s.groupID = packetNumber
+		s.timer.Reset(fecGroupTimeout)
 	}
-	// The packet bytes are kept rather than a description of them: a member is
-	// recovered as the packet the sender wrote, which is what makes it
-	// authenticable and what keeps recovery from being a second kind of receive.
-	member := append(sender.buffer(), packet...)
-	sender.group = append(sender.group, member)
-	if len(member) > sender.shardLen {
-		sender.shardLen = len(member)
+	member := append(s.buffer(), packet...)
+	s.group = append(s.group, member)
+	if len(member) > s.shardLen {
+		s.shardLen = len(member)
 	}
-	if len(sender.group) < sender.dataShards {
-		return nil
-	}
-	return a.sendParityLocked()
 }
 
 // fecObserve tells the sender what one acknowledgement settled, so that the
@@ -623,14 +622,14 @@ func (a *association) flushFECGroup() {
 		return
 	default:
 	}
-	if len(sender.group) < fecMinGroupMembers {
+	if sender.planned < fecMinGroupMembers {
 		// Two packets are not worth as many parity shards: what a group this small
 		// buys is one timeout of latency on a loss, and the sender is idle enough
 		// that what it protects is not what the peer is waiting for.
 		sender.close()
 		return
 	}
-	if err := a.sendParityLocked(); err != nil {
+	if err := a.closeGroupLocked(); err != nil {
 		return
 	}
 	// Nothing else is going to fill a batch on a timer: the group closed on its
@@ -638,10 +637,16 @@ func (a *association) flushFECGroup() {
 	_ = a.writePendingLocked()
 }
 
-// sendParityLocked encodes the open group and sends its parity shards, one packet
-// each. The caller holds sendMu.
-func (a *association) sendParityLocked() error {
+// closeGroupLocked ends the open group: it seals the members the group was
+// promised, computes the parity shards over them and plans the packets that carry
+// them. The caller holds sendMu.
+//
+// The members have to be sealed here rather than with the rest of the batch: a
+// parity shard is a function of the packets the sender wrote, so the encoder reads
+// what the socket is going to send.
+func (a *association) closeGroupLocked() error {
 	sender := a.fecSender
+	a.sealPendingLocked()
 	members := sender.group
 	if len(members) == 0 {
 		return nil
@@ -674,7 +679,7 @@ func (a *association) sendParityLocked() error {
 	if err == nil {
 		for index, shard := range parity {
 			description.Index = uint8(index)
-			err = a.sendParityPacketLocked(description, shard)
+			err = a.planParityLocked(description, shard)
 			if err != nil {
 				break
 			}
@@ -686,29 +691,40 @@ func (a *association) sendParityLocked() error {
 	return err
 }
 
-// sendParityPacketLocked writes one parity shard. The caller holds sendMu, so the
-// packet number is the next one in the sequence: parity packets are numbered like
-// everything else, which is what keeps the members of a group in the one order the
-// description assumes.
-func (a *association) sendParityPacketLocked(description fecHeader, shard []byte) error {
+// planParityLocked puts one parity shard into the batch. The caller holds sendMu,
+// so the packet number is the next one in the sequence: parity packets are numbered
+// like everything else, which is what keeps the members of a group in the one order
+// the description assumes.
+func (a *association) planParityLocked(description fecHeader, shard []byte) error {
 	h := header{
 		ConnectionID: a.peerConnID,
 		Type:         packetTypeFEC,
 		Epoch:        a.sendRing.epoch(),
 		PacketNumber: a.sendPacket,
 	}
-	packet, err := a.sealLocked(h, &description, shard)
+	if len(a.pending) >= maxSendBatch {
+		if err := a.writePendingLocked(); err != nil {
+			return err
+		}
+	}
+	packet, payloadStart, err := a.reserveLocked(h, &description, len(shard))
 	if err != nil {
 		return err
 	}
+	copy(packet[payloadStart:], shard)
 	a.sendPacket++
-	return a.appendPacketLocked(&sentPacket{
-		packetNumber: h.PacketNumber,
-		sentAt:       time.Now(),
-		size:         len(packet),
-		ackEliciting: true,
-		parity:       true,
-	}, packet)
+	a.pending = append(a.pending, pendingPacket{
+		sent: &sentPacket{
+			packetNumber: h.PacketNumber,
+			sentAt:       time.Now(),
+			size:         len(packet),
+			ackEliciting: true,
+			parity:       true,
+		},
+		packet:       packet,
+		payloadStart: payloadStart,
+	})
+	return nil
 }
 
 // fecCachedPacket is one packet kept for the group it belongs to.

@@ -331,6 +331,22 @@ func (ring *keyRing) seal(dst []byte, h header, fec *fecHeader, payload []byte) 
 	return ring.current.aead.Seal(dst, nonce(ring.current.epoch, h.PacketNumber), payload, clearHeader), nil
 }
 
+// sealInPlace seals a packet whose clear header and payload are already where the
+// packet belongs: the payload is encrypted where it is and the tag follows it, so
+// the bytes a sender assembled are the bytes it sends.
+//
+// What the packet turns into is what seal would have produced: the payload is
+// encrypted in its place with the header in front of it as the additional data, and
+// the only room taken behind it is the tag's. scratch is the room for the nonce the
+// caller reuses, because a sender seals a packet every few microseconds and asking
+// the allocator for twelve bytes each time is a third of what sealing one costs.
+func (ring *keyRing) sealInPlace(scratch []byte, packet []byte, payloadStart int, packetNumber uint32) {
+	nonce := appendNonce(scratch[:0], ring.current.epoch, packetNumber)
+	clearHeader := packet[:payloadStart]
+	payload := packet[payloadStart : len(packet)-tagLen]
+	ring.current.aead.Seal(clearHeader, nonce, payload, clearHeader)
+}
+
 // open parses and authenticates packet, whose keys must belong to the
 // association it is addressed to. The returned payload and the lengths of a
 // returned group description point into packet and must be used before it is
@@ -371,10 +387,15 @@ func (ring *keyRing) open(packet []byte) (header, *fecHeader, []byte, error) {
 // key already differs per epoch, which costs nothing and makes a nonce repeat
 // after a wrap around impossible: the key changed when the epoch did.
 func nonce(epoch uint8, packetNumber uint32) []byte {
-	n := make([]byte, nonceLen)
-	n[0] = epoch
-	binary.BigEndian.PutUint32(n[nonceLen-packetNumberLen:], packetNumber)
-	return n
+	return appendNonce(make([]byte, 0, nonceLen), epoch, packetNumber)
+}
+
+// appendNonce appends the nonce of a packet to dst: the epoch, room for nothing in
+// particular, and the packet number, which is what makes a nonce never repeat
+// under one key.
+func appendNonce(dst []byte, epoch uint8, packetNumber uint32) []byte {
+	dst = append(dst, epoch, 0, 0, 0, 0, 0, 0, 0)
+	return binary.BigEndian.AppendUint32(dst, packetNumber)
 }
 
 // newAEAD builds the AEAD a packet key is used with. ChaCha20-Poly1305 is the

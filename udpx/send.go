@@ -26,6 +26,11 @@ import (
 // the stream's send buffer, which is why that buffer is released only once the
 // frame leaves the flight table — and nothing about the packet it travels in is
 // remembered by the frame beyond its number.
+//
+// A packet is assembled in one place: the batch buffer. The clear header and the
+// payload are written where the packet belongs as it is planned, sealing encrypts
+// the payload where it is, and the region the packet fills is what the socket is
+// handed, so no byte of a packet is ever moved from where it was written.
 type outFrame struct {
 	// payload is the encoded frame, for every frame that is not a stream frame.
 	payload []byte
@@ -188,13 +193,25 @@ type sentPacket struct {
 // not: a run of acknowledgements, or the parity shards of a group encoded at once.
 const maxSendBatch = 16
 
-// pendingPacket is a packet that has left the frame queue and has a number but has
-// not left the host. priorInFlight is what was in flight when it was recorded,
-// which the congestion controller needs per packet and which therefore cannot be
-// read after the whole batch has been added.
+// batchRoom is the room one batch has: a batch holds at most maxSendBatch packets
+// and no packet is longer than maxPacketSize, so a batch that starts empty never
+// has to grow in the middle of being filled — which is what lets the packets
+// already planned keep pointing into it.
+const batchRoom = maxSendBatch * maxPacketSize
+
+// pendingPacket is one packet of the batch, from the moment it has a number and a
+// place in the batch buffer to the moment the batch leaves the host.
 type pendingPacket struct {
-	sent          *sentPacket
-	packet        []byte
+	sent *sentPacket
+	// packet is the region of the batch buffer the packet fills, from its clear
+	// header to the last byte of its tag.
+	packet []byte
+	// payloadStart is where the payload begins in packet: what is in front of it is
+	// the clear header, which sealing authenticates rather than encrypts.
+	payloadStart int
+	// priorInFlight is what was in flight when the packet was recorded, which the
+	// congestion controller needs per packet and which therefore cannot be read
+	// after the whole batch has been added.
 	priorInFlight int
 }
 
@@ -353,10 +370,10 @@ func isLost(packet *sentPacket, now time.Time, largestAcked uint32, lossDelay ti
 // as the congestion window and the pacing rate allow. What does not fit stays
 // queued: an acknowledgement opens the window again and calls this.
 //
-// A flush is a batch: packets are sealed one after another into one buffer and
-// leave in as few calls as the socket allows. Whether that is one call or twenty
-// is the socket's business, and a socket that can segment sends a run of equal
-// packets with a single one.
+// A flush is a batch: packets are assembled into one buffer and leave in as few
+// calls as the socket allows. Whether that is one call or twenty is the socket's
+// business, and a socket that can segment sends a run of equal packets with a
+// single one.
 func (a *association) flush() error {
 	a.sendMu.Lock()
 	defer a.sendMu.Unlock()
@@ -372,7 +389,7 @@ func (a *association) flush() error {
 		}
 		if !a.windowAllows() {
 			if len(a.pending) > 0 {
-				// What is sealed leaves before the window is asked again: it was
+				// What is planned leaves before the window is asked again: it was
 				// taken while the window was open, and the acknowledgement that
 				// opens the window further is an answer to it.
 				if err := a.writePendingLocked(); err != nil {
@@ -386,7 +403,7 @@ func (a *association) flush() error {
 				// before it can send anything, and an acknowledgement is not
 				// congestion controlled. Two ends that each held one back would
 				// wait for the other to open a window neither of them can open.
-				err := a.sendFramesLocked(acknowledgement)
+				err := a.planLocked(acknowledgement)
 				if err != nil {
 					return err
 				}
@@ -411,20 +428,36 @@ func (a *association) flush() error {
 		if len(frames) == 0 {
 			return E.New("frame of ", a.queue.frames[0].size(), " bytes does not fit in a packet")
 		}
-		err := a.sendFramesLocked(frames)
+		err := a.planLocked(frames)
 		if err != nil {
 			return err
 		}
 	}
 }
 
-// sendFramesLocked writes the frames as one packet. The caller holds sendMu,
-// which is what keeps packet numbers leaving in the order they were assigned.
-func (a *association) sendFramesLocked(frames []outFrame) error {
+// planLocked puts the frames into the batch as one packet and, when this packet is
+// the one that fills a FEC group, closes the group.
+//
+// What a packet is gets decided here: its number, its clear header, its payload and
+// its place in the batch buffer. Sealing is what waits, for one of two reasons: the
+// members of a group have to be sealed before the parity shards that cover them can
+// be computed, and the packets of a batch are sealed together when the batch leaves.
+// The caller holds sendMu, which is what keeps packet numbers leaving in the order
+// they were assigned.
+func (a *association) planLocked(frames []outFrame) error {
 	select {
 	case <-a.ctx.Done():
 		return context.Cause(a.ctx)
 	default:
+	}
+	if len(a.pending) >= maxSendBatch {
+		if err := a.writePendingLocked(); err != nil {
+			return err
+		}
+	}
+	payloadLen := 0
+	for _, frame := range frames {
+		payloadLen += frame.size()
 	}
 	h := header{
 		ConnectionID: a.peerConnID,
@@ -432,61 +465,92 @@ func (a *association) sendFramesLocked(frames []outFrame) error {
 		Epoch:        a.sendRing.epoch(),
 		PacketNumber: a.sendPacket,
 	}
-	payload := a.buildBuffer[:0]
+	packet, payloadStart, err := a.reserveLocked(h, nil, payloadLen)
+	if err != nil {
+		return err
+	}
+	payload := packet[payloadStart:payloadStart]
 	for _, frame := range frames {
 		payload = frame.appendTo(payload)
 	}
-	a.buildBuffer = payload[:0]
 	sent := &sentPacket{
 		packetNumber: h.PacketNumber,
 		sentAt:       time.Now(),
 		frames:       frames,
+		size:         len(packet),
 	}
 	for index := range frames {
 		frames[index].lastSent = h.PacketNumber
 		sent.ackEliciting = sent.ackEliciting || frames[index].ackEliciting
 	}
-	packet, err := a.sealLocked(h, nil, payload)
-	if err != nil {
-		return err
-	}
-	sent.size = len(packet)
+	a.pending = append(a.pending, pendingPacket{sent: sent, packet: packet, payloadStart: payloadStart})
 	a.sendPacket++
-	err = a.appendPacketLocked(sent, packet)
-	if err != nil {
-		return err
-	}
-	return a.fecMemberLocked(packet, h.PacketNumber)
-}
-
-// sealLocked seals one packet at the end of the batch buffer, so that the packets
-// of a batch are one run of memory for a segmented send to take as it is.
-func (a *association) sealLocked(h header, description *fecHeader, payload []byte) ([]byte, error) {
-	start := len(a.batchBuffers)
-	if cap(a.batchBuffers) < start+maxPacketSize {
-		grown := make([]byte, start, 2*(start+maxPacketSize))
-		copy(grown, a.batchBuffers)
-		a.batchBuffers = grown
-	}
-	a.batchBuffers = a.batchBuffers[:start+maxPacketSize]
-	packet, err := a.sendRing.seal(a.batchBuffers[start:start], h, description, payload)
-	if err != nil {
-		a.batchBuffers = a.batchBuffers[:start]
-		return nil, err
-	}
-	a.batchBuffers = a.batchBuffers[:start+len(packet)]
-	return packet, nil
-}
-
-// appendPacketLocked adds a sealed packet to the batch, writing the batch out when
-// it is full. A group of parity shards is encoded all at once, so the batch can
-// fill in the middle of one.
-func (a *association) appendPacketLocked(sent *sentPacket, packet []byte) error {
-	a.pending = append(a.pending, pendingPacket{sent: sent, packet: packet})
-	if len(a.pending) >= maxSendBatch {
-		return a.writePendingLocked()
+	if a.fecSender != nil {
+		// A group is a run of consecutive packet numbers, so it fills as they are
+		// numbered rather than as they are sealed, and the parity shards are numbered
+		// right behind the member that filled it.
+		a.fecSender.planned++
+		if a.fecSender.planned == a.fecSender.dataShards {
+			return a.closeGroupLocked()
+		}
 	}
 	return nil
+}
+
+// reserveLocked makes room for one packet of the batch and writes the part of it
+// that is in the clear: the common header and, for a parity shard, the description
+// of its group. It returns the region the packet fills and where the payload starts
+// in it.
+//
+// The room is exactly what the packet takes — as long as the description makes the
+// header, the payload, and a tag behind it — because the region is what the socket
+// is going to be handed.
+func (a *association) reserveLocked(h header, description *fecHeader, payloadLen int) (packet []byte, payloadStart int, err error) {
+	length := headerLen + payloadLen + tagLen
+	if description != nil {
+		length += fecFixedLen + fecLengthLen*int(description.MemberCount)
+	}
+	start := len(a.batchBuffers)
+	if start+length > batchRoom {
+		// A batch that asked for more than one batch holds is a batch that should
+		// have left before this packet was planned.
+		return nil, 0, E.New("packet of ", length, " bytes in a batch of ", start, " bytes")
+	}
+	written := h.appendTo(a.batchBuffers[start:start])
+	if description != nil {
+		written = description.appendTo(written)
+	}
+	a.batchBuffers = a.batchBuffers[:start+length]
+	return a.batchBuffers[start : start+length], len(written), nil
+}
+
+// sealPendingLocked seals the packets of the batch that are not sealed yet, and
+// hands the ones that carry frames to the FEC group being assembled.
+//
+// Sealing happens where the payload is, which is what keeps a packet from being
+// assembled twice: the region of the batch buffer the socket is going to be handed
+// is the region the payload was written into and the region the tag is written
+// behind. The caller holds sendMu.
+func (a *association) sealPendingLocked() {
+	if a.sealed == len(a.pending) {
+		return
+	}
+	unsealed := a.pending[a.sealed:]
+	for index := range unsealed {
+		a.sendRing.sealInPlace(a.sealNonce[:], unsealed[index].packet, unsealed[index].payloadStart, unsealed[index].sent.packetNumber)
+	}
+	a.sealed = len(a.pending)
+	if a.fecSender == nil {
+		return
+	}
+	for index := range unsealed {
+		if unsealed[index].sent.parity {
+			// A parity shard covers the group that is already closed rather than
+			// being a member of the one being assembled.
+			continue
+		}
+		a.fecSender.add(unsealed[index].packet, unsealed[index].sent.packetNumber)
+	}
 }
 
 // writePendingLocked puts the sealed packets on the wire in one call where it can,
@@ -502,6 +566,7 @@ func (a *association) writePendingLocked() error {
 		return context.Cause(a.ctx)
 	default:
 	}
+	a.sealPendingLocked()
 	remote := a.RemoteAddr()
 	packets := a.writeBuffer[:0]
 	for index := range a.pending {
@@ -559,5 +624,6 @@ func (a *association) clearPendingLocked() {
 		a.pending[index] = pendingPacket{}
 	}
 	a.pending = a.pending[:0]
+	a.sealed = 0
 	a.batchBuffers = a.batchBuffers[:0]
 }
