@@ -10,7 +10,6 @@ import (
 	"github.com/sagernet/sing-quic/udpx"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -179,7 +178,7 @@ func (c *Client) offerNew(ctx context.Context) (*clientSession, error) {
 	// or whatever a proxy chain gave it. The transport addresses a session by the
 	// socket it runs on, so the one destination this connection has is what its
 	// writes go to and what its reads come from.
-	association, err := udpx.Dial(ctx, bufio.NewUnbindPacketConn(udpConn), remote, c.password, c.transport)
+	association, err := udpx.Dial(ctx, bindPacketConn(udpConn), remote, c.password, c.transport)
 	if err != nil {
 		_ = udpConn.Close()
 		c.logger.Error("QUICX dial failed: stage=handshake server=", c.serverAddr, " remote=", remote, " elapsed=", dialElapsed(dialStart), " error=", err)
