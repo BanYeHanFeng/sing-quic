@@ -82,6 +82,7 @@ func fecQueueFrame(t *testing.T, a *association, offset uint64, size int, fill b
 	if err != nil {
 		t.Fatal(err)
 	}
+	drainWrites(t, a)
 	return data
 }
 
@@ -271,6 +272,7 @@ func TestFECGroupTimer(t *testing.T) {
 	// that nothing more is coming.
 	fecQueueFrame(t, sender, 0, 1000, 0)
 	time.Sleep(4 * fecGroupTimeout)
+	drainWrites(t, sender)
 	if written := conn.len(); written != 1 {
 		t.Fatalf("%d packets written for a group of one member", written)
 	}
@@ -279,6 +281,7 @@ func TestFECGroupTimer(t *testing.T) {
 	fecQueueFrame(t, sender, 1000, 1000, 1)
 	fecQueueFrame(t, sender, 2000, 1000, 2)
 	time.Sleep(4 * fecGroupTimeout)
+	drainWrites(t, sender)
 	packets := fecTestPackets(t, conn, &sender.sendRing)
 	if len(packets) != 5 {
 		t.Fatalf("%d packets written for a group of two members", len(packets))
@@ -416,6 +419,7 @@ func TestFECRecoveredOnce(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	drainWrites(t, sender)
 	packets := fecTestPackets(t, conn, &sender.sendRing)
 	if len(packets) != 6 {
 		t.Fatalf("%d packets written for one group", len(packets))

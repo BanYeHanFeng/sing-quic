@@ -702,7 +702,7 @@ func (a *association) planParityLocked(description fecHeader, shard []byte) erro
 		Epoch:        a.sendRing.epoch(),
 		PacketNumber: a.sendPacket,
 	}
-	if len(a.pending) >= maxSendBatch {
+	if len(a.batch.pending) >= maxSendBatch {
 		if err := a.writePendingLocked(); err != nil {
 			return err
 		}
@@ -713,10 +713,9 @@ func (a *association) planParityLocked(description fecHeader, shard []byte) erro
 	}
 	copy(packet[payloadStart:], shard)
 	a.sendPacket++
-	a.pending = append(a.pending, pendingPacket{
+	a.batch.pending = append(a.batch.pending, pendingPacket{
 		sent: &sentPacket{
 			packetNumber: h.PacketNumber,
-			sentAt:       time.Now(),
 			size:         len(packet),
 			ackEliciting: true,
 			parity:       true,

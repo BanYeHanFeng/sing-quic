@@ -197,16 +197,22 @@ type association struct {
 	sendMu     sync.Mutex
 	sendRing   keyRing
 	sendPacket uint32
-	// batchIO moves the packets of one flush in as few calls as the socket
-	// allows. pending holds the packets of the batch in the order they were
-	// numbered, sealed counts the ones of them that are sealed, batchBuffers is
-	// where every one of them is assembled, and writeBuffer is the list handed to
-	// the socket.
-	batchIO      udpio.Conn
-	pending      []pendingPacket
-	sealed       int
-	batchBuffers []byte
-	writeBuffer  []udpio.Packet
+	// batchIO moves the packets of one batch in as few calls as the socket
+	// allows. batch is the one being filled; written carries it to the write loop
+	// once it is full, and freeBatches carries it back once the socket has taken
+	// it. What is written here is what is in flight, so a batch that is on its way
+	// into the socket already counts against the window.
+	batchIO     udpio.Conn
+	batch       *batch
+	written     chan *batch
+	freeBatches chan *batch
+	// writing counts the batches the write loop has been handed and has not
+	// written yet, which is what closing waits for before it takes the socket
+	// away: the close of an association is heard by its peer.
+	writingMu sync.Mutex
+	writing   int
+	writeStop chan struct{}
+	writeDone chan struct{}
 	// sealNonce is the nonce of the packet being sealed, reused: twelve bytes per
 	// packet is a third of what sealing one costs.
 	sealNonce [nonceLen]byte
@@ -306,7 +312,10 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		sendRing:     result.send,
 		recvRing:     result.recv,
 		batchIO:      udpio.New(conn, udpio.Options{GRO: true, DisableGSO: options.DisableGSO}),
-		batchBuffers: make([]byte, 0, batchRoom),
+		freeBatches:  make(chan *batch, writeBatchSlots),
+		written:      make(chan *batch, writeBatchSlots),
+		writeStop:    make(chan struct{}),
+		writeDone:    make(chan struct{}),
 		maxPayload:   maxPacketSize - headerLen - tagLen,
 		fecSender:    newFECSender(options.FEC),
 		fec:          newFECReceiver(),
@@ -330,6 +339,13 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		a.fecSender.timer.Stop()
 	}
 	a.peerAddr.Store(&peer)
+	// The batches come before the loop that uses them, and the loop comes last: a
+	// timer that fired before the association was complete would hand over a batch
+	// nothing is there to write.
+	for range writeBatchSlots {
+		a.freeBatches <- newBatch()
+	}
+	a.batch = <-a.freeBatches
 	// Every timer starts out a hour away and is armed once the pointer to the set
 	// is in place: a timer whose callback runs before the association has finished
 	// building itself would read fields that nothing has written yet.
@@ -344,6 +360,7 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 	timers.pace.Stop()
 	a.timers.Store(timers)
 	timers.idle.Reset(a.options.IdleTimeout)
+	go a.writeLoop()
 	if a.options.KeepAlivePeriod > 0 {
 		go a.keepAliveLoop()
 	}
@@ -384,6 +401,10 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 		}
 		if notifyPeer {
 			_ = a.send(appendClose(nil, closeCodeOf(cause)))
+			// The close packet goes to the socket behind whatever was handed over
+			// before it, so the socket waits for the write loop before it is taken
+			// away: an association that ends is one whose peer heard why.
+			a.drainWrites()
 		}
 		timers := a.timers.Load()
 		timers.idle.Stop()
@@ -395,8 +416,16 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 		}
 		a.cancel(cause)
 		a.closeStreams(cause)
+		// The write loop stops once the socket is gone: closing it is what wakes a
+		// write that is waiting for room, and the loop is what a stuck write would
+		// otherwise keep alive.
+		close(a.writeStop)
 		if a.ownsConn {
 			_ = a.conn.Close()
+		}
+		select {
+		case <-a.writeDone:
+		case <-time.After(writeDrainTimeout):
 		}
 		if a.onClose != nil {
 			a.onClose()

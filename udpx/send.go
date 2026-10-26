@@ -31,6 +31,12 @@ import (
 // payload are written where the packet belongs as it is planned, sealing encrypts
 // the payload where it is, and the region the packet fills is what the socket is
 // handed, so no byte of a packet is ever moved from where it was written.
+//
+// A batch is handed to a write loop of its own, which is what lets the two halves
+// of sending happen at once: while the socket is taking one batch, the send path
+// is framing, sealing and encoding the next one. Two batches exist at a time, one
+// being filled and one being written, and only one of them is ever on its way into
+// the socket, so packet numbers still leave in the order they were assigned.
 type outFrame struct {
 	// payload is the encoded frame, for every frame that is not a stream frame.
 	payload []byte
@@ -198,6 +204,60 @@ const maxSendBatch = 16
 // has to grow in the middle of being filled — which is what lets the packets
 // already planned keep pointing into it.
 const batchRoom = maxSendBatch * maxPacketSize
+
+// writeBatchSlots is how many batches the send path holds at once: the one it is
+// filling and the one the write loop is handing to the socket. Two is what the
+// overlap needs, and more would only make a batch that is already complete wait
+// behind another one, because a packet number leaves in the order it was assigned.
+const writeBatchSlots = 2
+
+// writeDrainTimeout bounds how long closing waits for the socket to take the batch
+// it was handed. A socket that stopped accepting writes is unblocked by closing it,
+// which is what the caller does next: a close that waited for a stuck socket would
+// hang the association instead of ending it.
+const writeDrainTimeout = 100 * time.Millisecond
+
+// writeDrainPoll is how often closing looks while it waits.
+const writeDrainPoll = 20 * time.Microsecond
+
+// batch is one buffer a batch of packets is assembled in and handed to the socket
+// in.
+//
+// It is a thing of its own rather than a field of the association because two of
+// them exist at the same time: the one being filled and the one being written. A
+// batch belongs to the send path from the moment it is taken until it is handed
+// over, and to the write loop from then until it comes back, so nothing in it is
+// touched by both at once.
+type batch struct {
+	// buffer is where the packets are assembled: the room a packet needs is taken
+	// before its payload is known byte for byte, and what the socket is handed is
+	// the region the packet was written into.
+	buffer []byte
+	// pending is the packets of the batch in the order they were numbered, and
+	// sealed counts the ones of them that are sealed.
+	pending []pendingPacket
+	sealed  int
+	// packets is the list handed to the socket.
+	packets []udpio.Packet
+}
+
+func newBatch() *batch {
+	return &batch{buffer: make([]byte, 0, batchRoom)}
+}
+
+// reset empties the batch for the next fill, keeping what the next batch needs:
+// the room the packets are written in and the array of packets themselves. The
+// pending entries are cleared because they hold the regions of the buffer and the
+// packets in flight, neither of which outlives the write.
+func (b *batch) reset() {
+	for index := range b.pending {
+		b.pending[index] = pendingPacket{}
+	}
+	b.pending = b.pending[:0]
+	b.packets = b.packets[:0]
+	b.sealed = 0
+	b.buffer = b.buffer[:0]
+}
 
 // pendingPacket is one packet of the batch, from the moment it has a number and a
 // place in the batch buffer to the moment the batch leaves the host.
@@ -381,14 +441,14 @@ func (a *association) flush() error {
 		if a.queue.len() == 0 {
 			return a.writePendingLocked()
 		}
-		if len(a.pending) >= maxSendBatch {
+		if len(a.batch.pending) >= maxSendBatch {
 			if err := a.writePendingLocked(); err != nil {
 				return err
 			}
 			continue
 		}
 		if !a.windowAllows() {
-			if len(a.pending) > 0 {
+			if len(a.batch.pending) > 0 {
 				// What is planned leaves before the window is asked again: it was
 				// taken while the window was open, and the acknowledgement that
 				// opens the window further is an answer to it.
@@ -413,7 +473,7 @@ func (a *association) flush() error {
 			// nothing before that can change it.
 			return nil
 		}
-		if len(a.pending) == 0 {
+		if len(a.batch.pending) == 0 {
 			// The pacing rate is what spreads the batches over time, so it is
 			// asked once per batch: a batch that waited for its own last packet
 			// would hold one packet, and one packet per call is the thing the
@@ -450,7 +510,7 @@ func (a *association) planLocked(frames []outFrame) error {
 		return context.Cause(a.ctx)
 	default:
 	}
-	if len(a.pending) >= maxSendBatch {
+	if len(a.batch.pending) >= maxSendBatch {
 		if err := a.writePendingLocked(); err != nil {
 			return err
 		}
@@ -473,9 +533,10 @@ func (a *association) planLocked(frames []outFrame) error {
 	for _, frame := range frames {
 		payload = frame.appendTo(payload)
 	}
+	// The time the packet is sent is stamped by the batch, when it leaves the send
+	// path: what a round trip is measured from is the write, not the framing.
 	sent := &sentPacket{
 		packetNumber: h.PacketNumber,
-		sentAt:       time.Now(),
 		frames:       frames,
 		size:         len(packet),
 	}
@@ -483,7 +544,7 @@ func (a *association) planLocked(frames []outFrame) error {
 		frames[index].lastSent = h.PacketNumber
 		sent.ackEliciting = sent.ackEliciting || frames[index].ackEliciting
 	}
-	a.pending = append(a.pending, pendingPacket{sent: sent, packet: packet, payloadStart: payloadStart})
+	a.batch.pending = append(a.batch.pending, pendingPacket{sent: sent, packet: packet, payloadStart: payloadStart})
 	a.sendPacket++
 	if a.fecSender != nil {
 		// A group is a run of consecutive packet numbers, so it fills as they are
@@ -510,18 +571,18 @@ func (a *association) reserveLocked(h header, description *fecHeader, payloadLen
 	if description != nil {
 		length += fecFixedLen + fecLengthLen*int(description.MemberCount)
 	}
-	start := len(a.batchBuffers)
+	start := len(a.batch.buffer)
 	if start+length > batchRoom {
 		// A batch that asked for more than one batch holds is a batch that should
 		// have left before this packet was planned.
 		return nil, 0, E.New("packet of ", length, " bytes in a batch of ", start, " bytes")
 	}
-	written := h.appendTo(a.batchBuffers[start:start])
+	written := h.appendTo(a.batch.buffer[start:start])
 	if description != nil {
 		written = description.appendTo(written)
 	}
-	a.batchBuffers = a.batchBuffers[:start+length]
-	return a.batchBuffers[start : start+length], len(written), nil
+	a.batch.buffer = a.batch.buffer[:start+length]
+	return a.batch.buffer[start : start+length], len(written), nil
 }
 
 // sealPendingLocked seals the packets of the batch that are not sealed yet, and
@@ -532,14 +593,14 @@ func (a *association) reserveLocked(h header, description *fecHeader, payloadLen
 // is the region the payload was written into and the region the tag is written
 // behind. The caller holds sendMu.
 func (a *association) sealPendingLocked() {
-	if a.sealed == len(a.pending) {
+	if a.batch.sealed == len(a.batch.pending) {
 		return
 	}
-	unsealed := a.pending[a.sealed:]
+	unsealed := a.batch.pending[a.batch.sealed:]
 	for index := range unsealed {
 		a.sendRing.sealInPlace(a.sealNonce[:], unsealed[index].packet, unsealed[index].payloadStart, unsealed[index].sent.packetNumber)
 	}
-	a.sealed = len(a.pending)
+	a.batch.sealed = len(a.batch.pending)
 	if a.fecSender == nil {
 		return
 	}
@@ -553,30 +614,39 @@ func (a *association) sealPendingLocked() {
 	}
 }
 
-// writePendingLocked puts the sealed packets on the wire in one call where it can,
-// and records what they mean for what is in flight, for the congestion controller
-// and for the probe timer. The caller holds sendMu.
+// writePendingLocked hands the batch that is full to the write loop and takes the
+// next one to fill. What the packets mean for the window, for the congestion
+// controller and for the probe timer is recorded here rather than with the write,
+// so that the whole send path is one goroutine: what leaves the association is
+// what was decided here, and the write loop only moves bytes. The caller holds
+// sendMu.
 func (a *association) writePendingLocked() error {
-	if len(a.pending) == 0 {
+	current := a.batch
+	if len(current.pending) == 0 {
 		return nil
 	}
 	select {
 	case <-a.ctx.Done():
-		a.clearPendingLocked()
+		current.reset()
 		return context.Cause(a.ctx)
 	default:
 	}
 	a.sealPendingLocked()
+	// The batch leaves the send path now, so this is when its packets are sent: a
+	// packet planned at the start of the batch and one planned at its end wait for
+	// the same write, and a round trip is measured from the write rather than from
+	// the framing in front of it.
+	now := time.Now()
 	remote := a.RemoteAddr()
-	packets := a.writeBuffer[:0]
-	for index := range a.pending {
-		packets = append(packets, udpio.Packet{Data: a.pending[index].packet, Addr: remote})
+	current.packets = current.packets[:0]
+	for index := range current.pending {
+		current.pending[index].sent.sentAt = now
+		current.packets = append(current.packets, udpio.Packet{Data: current.pending[index].packet, Addr: remote})
 	}
-	a.writeBuffer = packets
 	a.flightMu.Lock()
 	wasEmpty := a.inFlight.len() == 0
-	for index := range a.pending {
-		packet := &a.pending[index]
+	for index := range current.pending {
+		packet := &current.pending[index]
 		if !packet.sent.ackEliciting {
 			// Nothing in this packet asks for an acknowledgement, so nothing will
 			// ever acknowledge it: putting it in flight would leave an entry that
@@ -588,21 +658,8 @@ func (a *association) writePendingLocked() error {
 		a.inFlight.append(packet.sent)
 	}
 	a.flightMu.Unlock()
-	err := a.batchIO.WritePackets(packets)
-	a.writeBuffer = packets[:0]
-	if err != nil {
-		a.flightMu.Lock()
-		for index := range a.pending {
-			if a.pending[index].sent.ackEliciting {
-				a.inFlight.remove(a.pending[index].sent)
-			}
-		}
-		a.flightMu.Unlock()
-		a.clearPendingLocked()
-		return E.Cause(err, "write packets")
-	}
-	for index := range a.pending {
-		packet := &a.pending[index]
+	for index := range current.pending {
+		packet := &current.pending[index]
 		if packet.sent.ackEliciting {
 			a.congestionSent(packet.sent.packetNumber, packet.sent.size, packet.priorInFlight, true)
 		}
@@ -614,16 +671,111 @@ func (a *association) writePendingLocked() error {
 	if wasEmpty {
 		a.armPTO()
 	}
-	a.clearPendingLocked()
+	// The next batch is taken before this one is handed over, which is what keeps
+	// the send path holding a batch at all times: what it waits for is the write of
+	// the batch in front of the one it just finished, and that wait is where the
+	// two halves of sending meet.
+	next, err := a.nextBatchLocked()
+	if err != nil {
+		current.reset()
+		return err
+	}
+	a.writingMu.Lock()
+	a.writing++
+	a.writingMu.Unlock()
+	// The hand over never waits: at most one batch is being written and at most one
+	// waits for its turn, because there are only two batches to pass around.
+	a.written <- current
+	a.batch = next
 	return nil
 }
 
-// clearPendingLocked forgets the batch, keeping its buffers for the next one.
-func (a *association) clearPendingLocked() {
-	for index := range a.pending {
-		a.pending[index] = pendingPacket{}
+// nextBatchLocked returns the batch to fill next: one the socket has finished
+// with. When the socket has finished with neither of them, the send path waits
+// here, which is the whole of the back pressure: one batch being written and one
+// being filled is what the pipeline holds, and a third would only queue behind the
+// write that a batch of 16 packets has to wait for anyway. The caller holds sendMu.
+func (a *association) nextBatchLocked() (*batch, error) {
+	select {
+	case next := <-a.freeBatches:
+		next.reset()
+		return next, nil
+	default:
 	}
-	a.pending = a.pending[:0]
-	a.sealed = 0
-	a.batchBuffers = a.batchBuffers[:0]
+	select {
+	case next := <-a.freeBatches:
+		next.reset()
+		return next, nil
+	case <-a.ctx.Done():
+		return nil, context.Cause(a.ctx)
+	}
+}
+
+// writeLoop is the other half of sending: it hands the batches the send path
+// filled to the socket, one at a time, in the order they were numbered.
+//
+// Writing a batch is a system call into a socket that may have to wait for room,
+// and it is the largest single item of the send path. Preparing a batch is framing,
+// sealing and, with FEC, the arithmetic of the parity shards over it. Both used to
+// be the same goroutine one after the other; here one happens while the other does,
+// and what makes that safe is that only one batch is ever on its way into the
+// socket, so what the peer sees is still one order of packet numbers.
+func (a *association) writeLoop() {
+	defer close(a.writeDone)
+	for {
+		select {
+		case <-a.writeStop:
+			return
+		default:
+		}
+		select {
+		case <-a.writeStop:
+			return
+		case current := <-a.written:
+			err := a.batchIO.WritePackets(current.packets)
+			if err != nil {
+				a.writeFailed(current, err)
+			}
+			a.writingMu.Lock()
+			a.writing--
+			a.writingMu.Unlock()
+			// The slot comes back whether the write worked or not: what is in it is
+			// not going to be sent again from here, and a batch that cannot be
+			// written is a batch whose bytes are already recorded as lost.
+			a.freeBatches <- current
+		}
+	}
+}
+
+// writeFailed takes the packets of a batch the socket refused out of flight and
+// ends the association: a socket that cannot take a batch is a socket that nothing
+// else on this association is going to work on. The close is announced to nobody,
+// because what would carry the announcement is the same socket.
+func (a *association) writeFailed(failed *batch, err error) {
+	a.flightMu.Lock()
+	for index := range failed.pending {
+		if failed.pending[index].sent.ackEliciting {
+			a.inFlight.remove(failed.pending[index].sent)
+		}
+	}
+	a.flightMu.Unlock()
+	// The shutdown waits for the write loop, which is this goroutine, so it runs
+	// where it can: the loop is what makes the wait finish.
+	go a.shutdown(E.Cause(err, "write packets"), false)
+}
+
+// drainWrites waits for the socket to have taken the batches it was handed, and
+// gives up after writeDrainTimeout: a socket that stopped accepting writes is
+// unblocked by closing it, which is what the caller does next.
+func (a *association) drainWrites() {
+	deadline := time.Now().Add(writeDrainTimeout)
+	for {
+		a.writingMu.Lock()
+		writing := a.writing
+		a.writingMu.Unlock()
+		if writing == 0 || time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(writeDrainPoll)
+	}
 }
