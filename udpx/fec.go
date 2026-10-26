@@ -45,6 +45,12 @@ const (
 var (
 	gfExp [512]byte
 	gfLog [256]byte
+	// gfProducts is the product of every coefficient with every byte. Encoding a
+	// shard multiplies a whole shard by one coefficient, and a table turns that
+	// from two lookups and an addition per byte into one lookup per byte: at 8+2
+	// over a gigabyte of bulk data that is two gigabytes of multiplications, which
+	// is the single largest cost a sender with redundancy switched on pays.
+	gfProducts [256][256]byte
 )
 
 func init() {
@@ -61,6 +67,11 @@ func init() {
 	// two logarithms never needs a modulo.
 	for index := 255; index < len(gfExp); index++ {
 		gfExp[index] = gfExp[index-255]
+	}
+	for coefficient := 0; coefficient < 256; coefficient++ {
+		for value := 0; value < 256; value++ {
+			gfProducts[coefficient][value] = gfMul(byte(coefficient), byte(value))
+		}
 	}
 }
 
@@ -153,14 +164,19 @@ func fecEncode(members [][]byte, parity [][]byte) error {
 			if coefficient == 0 {
 				continue
 			}
+			// The member is cut to the shard's length once — they are equal by the
+			// shape check above, and saying so is what takes the bounds check out of
+			// the loop below, where it would be paid per byte.
+			member := members[column][:len(shard)]
 			if coefficient == 1 {
-				for offset, value := range members[column] {
+				for offset, value := range member {
 					shard[offset] ^= value
 				}
 				continue
 			}
-			for offset, value := range members[column] {
-				shard[offset] ^= gfMul(coefficient, value)
+			products := &gfProducts[coefficient]
+			for offset, value := range member {
+				shard[offset] ^= products[value]
 			}
 		}
 	}
@@ -261,8 +277,9 @@ func fecRecover(members, parity int, shards [][]byte) error {
 			if coefficient == 0 {
 				continue
 			}
+			products := &gfProducts[coefficient]
 			for offset, value := range shards[known[row]] {
-				shard[offset] ^= gfMul(coefficient, value)
+				shard[offset] ^= products[value]
 			}
 		}
 		recovered[member] = shard
