@@ -42,7 +42,7 @@ const (
 	// advertises: a buffer below it turns the window into a number the peer obeys
 	// and the kernel then throws away. The send side is smaller because a send
 	// buffer only has to hold one batch of paced packets.
-	desiredReceiveBuffer = 4 * 1024 * 1024
+	desiredReceiveBuffer = 8 * 1024 * 1024
 	desiredSendBuffer    = 1 * 1024 * 1024
 )
 
