@@ -62,7 +62,12 @@ type batchedConn struct {
 	// so two senders must not take turns in the middle of one.
 	writeMu  sync.Mutex
 	coalesce []byte
-	oob      [oobSize]byte
+	// cmsg is where a send builds its control messages and oob is where a
+	// receive puts the ones the kernel sent. They are separate buffers because a
+	// send and a receive happen at the same time, and the two used to share one:
+	// a segmented send built its segment size in the buffer a read was filling.
+	cmsg []byte
+	oob  [oobSize]byte
 
 	sendBuf  []byte
 	sendOOB  []byte
@@ -383,10 +388,11 @@ func (c *batchedConn) send(data []byte, addr net.Addr, segmentSize int) error {
 	if err != nil {
 		return err
 	}
-	oob := c.oob[:0]
+	oob := c.cmsg[:0]
 	if segmentSize > 0 && len(data) > segmentSize {
 		oob = appendSegmentSize(oob, uint16(segmentSize))
 	}
+	c.cmsg = oob
 	c.sendBuf = data
 	c.sendOOB = oob
 	c.sendAddr = sockaddr
