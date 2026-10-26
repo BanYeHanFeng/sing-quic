@@ -563,9 +563,7 @@ func (a *association) handleParity(packet []byte, packetHeader header, source ne
 	}
 	a.peerAddr.Store(&source)
 	a.resetIdle()
-	// The shard is a view of the buffer the next packet will be read into, and the
-	// group outlives this call.
-	recovered := a.fec.parity(description, append([]byte(nil), payload...))
+	recovered := a.fec.parity(description, payload)
 	for _, member := range recovered {
 		packetHeader, headerErr := parseHeader(member)
 		if headerErr != nil {

@@ -3,6 +3,7 @@ package udpx
 import (
 	"bytes"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -442,5 +443,106 @@ func TestFECRecoveredOnce(t *testing.T) {
 	datagram, err := receiver.ReceiveDatagram(extra)
 	if err == nil {
 		t.Fatalf("channel %d arrived twice", datagram.Channel)
+	}
+}
+
+// TestFECReusesBuffers requires protecting the path to cost no allocation of its
+// own. A group is k member packets and m parity shards, all of them one packet
+// long, and asking the allocator for them again for every k packets is what makes
+// a sender with redundancy on allocate twice the bytes it sends: the collector
+// then pays for the bulk data a second time, which is what a sender at the top of
+// a core is least able to afford. The two runs are compared with each other rather
+// than with a constant, because what the transport allocates on its own is the
+// same in both and is not what this is about.
+//
+// The bound is one payload and not nothing because a protected transfer is not the
+// same traffic: it carries a quarter more packets, so its share of the in-flight
+// table and of the retransmissions is larger, and under the race detector that
+// alone is a megabyte. What the bound catches is the per-group allocation, which
+// was 3.9 payloads before the buffers were reused.
+func TestFECReusesBuffers(t *testing.T) {
+	const size = 4 << 20
+	plain := allocatedForTransfer(t, size, Options{})
+	redundant := allocatedForTransfer(t, size, Options{FEC: FECOptions{DataShards: 8, ParityShards: 2}})
+	t.Logf("an unprotected transfer of %d bytes allocated %d, a protected one %d", size, plain, redundant)
+	if redundant > plain+size {
+		t.Fatalf("a protected transfer of %d bytes allocated %d bytes more than an unprotected one", size, redundant-plain)
+	}
+}
+
+// allocatedForTransfer moves size bytes over one association and reports how much
+// was allocated while it did.
+func allocatedForTransfer(t *testing.T, size int, options Options) uint64 {
+	t.Helper()
+	client, server, _ := testSetup(t, options, options)
+	ctx := testContext(t, 120*time.Second)
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := testPayload(size)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	go func() {
+		if _, writeErr := stream.Write(payload); writeErr != nil {
+			t.Errorf("write: %v", writeErr)
+			return
+		}
+		_ = stream.CloseWrite()
+	}()
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read := readAll(t, accepted, size); len(read) != size {
+		t.Fatalf("the transfer delivered %d of %d bytes", len(read), size)
+	}
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// TestFECRingDropsStaleGroup requires a group whose members the receive ring has
+// started overwriting to be dropped rather than assembled. The ring hands a slot to
+// the packet that replaces the one it held, so a group still holding that slot has
+// another packet's bytes: what an assembly would recover out of them is nothing the
+// sender encoded, and the group is one shard short exactly when this can happen.
+func TestFECRingDropsStaleGroup(t *testing.T) {
+	const shardLen = 64
+	members := [][]byte{
+		bytes.Repeat([]byte{0x01}, shardLen),
+		bytes.Repeat([]byte{0x02}, shardLen),
+		bytes.Repeat([]byte{0x03}, shardLen),
+	}
+	parity := make([][]byte, 2)
+	for index := range parity {
+		parity[index] = make([]byte, shardLen)
+	}
+	err := fecEncode(members, parity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	description := fecHeader{
+		GroupID:     0,
+		MemberCount: uint8(len(members)),
+		ParityCount: uint8(len(parity)),
+		lengths:     make([]byte, fecLengthLen*len(members)),
+	}
+	for index := range members {
+		description.setMemberLength(index, len(members[index]))
+	}
+	receiver := newFECReceiver()
+	// The last member arrived and the first parity shard did too, which leaves the
+	// group one shard short of being recovered.
+	receiver.remember(uint32(len(members)-1), members[len(members)-1])
+	if recovered := receiver.parity(&description, parity[0]); recovered != nil {
+		t.Fatalf("%d packets recovered from a group that is missing two members", len(recovered))
+	}
+	// Enough packets to take the slot the group is holding away from it.
+	for index := range fecReceiveCache {
+		receiver.remember(uint32(len(members)+index), bytes.Repeat([]byte{0xEE}, shardLen))
+	}
+	description.Index = 1
+	if recovered := receiver.parity(&description, parity[1]); len(recovered) != 0 {
+		t.Fatalf("%d packets recovered out of bytes the ring had given to another packet", len(recovered))
 	}
 }

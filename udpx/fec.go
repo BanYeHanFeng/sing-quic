@@ -316,6 +316,13 @@ const (
 	// help, and the extra bytes are charged to the window like everything else.
 	fecMaxParityShards = 8
 
+	// fecBufferLimit is how many packet-sized buffers one end keeps between groups.
+	// A sender holds k members and m parity shards at once and a receiver the shards
+	// of fecReceiveGroups groups, so the largest group this end may build is what
+	// bounds it: a hundred kilobytes held for the life of an association, against an
+	// allocation of that size for every group ever encoded.
+	fecBufferLimit = 2*fecMaxDataShards + fecMaxParityShards
+
 	// fecMinGroupMembers is the smallest group the timer may close. A group of one
 	// packet with one parity shard is everything sent twice, which is a fine trade
 	// for a path that loses half of it and a poor one for a request whose answer
@@ -382,6 +389,16 @@ type fecSender struct {
 	groupID  uint32
 	shardLen int
 
+	// free is the buffers of the groups already encoded, lengths the room to
+	// describe the group being encoded and shards the list of shards it was
+	// encoded into. A group is 2k+m packet-sized buffers, and asking the allocator
+	// for them once per k packets is what a sender with redundancy would otherwise
+	// spend on the collector: everything here belongs to sendMu, so it needs no
+	// lock of its own.
+	free    [][]byte
+	lengths []byte
+	shards  [][]byte
+
 	// timer closes the open group when nothing followed it for a while.
 	timer *time.Timer
 }
@@ -408,6 +425,65 @@ func newFECSender(options FECOptions) *fecSender {
 		dataShards:  dataShards,
 		fixedParity: parityShards,
 	}
+}
+
+// buffer returns an empty buffer of one packet's size, kept from a group that was
+// already encoded when there is one. Every buffer a group holds comes from here,
+// which is what lets a member grow to the length of the group's shards in place.
+func (s *fecSender) buffer() []byte {
+	if len(s.free) == 0 {
+		return make([]byte, 0, maxPacketSize)
+	}
+	buffer := s.free[len(s.free)-1]
+	s.free = s.free[:len(s.free)-1]
+	return buffer[:0]
+}
+
+// release hands a buffer back for the next group. A buffer that is not one of
+// these is left to the collector.
+func (s *fecSender) release(buffer []byte) {
+	if cap(buffer) < maxPacketSize || len(s.free) >= fecBufferLimit {
+		return
+	}
+	s.free = append(s.free, buffer[:0])
+}
+
+// lengthsFor returns the room to describe count members, kept from the group
+// before: the description is copied into every parity packet as it is sealed, so
+// it only has to live as long as the group does.
+func (s *fecSender) lengthsFor(count int) []byte {
+	size := fecLengthLen * count
+	if cap(s.lengths) < size {
+		s.lengths = make([]byte, size)
+	}
+	return s.lengths[:size]
+}
+
+// shardsFor returns count parity shards of shardLen bytes each. The code writes
+// every one of them from the first byte, so what they held before does not matter.
+func (s *fecSender) shardsFor(count, shardLen int) [][]byte {
+	if cap(s.shards) < count {
+		s.shards = make([][]byte, count)
+	}
+	shards := s.shards[:count]
+	for index := range shards {
+		shards[index] = s.buffer()[:shardLen]
+	}
+	return shards
+}
+
+// pad extends a member to the shard length of its group, which is what makes the
+// members the shards the code expects. The padding is zeroed here rather than when
+// the buffer was allocated, because the buffer behind it held another packet then.
+func (s *fecSender) pad(member []byte) []byte {
+	if cap(member) < s.shardLen {
+		padded := make([]byte, s.shardLen)
+		copy(padded, member)
+		return padded
+	}
+	shard := member[:s.shardLen]
+	clear(shard[len(member):])
+	return shard
 }
 
 // observe records how many of the packets that one acknowledgement settled were
@@ -466,9 +542,13 @@ func (s *fecSender) open() bool {
 	return len(s.group) > 0
 }
 
-// close forgets the open group. It is called before the parity is sent, so that a
-// failed write cannot leave the same group to be encoded twice.
+// close forgets the open group, handing its buffers back. It is called before the
+// parity is sent, so that a failed write cannot leave the same group to be
+// encoded twice.
 func (s *fecSender) close() {
+	for _, member := range s.group {
+		s.release(member)
+	}
 	s.group = s.group[:0]
 	s.shardLen = 0
 	if s.timer != nil {
@@ -492,7 +572,7 @@ func (a *association) fecMemberLocked(packet []byte, packetNumber uint32) error 
 	// The packet bytes are kept rather than a description of them: a member is
 	// recovered as the packet the sender wrote, which is what makes it
 	// authenticable and what keeps recovery from being a second kind of receive.
-	member := append([]byte(nil), packet...)
+	member := append(sender.buffer(), packet...)
 	sender.group = append(sender.group, member)
 	if len(member) > sender.shardLen {
 		sender.shardLen = len(member)
@@ -578,36 +658,32 @@ func (a *association) sendParityLocked() error {
 		GroupID:     sender.groupID,
 		MemberCount: uint8(len(members)),
 		ParityCount: uint8(parityCount),
-		lengths:     make([]byte, fecLengthLen*len(members)),
+		lengths:     sender.lengthsFor(len(members)),
 	}
 	shardLen := sender.shardLen
-	padded := make([][]byte, len(members))
 	for index, member := range members {
 		// Every shard is as long as the longest member, not as long as the MTU: a
 		// group of small packets must not be inflated to full size just to be
 		// recoverable, and the original length is what the description carries.
 		description.setMemberLength(index, len(member))
-		shard := make([]byte, shardLen)
-		copy(shard, member)
-		padded[index] = shard
+		members[index] = sender.pad(member)
 	}
+	parity := sender.shardsFor(parityCount, shardLen)
+	err := fecEncode(members, parity)
 	sender.close()
-	parity := make([][]byte, parityCount)
-	for index := range parity {
-		parity[index] = make([]byte, shardLen)
-	}
-	err := fecEncode(padded, parity)
-	if err != nil {
-		return err
-	}
-	for index, shard := range parity {
-		description.Index = uint8(index)
-		err = a.sendParityPacketLocked(description, shard)
-		if err != nil {
-			return err
+	if err == nil {
+		for index, shard := range parity {
+			description.Index = uint8(index)
+			err = a.sendParityPacketLocked(description, shard)
+			if err != nil {
+				break
+			}
 		}
 	}
-	return nil
+	for _, shard := range parity {
+		sender.release(shard)
+	}
+	return err
 }
 
 // sendParityPacketLocked writes one parity shard. The caller holds sendMu, so the
@@ -679,6 +755,12 @@ type fecReceiver struct {
 
 	groups map[uint32]*fecReceiveGroup
 
+	// free is the parity shards of the groups already assembled: unlike a member,
+	// which belongs to the ring, a parity shard belongs to its group alone, so it
+	// is handed back when the group is dropped. It is driven by the goroutine that
+	// reads the socket, which is why it needs no lock.
+	free [][]byte
+
 	// recovered counts the members that only arrived because their parity did,
 	// which is the one number that says whether the redundancy was spent on
 	// anything.
@@ -689,13 +771,73 @@ func newFECReceiver() fecReceiver {
 	return fecReceiver{groups: make(map[uint32]*fecReceiveGroup)}
 }
 
+// buffer returns an empty buffer of one packet's size, kept from a group that was
+// already assembled when there is one.
+func (r *fecReceiver) buffer() []byte {
+	if len(r.free) == 0 {
+		return make([]byte, 0, maxPacketSize)
+	}
+	buffer := r.free[len(r.free)-1]
+	r.free = r.free[:len(r.free)-1]
+	return buffer[:0]
+}
+
+// release hands a parity shard back for the next group.
+func (r *fecReceiver) release(buffer []byte) {
+	if cap(buffer) < maxPacketSize || len(r.free) >= fecBufferLimit {
+		return
+	}
+	r.free = append(r.free, buffer[:0])
+}
+
+// shard returns a copy of a parity shard that the group can keep: the shard is a
+// view of the buffer the next packet is read into, and a group waits for the
+// shards that follow it.
+func (r *fecReceiver) shard(shard []byte) []byte {
+	cached := r.buffer()
+	if cap(cached) < len(shard) {
+		cached = make([]byte, 0, len(shard))
+	}
+	cached = cached[:len(shard)]
+	copy(cached, shard)
+	return cached
+}
+
+// drop forgets a group, handing the parity shards it holds back. Its members are
+// not its to hand back: they are slots of the ring.
+func (r *fecReceiver) drop(groupID uint32) {
+	group, found := r.groups[groupID]
+	if !found {
+		return
+	}
+	for _, shard := range group.parity {
+		r.release(shard)
+	}
+	delete(r.groups, groupID)
+}
+
 // remember keeps a member packet for the group that may describe it later.
 func (r *fecReceiver) remember(packetNumber uint32, packet []byte) {
-	cached := append([]byte(nil), packet...)
 	if r.recent == nil {
 		r.recent = make([]fecCachedPacket, fecReceiveCache)
 	}
-	r.recent[r.next] = fecCachedPacket{packetNumber: packetNumber, bytes: cached}
+	slot := &r.recent[r.next]
+	// The slot is taken back from the packet it held before, so the ring allocates
+	// once per slot rather than once per packet. What that costs is a group the
+	// ring has started overwriting: its members are other packets now, so it cannot
+	// be assembled any more and is dropped rather than recovered from bytes that
+	// are no longer its own.
+	for groupID, group := range r.groups {
+		if group.member(slot.packetNumber) >= 0 {
+			r.drop(groupID)
+		}
+	}
+	if cap(slot.bytes) < len(packet) {
+		slot.bytes = make([]byte, len(packet))
+	}
+	cached := slot.bytes[:len(packet)]
+	copy(cached, packet)
+	*slot = fecCachedPacket{packetNumber: packetNumber, bytes: cached}
 	r.next = (r.next + 1) % len(r.recent)
 	// A group that is already assembling takes it as the shard it is: a member that
 	// arrives after the first parity packet is as good as one that arrived before.
@@ -767,14 +909,15 @@ func (r *fecReceiver) evict() {
 		}
 	}
 	if found {
-		delete(r.groups, oldest)
+		r.drop(oldest)
 	}
 }
 
 // parity takes one parity shard and returns the member packets that can be
 // recovered with it. The returned packets are the bytes the sender wrote,
 // including the padding the shard carries, cut back to the length each member was
-// described with.
+// described with. The shard itself is a view of the buffer the next packet is read
+// into, so a group keeps a copy of it rather than the view.
 func (r *fecReceiver) parity(description *fecHeader, shard []byte) [][]byte {
 	r.active = true
 	group := r.group(description)
@@ -795,7 +938,13 @@ func (r *fecReceiver) parity(description *fecHeader, shard []byte) [][]byte {
 	if len(shard) != longest {
 		return nil
 	}
-	group.parity[description.Index] = shard
+	// A parity packet can arrive twice — a shard that was retransmitted arrives
+	// beside the one it replaced — and the shard it displaces goes back to the pool
+	// it came from rather than to the collector.
+	if previous := group.parity[description.Index]; previous != nil {
+		r.release(previous)
+	}
+	group.parity[description.Index] = r.shard(shard)
 	available := 0
 	for _, member := range group.members {
 		if member != nil {
@@ -820,7 +969,7 @@ func (r *fecReceiver) parity(description *fecHeader, shard []byte) [][]byte {
 	if !missing {
 		// Everything arrived on its own, which is the ordinary case: the parity was
 		// insurance nobody had to claim.
-		delete(r.groups, group.groupID)
+		r.drop(group.groupID)
 		return nil
 	}
 	shards := make([][]byte, 0, len(group.members)+len(group.parity))
@@ -828,12 +977,12 @@ func (r *fecReceiver) parity(description *fecHeader, shard []byte) [][]byte {
 	shards = append(shards, group.parity...)
 	err := fecRecover(len(group.members), len(group.parity), shards)
 	if err != nil {
-		delete(r.groups, group.groupID)
+		r.drop(group.groupID)
 		return nil
 	}
 	// The group leaves the table before anything is delivered: a recovered packet
 	// takes the normal receive path, which may reach this receiver again.
-	delete(r.groups, group.groupID)
+	r.drop(group.groupID)
 	recovered := make([][]byte, 0, len(group.members))
 	for index, member := range group.members {
 		if member != nil {
