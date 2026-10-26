@@ -108,13 +108,13 @@ func (a *association) armPTO() {
 	if backoff > maxProbeBackoff {
 		backoff = maxProbeBackoff
 	}
-	a.ptoTimer.Reset(delay << backoff)
+	a.timers.Load().pto.Reset(delay << backoff)
 }
 
 // disarmPTO stops the probe timer. A probe exists to find out whether a packet
 // arrived, and with nothing in flight there is no packet left to ask about.
 func (a *association) disarmPTO() {
-	a.ptoTimer.Stop()
+	a.timers.Load().pto.Stop()
 }
 
 // probe declares the oldest packet in flight lost and sends it again.

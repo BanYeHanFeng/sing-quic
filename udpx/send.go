@@ -420,7 +420,7 @@ func (a *association) flush() error {
 			// socket was asked to avoid.
 			waitUntil := a.pacingWait()
 			if !waitUntil.IsZero() {
-				a.paceTimer.Reset(time.Until(waitUntil))
+				a.timers.Load().pace.Reset(time.Until(waitUntil))
 				return nil
 			}
 		}

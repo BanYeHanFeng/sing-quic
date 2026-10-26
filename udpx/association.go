@@ -157,6 +157,24 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
+// associationTimers is what an association wakes up on.
+//
+// The four belong together because a timer that fires runs into the association
+// and arms one of the others: a retransmission is paced, an acknowledgement is
+// sent, a probe rearms itself. They are therefore built as one set, before any of
+// them can fire, and the set is what the association hands out.
+type associationTimers struct {
+	// idle closes the association when it falls silent. It is reset from both
+	// sides.
+	idle *time.Timer
+	// ack sends the acknowledgement the delay was holding back.
+	ack *time.Timer
+	// pto asks the peer about the oldest packet in flight.
+	pto *time.Timer
+	// pace wakes the send path when the pacing rate allows the next batch.
+	pace *time.Timer
+}
+
 // association is one association as this end keeps it.
 //
 // Each direction has its own key ring and packet numbers and is driven by one
@@ -205,16 +223,17 @@ type association struct {
 	// needs no lock of its own.
 	fec fecReceiver
 
-	// idleTimer closes the association when it falls silent. It is reset from
-	// both sides.
-	idleTimer *time.Timer
+	// timers are the timers of an association, in one place because a timer that
+	// fires reads them: they are built with the association and never change, so
+	// the pointer is what is shared rather than four fields being assigned one
+	// after another while the first of them may already be running.
+	timers atomic.Pointer[associationTimers]
 
 	// ackMu guards the receive side's acknowledgement state, which is driven by
 	// the goroutine that reads the socket and by the timer that sends a delayed
 	// acknowledgement.
-	ackMu    sync.Mutex
-	ack      ackScheduler
-	ackTimer *time.Timer
+	ackMu sync.Mutex
+	ack   ackScheduler
 
 	// flightMu guards the packets in flight and the round trip estimate. The
 	// send path records a packet as it leaves and the receive path takes it out
@@ -226,15 +245,13 @@ type association struct {
 	rtt      rttEstimator
 	// probes counts the probes that went unanswered, which is what the wait
 	// before the next one doubles with.
-	probes   int
-	ptoTimer *time.Timer
+	probes int
 
 	// ccMu is the innermost lock: the congestion controller is called with it held,
 	// after the send lock or the flight lock, never around them.
-	ccMu      sync.Mutex
-	cc        congestion.Controller
-	rttStats  rttSnapshot
-	paceTimer *time.Timer
+	ccMu     sync.Mutex
+	cc       congestion.Controller
+	rttStats rttSnapshot
 
 	// streamsMu guards the streams of the association. The table is what turns a
 	// stream id on the wire into a stream, and what bounds how many the peer may
@@ -313,14 +330,20 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		a.fecSender.timer.Stop()
 	}
 	a.peerAddr.Store(&peer)
-	a.idleTimer = time.AfterFunc(a.options.IdleTimeout, func() {
-		a.shutdown(ErrIdleTimeout, true)
-	})
-	a.ackTimer = time.AfterFunc(maxAckDelay, a.flushAck)
-	a.ptoTimer = time.AfterFunc(initialPTO, a.probe)
-	a.ptoTimer.Stop()
-	a.paceTimer = time.AfterFunc(time.Hour, func() { _ = a.flush() })
-	a.paceTimer.Stop()
+	// Every timer starts out a hour away and is armed once the pointer to the set
+	// is in place: a timer whose callback runs before the association has finished
+	// building itself would read fields that nothing has written yet.
+	timers := &associationTimers{
+		idle: time.AfterFunc(time.Hour, func() { a.shutdown(ErrIdleTimeout, true) }),
+		ack:  time.AfterFunc(time.Hour, a.flushAck),
+		pto:  time.AfterFunc(time.Hour, a.probe),
+		pace: time.AfterFunc(time.Hour, func() { _ = a.flush() }),
+	}
+	timers.ack.Stop()
+	timers.pto.Stop()
+	timers.pace.Stop()
+	a.timers.Store(timers)
+	timers.idle.Reset(a.options.IdleTimeout)
 	if a.options.KeepAlivePeriod > 0 {
 		go a.keepAliveLoop()
 	}
@@ -362,10 +385,11 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 		if notifyPeer {
 			_ = a.send(appendClose(nil, closeCodeOf(cause)))
 		}
-		a.idleTimer.Stop()
-		a.ackTimer.Stop()
-		a.ptoTimer.Stop()
-		a.paceTimer.Stop()
+		timers := a.timers.Load()
+		timers.idle.Stop()
+		timers.ack.Stop()
+		timers.pto.Stop()
+		timers.pace.Stop()
 		if a.fecSender != nil {
 			a.fecSender.timer.Stop()
 		}
@@ -519,7 +543,7 @@ func (a *association) scheduleAck(packetNumber uint32, now time.Time) {
 		}
 		return
 	}
-	a.ackTimer.Reset(a.ackDelay())
+	a.timers.Load().ack.Reset(a.ackDelay())
 }
 
 // ackDelay is how long an acknowledgement waits for the packet that would reach
@@ -621,7 +645,7 @@ func (a *association) handleReset(packet []byte, source net.Addr) error {
 }
 
 func (a *association) resetIdle() {
-	a.idleTimer.Reset(a.options.IdleTimeout)
+	a.timers.Load().idle.Reset(a.options.IdleTimeout)
 }
 
 func (a *association) keepAliveLoop() {
