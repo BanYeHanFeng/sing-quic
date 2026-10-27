@@ -51,17 +51,6 @@ func MaxFilter[O cmp.Ordered](a, b O) int {
 	return 0
 }
 
-// Compares two values and returns true if the first is less than or equal
-// to the second.
-func MinFilter[O cmp.Ordered](a, b O) int {
-	if a < b {
-		return 1
-	} else if a > b {
-		return -1
-	}
-	return 0
-}
-
 func NewWindowedFilter[V any](windowLength roundTripCount, comparator func(V, V) int) *WindowedFilter[V] {
 	return &WindowedFilter[V]{
 		windowLength: windowLength,
