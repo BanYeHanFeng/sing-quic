@@ -370,37 +370,25 @@ func testFECOverLossyLink(t *testing.T, fecOptions FECOptions) {
 	}
 }
 
-// TestFECParityFollowsLoss requires the redundancy of a group to follow what the
-// path is losing: nothing where nothing is lost, and more where more is, with what
-// was asked for taking precedence over both.
-func TestFECParityFollowsLoss(t *testing.T) {
+// TestFECParityIsTheCallers requires the redundancy of a group to be what was
+// asked for: it is paid on every group, so how much of it is worth paying is not
+// something this end decides by watching the path.
+func TestFECParityIsTheCallers(t *testing.T) {
 	sender := newFECSender(FECOptions{DataShards: 8})
 	if sender == nil {
 		t.Fatal("data shards of eight did not turn forward error correction on")
 	}
-	// Nothing has been settled, so nothing is known about the path.
-	if parity := sender.parity(); parity != 0 {
-		t.Fatalf("%d parity shards before anything was acknowledged", parity)
+	if parity := sender.parityShards; parity != defaultParityShards {
+		t.Fatalf("%d parity shards for a group that asked for none, want the default %d", parity, defaultParityShards)
 	}
-	sender.observe(32, 0)
-	if parity := sender.parity(); parity != 0 {
-		t.Fatalf("%d parity shards on a path that lost nothing", parity)
-	}
-	// Five per cent of what is settled: a group of eight expects half a packet lost.
-	sender.observe(28, 4)
-	if parity := sender.parity(); parity < 1 {
-		t.Fatalf("%d parity shards for a path losing five per cent", parity)
-	}
-	// A path that loses half of everything gets redundancy in proportion, up to the
-	// members it covers.
-	sender.observe(0, 64)
-	if parity := sender.parity(); parity < 2 || parity > 8 {
-		t.Fatalf("%d parity shards for a path losing half of it", parity)
-	}
-	// What the caller asked for is what is sent, whatever the path does.
 	fixed := newFECSender(FECOptions{DataShards: 8, ParityShards: 3})
-	if parity := fixed.parity(); parity != 3 {
+	if parity := fixed.parityShards; parity != 3 {
 		t.Fatalf("%d parity shards for a group that asked for three", parity)
+	}
+	// More redundancy than members is not redundancy.
+	capped := newFECSender(FECOptions{DataShards: 2, ParityShards: 8})
+	if parity := capped.parityShards; parity != 2 {
+		t.Fatalf("%d parity shards for a group of two members", parity)
 	}
 	if sender := newFECSender(FECOptions{DataShards: 0}); sender != nil {
 		t.Fatal("zero data shards did not turn forward error correction off")

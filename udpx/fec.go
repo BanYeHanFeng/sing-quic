@@ -1,7 +1,6 @@
 package udpx
 
 import (
-	"math"
 	"sync/atomic"
 	"time"
 
@@ -311,6 +310,10 @@ const (
 	// header of every parity shard.
 	fecMaxDataShards = 32
 
+	// defaultParityShards is the redundancy a group gets when the caller asks for
+	// data shards without saying how much redundancy to pay for them.
+	defaultParityShards = 2
+
 	// fecMaxParityShards is the most redundancy a group may carry. A path that
 	// loses a quarter of what crosses it is not one a redundancy of half would
 	// help, and the extra bytes are charged to the window like everything else.
@@ -347,23 +350,6 @@ const (
 	// recoverable at all: what was forgotten is delivered twice at worst, and the
 	// frame that carries it is the same frame.
 	fecReceiveCache = 64
-
-	// fecLossSamples is how many packets have to be settled before the losses the
-	// path is showing are worth acting on. Below it, the fraction is a fraction of
-	// three packets and says nothing.
-	fecLossSamples = 32
-
-	// fecLossWindow is how many settled packets the loss estimate covers before it
-	// is halved. It is the memory of the estimate: long enough not to react to a
-	// burst, short enough to follow a path that changed.
-	fecLossWindow = 128
-
-	// fecRedundancyGain is how much redundancy a group gets for the losses it is
-	// expected to see. Above one, because the point of the redundancy is the groups
-	// that lose more than their share: a group that loses exactly what it expected
-	// would be recovered by covering the average alone, and the ones that do not are
-	// the ones whose members wait a round trip.
-	fecRedundancyGain = 1.5
 )
 
 // fecSender assembles the groups this end sends. It is driven by the goroutine
@@ -371,16 +357,10 @@ const (
 // order the groups describe.
 type fecSender struct {
 	dataShards int
-	// fixedParity is the redundancy that was asked for, or zero when the path
-	// decides it.
-	fixedParity int
-
-	// lost and settled are what the path is doing: how many of the packets that
-	// were settled since the estimate was last halved the path dropped, and how
-	// many were settled. Redundancy is only worth as much as the losses it
-	// replaces, so this is what decides how much to send.
-	lost    int
-	settled int
+	// parityShards is how many redundant packets each group gets. It is what the
+	// caller asked for: redundancy is a cost paid on every group, so how much of it
+	// is worth paying is the caller's answer, not something this end measures.
+	parityShards int
 
 	// group holds the packets of the open group in the order they were sent, and
 	// shardLen the length of the longest of them: parity shards are padded to it
@@ -418,6 +398,9 @@ func newFECSender(options FECOptions) *fecSender {
 		dataShards = fecMaxDataShards
 	}
 	parityShards := options.ParityShards
+	if parityShards <= 0 {
+		parityShards = defaultParityShards
+	}
 	if parityShards > fecMaxParityShards {
 		parityShards = fecMaxParityShards
 	}
@@ -428,8 +411,8 @@ func newFECSender(options FECOptions) *fecSender {
 		parityShards = 0
 	}
 	return &fecSender{
-		dataShards:  dataShards,
-		fixedParity: parityShards,
+		dataShards:   dataShards,
+		parityShards: parityShards,
 	}
 }
 
@@ -492,49 +475,6 @@ func (s *fecSender) pad(member []byte) []byte {
 	return shard
 }
 
-// observe records how many of the packets that one acknowledgement settled were
-// lost. Only what carried frames is counted: redundancy that is lost is not a
-// reason to send more redundancy, or a path that drops a fraction of everything
-// would be answered with a fraction of everything, for as long as it lasts.
-func (s *fecSender) observe(acked, lost int) {
-	s.settled += acked + lost
-	s.lost += lost
-	if s.settled >= 2*fecLossWindow {
-		// The estimate follows the path rather than its whole history: a path that
-		// recovered is not a path that is still losing.
-		s.settled /= 2
-		s.lost /= 2
-	}
-}
-
-// parity is how many redundant packets the next group gets.
-//
-// It is one and a half times the losses a group is expected to see: enough to
-// cover the average and some of the spread, and not so much that a group pays for
-// the tail of it that a retransmission would have covered anyway. A path that has
-// shown no loss gets none, which is what makes this free where there is nothing to
-// repair.
-func (s *fecSender) parity() int {
-	if s.fixedParity > 0 {
-		return s.fixedParity
-	}
-	if s.settled < fecLossSamples {
-		return 0
-	}
-	expected := fecRedundancyGain * float64(s.dataShards) * float64(s.lost) / float64(s.settled)
-	count := int(math.Ceil(expected))
-	if count < 0 {
-		count = 0
-	}
-	if count > s.dataShards {
-		count = s.dataShards
-	}
-	if count > fecMaxParityShards {
-		count = fecMaxParityShards
-	}
-	return count
-}
-
 // payloadBudget is how many payload bytes a packet may carry once this end
 // protects its packets: a parity shard is as long as the longest member and it
 // describes the group in its clear header, so members give up the room that
@@ -582,32 +522,6 @@ func (s *fecSender) add(packet []byte, packetNumber uint32) {
 	}
 }
 
-// fecObserve tells the sender what one acknowledgement settled, so that the
-// redundancy of the next group follows what the path is losing.
-func (a *association) fecObserve(acked, lost []*sentPacket) {
-	if a.fecSender == nil {
-		return
-	}
-	settled := 0
-	dropped := 0
-	for _, packet := range acked {
-		if !packet.parity {
-			settled++
-		}
-	}
-	for _, packet := range lost {
-		if !packet.parity {
-			dropped++
-		}
-	}
-	if settled == 0 && dropped == 0 {
-		return
-	}
-	a.sendMu.Lock()
-	a.fecSender.observe(settled, dropped)
-	a.sendMu.Unlock()
-}
-
 // flushFECGroup closes the group that nothing followed, so that a group which will
 // never be filled is still protected. It runs on the group timer.
 func (a *association) flushFECGroup() {
@@ -651,11 +565,9 @@ func (a *association) closeGroupLocked() error {
 	if len(members) == 0 {
 		return nil
 	}
-	parityCount := sender.parity()
+	parityCount := sender.parityShards
 	if parityCount == 0 {
-		// The path is not losing anything worth covering, so the group is closed
-		// without redundancy: what it would cost is the parity of every group
-		// forever, and what it would save is nothing.
+		// Redundancy was asked for as zero, so the group is closed without it.
 		sender.close()
 		return nil
 	}

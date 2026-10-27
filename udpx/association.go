@@ -121,16 +121,15 @@ type Options struct {
 // A group is a fixed number of packets and the redundancy that covers them, and
 // the cost of it is the redundancy: what a group buys is that a lost member is
 // recovered from the parity that already arrived instead of waiting a round trip
-// for a retransmission. The number of members is a constant of the sender, while
-// the redundancy follows the loss it sees, because a path that loses nothing has
-// nothing to replace.
+// for a retransmission. Both numbers are the caller's: the redundancy is paid on
+// every group, so measuring the path to decide it only moves the cost around.
 type FECOptions struct {
 	// DataShards is how many packets a group holds. Zero disables forward error
 	// correction.
 	DataShards int
 
 	// ParityShards is how many redundant packets a group gets, up to the number of
-	// members. Zero leaves it to the losses the path is showing.
+	// members. Zero means the default of two.
 	ParityShards int
 }
 

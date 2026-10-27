@@ -175,7 +175,6 @@ func (a *association) handleAck(body []byte, now time.Time) {
 
 	a.rttStats.update(a.rttEstimate())
 	a.congestionAcked(acked, lost, priorInFlight, now)
-	a.fecObserve(acked, lost)
 	if empty {
 		a.disarmPTO()
 	} else {
