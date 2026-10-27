@@ -55,6 +55,16 @@ const (
 	// is what a forwarded UDP packet wants and what keeps a datagram from
 	// holding up a stream.
 	frameTypeDatagram
+
+	// frameTypeMaxStreams moves the number of streams the peer may open forward.
+	// It is what the peer needs before it can open a stream at all, and the
+	// number is cumulative: the peer may have opened that many in total, so a
+	// stream that ended is a stream it may open again.
+	//
+	// It is last in this list because the numbers are the wire format: the ones
+	// above are already sent by deployed peers, so a new type goes at the end
+	// rather than beside the frames it belongs with.
+	frameTypeMaxStreams
 )
 
 // Layout of the type byte.
@@ -97,14 +107,14 @@ type frame struct {
 }
 
 // retransmittable reports whether a lost frame of this type has to be sent
-// again. Frames that carry data, and frames that move a window forward, do: a
-// window update that was lost would leave the peer waiting for credit that was
-// already granted, while repeating one that arrived is harmless because a window
-// only ever moves forward. A stream reset does too, and for the same reason in
+// again. Frames that carry data, and frames that move a ceiling forward, do: a
+// ceiling that was lost would leave the peer waiting for credit that was already
+// granted, while repeating one that arrived is harmless because a ceiling only
+// ever moves forward. A stream reset does too, and for the same reason in
 // reverse: a peer that never hears it keeps writing into a stream nobody reads.
 func (t frameType) retransmittable() bool {
 	switch t {
-	case frameTypeStream, frameTypeMaxData, frameTypeMaxStreamData, frameTypeResetStream:
+	case frameTypeStream, frameTypeMaxData, frameTypeMaxStreamData, frameTypeResetStream, frameTypeMaxStreams:
 		return true
 	default:
 		return false
@@ -180,6 +190,11 @@ func nextFrame(payload []byte) (frame, []byte, error) {
 			frameType: frameTypeDatagram,
 			body:      payload[1 : datagramFixedLen+length],
 		}, payload[datagramFixedLen+length:], nil
+	case frameTypeMaxStreams:
+		if flags != 0 || len(payload) < 1+4 {
+			return frame{}, nil, errShortFrame
+		}
+		return frame{frameType: frameTypeMaxStreams, body: payload[1:5]}, payload[5:], nil
 	default:
 		return frame{}, nil, E.New("unknown frame type ", int(payload[0]))
 	}

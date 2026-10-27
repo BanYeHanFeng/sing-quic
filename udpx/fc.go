@@ -54,15 +54,26 @@ const (
 	// it.
 	connectionWindow = 64 * 1024 * 1024
 
-	// maxStreams is how many streams an association may have open at once. It is
-	// a constant of the protocol rather than a number to negotiate: the number is
-	// what the receiver is willing to remember, and the sender has to stay inside
-	// it, not the other way around.
-	maxStreams = 256
+	// initialStreams is how many streams this end may open before the peer has said
+	// anything: like the windows above, it is the number both ends know without a
+	// frame. It is not the budget below — the budget is announced as soon as the peer
+	// opens its first stream.
+	initialStreams = 256
 
-	// acceptStreamBacklog is how many streams opened by the peer may wait for
-	// AcceptStream.
-	acceptStreamBacklog = 64
+	// streamBudget is how many streams of the peer one association may have open at
+	// once, which is what this end is willing to remember: an open stream costs an
+	// entry in the table (about 1 KB, measured at this many of them) and, until the
+	// application takes it, a place in the accept queue, which is a channel of that
+	// many pointers. Both are bounded by this number, so the memory an association
+	// spends on streams is known before the first one and does not depend on how many
+	// it has carried.
+	//
+	// The ceiling is a frame rather than a constant because the receiver is the one
+	// paying: a sender that stayed inside a number it guessed would have to fail an
+	// open once a busy client went past it, and a busy client does — every proxied
+	// connection of a machine is a stream on one session, and a browser alone keeps
+	// hundreds.
+	streamBudget = 4096
 )
 
 // credit is a send-side window: how much data may still be sent.

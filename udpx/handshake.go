@@ -37,7 +37,11 @@ const (
 	// appears, and a packet carrying another version is dropped without an
 	// answer, which is what lets an old and a new implementation share a port:
 	// a prober sees a port that answers nothing.
-	version = 2
+	//
+	// It is 3 since the number of streams became a frame: a peer that does not
+	// know that frame type answers one with an error and ends the association, so
+	// the two ends have to be told apart before the first frame rather than at it.
+	version = 3
 
 	// randomLen is the size of the random value each side contributes. It makes
 	// every handshake unique, so a repeated hello never produces the keys of an

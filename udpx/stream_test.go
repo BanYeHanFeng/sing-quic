@@ -901,3 +901,145 @@ func TestSendChunkReused(t *testing.T) {
 		t.Fatalf("a transfer the peer read whole allocated %d chunks of the send buffer", allocated)
 	}
 }
+
+// TestOpenStreamWaitsForThePeersCredit requires an opener past the number both ends
+// know without a frame to wait rather than fail: the peer is the one that remembers
+// open streams, so it is the peer's answer that lets the next one be opened.
+func TestOpenStreamWaitsForThePeersCredit(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 30*time.Second)
+	streams := make([]*Stream, 0, initialStreams)
+	for range initialStreams {
+		stream, err := client.OpenStream(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		streams = append(streams, stream)
+	}
+	// A stream exists on the peer only once something is written on it, so the peer
+	// has said nothing yet and this end is inside the number both ends know.
+	opened := make(chan error, 1)
+	go func() {
+		_, err := client.OpenStream(ctx)
+		opened <- err
+	}()
+	select {
+	case err := <-opened:
+		t.Fatalf("a stream was opened past the credit the peer granted: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	// The first byte is what the peer sees, and its answer is the budget.
+	if _, err := streams[0].Write([]byte{0}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-opened:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the opener is still waiting for credit the peer granted")
+	}
+	if count := streamCount(t, client); count != initialStreams+1 {
+		t.Fatalf("%d streams are open, expected %d", count, initialStreams+1)
+	}
+	// Only the stream that was written to exists on the peer.
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted.ID() != streams[0].ID() {
+		t.Fatalf("the peer accepted stream %d, expected %d", accepted.ID(), streams[0].ID())
+	}
+}
+
+// TestStreamsPastTheInitialNumber requires the number the peer allows to be a budget
+// rather than the number both ends know: a client with more connections than that
+// keeps opening them and the receiver keeps accepting them, so neither a busy client
+// nor a long lived session hits a wall.
+func TestStreamsPastTheInitialNumber(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 30*time.Second)
+	const count = initialStreams + 64
+	for index := range count {
+		stream, err := client.OpenStream(ctx)
+		if err != nil {
+			t.Fatalf("stream %d: %v", index, err)
+		}
+		// The write is what makes the stream exist on the peer, and the peer is what
+		// hands out the credit for the next one.
+		if _, err = stream.Write([]byte{0}); err != nil {
+			t.Fatalf("stream %d: %v", index, err)
+		}
+	}
+	for index := range count {
+		accepted, err := server.AcceptStream(ctx)
+		if err != nil {
+			t.Fatalf("accept %d: %v", index, err)
+		}
+		if read, readErr := readExactly(accepted, 1); readErr != nil || read[0] != 0 {
+			t.Fatalf("accept %d: the first byte is %v, %v", index, read, readErr)
+		}
+		if err = accepted.Close(); err != nil {
+			t.Fatalf("accept %d: %v", index, err)
+		}
+	}
+	waitStreamCount(t, server, 0)
+	waitStreamCount(t, client, 0)
+}
+
+// TestStreamSlotIsHeldUntilAccepted requires the place a stream of the peer holds
+// against the announced limit to be freed only once the application took it: a
+// stream that ends while it waits in the accept queue is still there, and freeing
+// the place then would let the peer fill the queue past what this end allowed.
+func TestStreamSlotIsHeldUntilAccepted(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 30*time.Second)
+	peerLimit := func() uint32 {
+		a := server.(*association)
+		a.streamsMu.Lock()
+		defer a.streamsMu.Unlock()
+		return a.peerStreamLimit
+	}
+	open := func() *Stream {
+		t.Helper()
+		stream, err := client.OpenStream(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The write is what makes the stream exist on the peer.
+		if _, err = stream.Write([]byte{0}); err != nil {
+			t.Fatal(err)
+		}
+		return stream
+	}
+	// The first stream is accepted, which is what the budget announcement rides on.
+	open()
+	if _, err := server.AcceptStream(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if limit := peerLimit(); limit != streamBudget {
+		t.Fatalf("the peer allows %d streams, expected the budget %d", limit, streamBudget)
+	}
+	// The second one is reset before the application takes it.
+	second := open()
+	waitStreamCount(t, server, 2)
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitStreamCount(t, server, 1)
+	if limit := peerLimit(); limit != streamBudget {
+		t.Fatalf("the peer allows %d streams after a stream it never took ended, expected %d", limit, streamBudget)
+	}
+	// Taking it is what frees the place.
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted.ID() != second.ID() {
+		t.Fatalf("the peer accepted stream %d, expected %d", accepted.ID(), second.ID())
+	}
+	if limit := peerLimit(); limit != streamBudget+1 {
+		t.Fatalf("the peer allows %d streams after the stream was taken, expected %d", limit, streamBudget+1)
+	}
+}

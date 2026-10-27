@@ -339,7 +339,7 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	}
 
 	bounds := sampler.worstBounds()
-	if bounds.streams > maxStreams {
+	if bounds.streams > streamBudget {
 		t.Errorf("%d streams were open at once", bounds.streams)
 	}
 	if bounds.inFlightBytes > int(2*bounds.connectionWindow) {

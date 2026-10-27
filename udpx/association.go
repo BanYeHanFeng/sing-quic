@@ -248,14 +248,21 @@ type association struct {
 	cc       congestion.Controller
 	rttStats rttSnapshot
 
-	// streamsMu guards the streams of the association. The table is what turns a
-	// stream id on the wire into a stream, and what bounds how many the peer may
-	// have open at once.
-	streamsMu    sync.Mutex
-	streams      map[uint32]*Stream
-	endedStreams endedStreams
-	acceptStream chan *Stream
-	nextStreamID uint32
+	// streamsMu guards the streams of the association: the table that turns a stream
+	// id on the wire into a stream, the queue of streams waiting for the application,
+	// and the two numbers that bound how many streams each end may have open.
+	// openCredit is how many streams the peer allows this end, and peerStreamLimit is
+	// how many this end allows the peer.
+	streamsMu       sync.Mutex
+	streams         map[uint32]*Stream
+	endedStreams    endedStreams
+	acceptStream    chan *Stream
+	nextStreamID    uint32
+	openCredit      uint32
+	peerStreamLimit uint32
+	// streamCredit is closed and replaced whenever the peer allows more streams, so
+	// that every opener waiting for one wakes rather than one of them.
+	streamCredit chan struct{}
 
 	// datagramMu guards the datagram side: the message numbers this end hands
 	// out, the reassemblies in progress, and the messages waiting for the
@@ -294,33 +301,36 @@ type association struct {
 func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, options Options, isClient, ownsConn bool) *association {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	a := &association{
-		localConnID:  result.localConnID,
-		peerConnID:   result.peerConnID,
-		keyID:        result.keyID,
-		conn:         conn,
-		options:      options.withDefaults(),
-		ctx:          ctx,
-		cancel:       cancel,
-		sendRing:     result.send,
-		recvRing:     result.recv,
-		batchIO:      udpio.New(conn, udpio.Options{GRO: true}),
-		freeBatches:  make(chan *batch, writeBatchSlots),
-		written:      make(chan *batch, writeBatchSlots),
-		writeStop:    make(chan struct{}),
-		writeDone:    make(chan struct{}),
-		paceWake:     make(chan struct{}, 1),
-		maxPayload:   maxPacketSize - headerLen - tagLen,
-		fecSender:    newFECSender(options.FEC),
-		fec:          newFECReceiver(),
-		streams:      make(map[uint32]*Stream),
-		acceptStream: make(chan *Stream, acceptStreamBacklog),
-		defragger:    newDatagramDefragger(),
-		datagrams:    make(chan Datagram, datagramBacklog),
-		sendCredit:   credit{limit: initialConnectionWindow},
-		recvLimit:    initialConnectionWindow,
-		recvWindow:   connectionWindow,
-		isClient:     isClient,
-		ownsConn:     ownsConn,
+		localConnID:     result.localConnID,
+		peerConnID:      result.peerConnID,
+		keyID:           result.keyID,
+		conn:            conn,
+		options:         options.withDefaults(),
+		ctx:             ctx,
+		cancel:          cancel,
+		sendRing:        result.send,
+		recvRing:        result.recv,
+		batchIO:         udpio.New(conn, udpio.Options{GRO: true}),
+		freeBatches:     make(chan *batch, writeBatchSlots),
+		written:         make(chan *batch, writeBatchSlots),
+		writeStop:       make(chan struct{}),
+		writeDone:       make(chan struct{}),
+		paceWake:        make(chan struct{}, 1),
+		maxPayload:      maxPacketSize - headerLen - tagLen,
+		fecSender:       newFECSender(options.FEC),
+		fec:             newFECReceiver(),
+		streams:         make(map[uint32]*Stream),
+		acceptStream:    make(chan *Stream, streamBudget),
+		defragger:       newDatagramDefragger(),
+		datagrams:       make(chan Datagram, datagramBacklog),
+		sendCredit:      credit{limit: initialConnectionWindow},
+		recvLimit:       initialConnectionWindow,
+		recvWindow:      connectionWindow,
+		openCredit:      initialStreams,
+		peerStreamLimit: initialStreams,
+		streamCredit:    make(chan struct{}),
+		isClient:        isClient,
+		ownsConn:        ownsConn,
 	}
 	// The controller comes first: a timer that fires before it exists would send
 	// through a half built association, and the idle timer is armed with the
@@ -540,6 +550,9 @@ func (a *association) handlePacket(packet []byte, source net.Addr) error {
 				a.shutdown(err, true)
 				return err
 			}
+		case frameTypeMaxStreams:
+			ackEliciting = true
+			a.handleMaxStreams(binary.BigEndian.Uint32(f.body))
 		}
 	}
 	if ackEliciting {

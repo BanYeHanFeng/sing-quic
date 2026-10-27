@@ -138,6 +138,13 @@ type Stream struct {
 	endErr error
 	done   chan struct{}
 
+	// queued says the stream is still in the accept queue, which is what keeps its
+	// place against the peer's stream limit until the application takes it: a stream
+	// that ends while it waits is still queued, and handing the place back then would
+	// let the peer open one more than the queue can hold. The association's
+	// streamsMu guards it.
+	queued bool
+
 	// A notification channel per direction, each a single slot: a second
 	// notification that arrives before the first was seen changes nothing. They
 	// are apart because a reader and a writer wait on the same stream at the same
@@ -740,25 +747,38 @@ func (s *Stream) signalRecv() {
 	}
 }
 
-// OpenStream opens a stream towards the peer.
+// OpenStream opens a stream towards the peer. It waits while the peer allows no more
+// streams: the peer is the one that remembers them, so the number it announced is
+// what this end stays inside, and a caller with more connections than that waits for
+// the ones in front of it to end rather than being told to go away.
 func (a *association) OpenStream(ctx context.Context) (*Stream, error) {
-	a.streamsMu.Lock()
-	if len(a.streams) >= maxStreams {
+	for {
+		a.streamsMu.Lock()
+		if a.nextStreamID < a.openCredit {
+			id := a.nextStreamID<<1 | a.initiatorBit()
+			a.nextStreamID++
+			stream := newStream(a, id, initialStreamWindow)
+			a.streams[id] = stream
+			a.streamsMu.Unlock()
+			return stream, nil
+		}
+		credit := a.streamCredit
 		a.streamsMu.Unlock()
-		return nil, E.New("too many open streams")
+		select {
+		case <-credit:
+		case <-ctx.Done():
+			return nil, context.Cause(ctx)
+		case <-a.ctx.Done():
+			return nil, context.Cause(a.ctx)
+		}
 	}
-	id := a.nextStreamID<<1 | a.initiatorBit()
-	a.nextStreamID++
-	stream := newStream(a, id, initialStreamWindow)
-	a.streams[id] = stream
-	a.streamsMu.Unlock()
-	return stream, nil
 }
 
 // AcceptStream returns the next stream the peer opened.
 func (a *association) AcceptStream(ctx context.Context) (*Stream, error) {
 	select {
 	case stream := <-a.acceptStream:
+		a.acceptedStream(stream)
 		return stream, nil
 	case <-ctx.Done():
 		return nil, context.Cause(ctx)
@@ -808,13 +828,41 @@ func (e *endedStreams) has(id uint32) bool {
 	return false
 }
 
-// removeStream forgets a stream that ended, which frees both the entry and the
-// slot it held against maxStreams.
+// removeStream forgets a stream that ended, which frees the entry and, for a stream
+// the peer opened, the slot it held against the stream budget.
 func (a *association) removeStream(id uint32) {
 	a.streamsMu.Lock()
-	defer a.streamsMu.Unlock()
+	stream, loaded := a.streams[id]
 	delete(a.streams, id)
 	a.endedStreams.add(id)
+	freed := loaded && !stream.queued && id&streamInitiatorBit != a.initiatorBit()
+	if freed {
+		// The peer may open one more now that this one is gone for good.
+		a.peerStreamLimit++
+	}
+	limit := a.peerStreamLimit
+	a.streamsMu.Unlock()
+	if freed {
+		_ = a.send(appendMaxStreams(nil, limit))
+	}
+}
+
+// acceptedStream takes one stream out of the accept queue. A stream that ended while
+// it waited was removed from the table without its slot being freed, because the
+// queue was still holding it; the place is free now.
+func (a *association) acceptedStream(stream *Stream) {
+	a.streamsMu.Lock()
+	stream.queued = false
+	_, live := a.streams[stream.id]
+	freed := !live
+	if freed {
+		a.peerStreamLimit++
+	}
+	limit := a.peerStreamLimit
+	a.streamsMu.Unlock()
+	if freed {
+		_ = a.send(appendMaxStreams(nil, limit))
+	}
 }
 
 // streamEnded reports whether a stream ended recently, which is what a frame that
@@ -881,23 +929,48 @@ func (a *association) handleStreamFrame(data streamData) error {
 }
 
 // acceptOpenedStream records a stream the peer opened and hands it to the
-// application.
+// application. A stream beyond the number this end allowed is a peer that does not
+// stay inside what it was told, and that is the whole association's problem.
 func (a *association) acceptOpenedStream(id uint32) (*Stream, error) {
 	a.streamsMu.Lock()
-	if len(a.streams) >= maxStreams {
+	if id>>1 >= a.peerStreamLimit {
+		limit := a.peerStreamLimit
 		a.streamsMu.Unlock()
-		return nil, E.New("the peer opened more than ", maxStreams, " streams")
+		return nil, E.New("the peer opened stream ", id>>1, " with a limit of ", limit)
 	}
 	stream := newStream(a, id, initialStreamWindow)
+	stream.queued = true
 	a.streams[id] = stream
-	a.streamsMu.Unlock()
-	select {
-	case a.acceptStream <- stream:
-		return stream, nil
-	default:
-		a.removeStream(id)
-		return nil, E.New("accept queue is full")
+	// The first stream the peer opens is what tells it the budget: until then both
+	// ends are inside the number they know without a frame.
+	announce := a.peerStreamLimit == initialStreams
+	if announce {
+		a.peerStreamLimit = streamBudget
 	}
+	limit := a.peerStreamLimit
+	a.streamsMu.Unlock()
+	if announce {
+		_ = a.send(appendMaxStreams(nil, limit))
+	}
+	// The queue always has room: a stream of the peer holds its place from here until
+	// it is both ended and accepted, and the limit this end announced is what bounds
+	// how many of those there are.
+	a.acceptStream <- stream
+	return stream, nil
+}
+
+// handleMaxStreams takes the number of streams the peer allows this end, and wakes
+// every opener that was waiting for one.
+func (a *association) handleMaxStreams(limit uint32) {
+	a.streamsMu.Lock()
+	if limit <= a.openCredit {
+		a.streamsMu.Unlock()
+		return
+	}
+	a.openCredit = limit
+	close(a.streamCredit)
+	a.streamCredit = make(chan struct{})
+	a.streamsMu.Unlock()
 }
 
 // handleMaxData moves the association window forward.
@@ -1026,6 +1099,13 @@ func appendMaxStreamData(dst []byte, streamID uint32, limit uint64) []byte {
 	dst = append(dst, byte(frameTypeMaxStreamData))
 	dst = binary.BigEndian.AppendUint32(dst, streamID)
 	return binary.BigEndian.AppendUint64(dst, limit)
+}
+
+// appendMaxStreams appends a frame that moves the number of streams the peer may
+// have open forward.
+func appendMaxStreams(dst []byte, limit uint32) []byte {
+	dst = append(dst, byte(frameTypeMaxStreams))
+	return binary.BigEndian.AppendUint32(dst, limit)
 }
 
 var (

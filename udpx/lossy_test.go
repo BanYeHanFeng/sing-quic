@@ -292,7 +292,7 @@ func TestTransferUnderLoss(t *testing.T) {
 			serverAssociation.flightMu.Lock()
 			inFlight := serverAssociation.inFlight.len()
 			serverAssociation.flightMu.Unlock()
-			if inFlight > 2*maxStreams {
+			if inFlight > 2*initialStreams {
 				t.Fatalf("%d packets in flight after the transfer", inFlight)
 			}
 		})
