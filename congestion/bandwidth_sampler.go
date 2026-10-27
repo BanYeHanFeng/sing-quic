@@ -8,7 +8,6 @@ import (
 const (
 	infRTT                             = time.Duration(math.MaxInt64)
 	defaultConnectionStateMapQueueSize = 256
-	defaultCandidatesBufferSize        = 256
 )
 
 type roundTripCount uint64
@@ -81,17 +80,12 @@ type bandwidthSample struct {
 	// The RTT measurement at this particular sample.  Zero if no RTT sample is
 	// available.  Does not correct for delayed ack time.
 	rtt time.Duration
-	// |send_rate| is computed from the current packet being acked('P') and an
-	// earlier packet that is acked before P was sent.
-	sendRate Bandwidth
 	// States captured when the packet was sent.
 	stateAtSend sendTimeState
 }
 
 func newBandwidthSample() *bandwidthSample {
-	return &bandwidthSample{
-		sendRate: infBandwidth,
-	}
+	return &bandwidthSample{}
 }
 
 // MaxAckHeightTracker is part of the BandwidthSampler. It is called after every
@@ -107,10 +101,8 @@ type maxAckHeightTracker struct {
 	lastSentPacketNumberBeforeEpoch PacketNumber
 	// The number of ack aggregation epochs ever started, including the ongoing
 	// one. Stats only.
-	numAckAggregationEpochs                uint64
-	ackAggregationBandwidthThreshold       float64
-	startNewAggregationEpochAfterFullRound bool
-	reduceExtraAckedOnBandwidthIncrease    bool
+	numAckAggregationEpochs          uint64
+	ackAggregationBandwidthThreshold float64
 }
 
 func newMaxAckHeightTracker(windowLength roundTripCount) *maxAckHeightTracker {
@@ -136,7 +128,7 @@ func (m *maxAckHeightTracker) Update(
 ) ByteCount {
 	forceNewEpoch := false
 
-	if m.reduceExtraAckedOnBandwidthIncrease && isNewMaxBandwidth {
+	if isNewMaxBandwidth {
 		// Save and clear existing entries.
 		best := m.maxAckHeightFilter.GetBest()
 		secondBest := m.maxAckHeightFilter.GetSecondBest()
@@ -161,14 +153,6 @@ func (m *maxAckHeightTracker) Update(
 		}
 	}
 
-	// If any packet sent after the start of the epoch has been acked, start a new
-	// epoch.
-	if m.startNewAggregationEpochAfterFullRound &&
-		m.lastSentPacketNumberBeforeEpoch != invalidPacketNumber &&
-		lastAckedPacketNumber != invalidPacketNumber &&
-		lastAckedPacketNumber > m.lastSentPacketNumberBeforeEpoch {
-		forceNewEpoch = true
-	}
 	if m.aggregationEpochStartTime.IsZero() || forceNewEpoch {
 		m.aggregationEpochBytes = bytesAcked
 		m.aggregationEpochStartTime = ackTime
@@ -215,65 +199,6 @@ func (m *maxAckHeightTracker) Reset(newHeight ByteCount, newTime roundTripCount)
 		round:      newTime,
 	}
 	m.maxAckHeightFilter.Reset(newEvent, newTime)
-}
-
-func (m *maxAckHeightTracker) SetAckAggregationBandwidthThreshold(threshold float64) {
-	m.ackAggregationBandwidthThreshold = threshold
-}
-
-func (m *maxAckHeightTracker) SetStartNewAggregationEpochAfterFullRound(value bool) {
-	m.startNewAggregationEpochAfterFullRound = value
-}
-
-func (m *maxAckHeightTracker) SetReduceExtraAckedOnBandwidthIncrease(value bool) {
-	m.reduceExtraAckedOnBandwidthIncrease = value
-}
-
-func (m *maxAckHeightTracker) AckAggregationBandwidthThreshold() float64 {
-	return m.ackAggregationBandwidthThreshold
-}
-
-func (m *maxAckHeightTracker) NumAckAggregationEpochs() uint64 {
-	return m.numAckAggregationEpochs
-}
-
-// AckPoint represents a point on the ack line.
-type ackPoint struct {
-	ackTime         time.Time
-	totalBytesAcked ByteCount
-}
-
-// RecentAckPoints maintains the most recent 2 ack points at distinct times.
-type recentAckPoints struct {
-	ackPoints [2]ackPoint
-}
-
-func (r *recentAckPoints) Update(ackTime time.Time, totalBytesAcked ByteCount) {
-	if ackTime.Before(r.ackPoints[1].ackTime) {
-		r.ackPoints[1].ackTime = ackTime
-	} else if ackTime.After(r.ackPoints[1].ackTime) {
-		r.ackPoints[0] = r.ackPoints[1]
-		r.ackPoints[1].ackTime = ackTime
-	}
-
-	r.ackPoints[1].totalBytesAcked = totalBytesAcked
-}
-
-func (r *recentAckPoints) Clear() {
-	r.ackPoints[0] = ackPoint{}
-	r.ackPoints[1] = ackPoint{}
-}
-
-func (r *recentAckPoints) MostRecentPoint() *ackPoint {
-	return &r.ackPoints[1]
-}
-
-func (r *recentAckPoints) LessRecentPoint() *ackPoint {
-	if r.ackPoints[0].totalBytesAcked != 0 {
-		return &r.ackPoints[0]
-	}
-
-	return &r.ackPoints[1]
 }
 
 // ConnectionStateOnSentPacket represents the information about a sent packet
@@ -474,20 +399,11 @@ type bandwidthSampler struct {
 	// sent, indexed by the packet number.
 	connectionStateMap *packetNumberIndexedQueue[connectionStateOnSentPacket]
 
-	recentAckPoints recentAckPoints
-	a0Candidates    RingBuffer[ackPoint]
-
 	// Maximum number of tracked packets.
 	maxTrackedPackets ByteCount
 
 	maxAckHeightTracker              *maxAckHeightTracker
 	totalBytesAckedAfterLastAckEvent ByteCount
-
-	// True if connection option 'BSAO' is set.
-	overestimateAvoidance bool
-
-	// True if connection option 'BBRB' is set.
-	limitMaxAckHeightTrackerBySendRate bool
 }
 
 func newBandwidthSampler(maxAckHeightTrackerWindowLength roundTripCount) *bandwidthSampler {
@@ -499,8 +415,6 @@ func newBandwidthSampler(maxAckHeightTrackerWindowLength roundTripCount) *bandwi
 		endOfAppLimitedPhase: invalidPacketNumber,
 	}
 
-	b.a0Candidates.Init(defaultCandidatesBufferSize)
-
 	return b
 }
 
@@ -508,41 +422,8 @@ func (b *bandwidthSampler) MaxAckHeight() ByteCount {
 	return b.maxAckHeightTracker.Get()
 }
 
-func (b *bandwidthSampler) NumAckAggregationEpochs() uint64 {
-	return b.maxAckHeightTracker.NumAckAggregationEpochs()
-}
-
-func (b *bandwidthSampler) SetMaxAckHeightTrackerWindowLength(length roundTripCount) {
-	b.maxAckHeightTracker.SetFilterWindowLength(length)
-}
-
 func (b *bandwidthSampler) ResetMaxAckHeightTracker(newHeight ByteCount, newTime roundTripCount) {
 	b.maxAckHeightTracker.Reset(newHeight, newTime)
-}
-
-func (b *bandwidthSampler) SetStartNewAggregationEpochAfterFullRound(value bool) {
-	b.maxAckHeightTracker.SetStartNewAggregationEpochAfterFullRound(value)
-}
-
-func (b *bandwidthSampler) SetLimitMaxAckHeightTrackerBySendRate(value bool) {
-	b.limitMaxAckHeightTrackerBySendRate = value
-}
-
-func (b *bandwidthSampler) SetReduceExtraAckedOnBandwidthIncrease(value bool) {
-	b.maxAckHeightTracker.SetReduceExtraAckedOnBandwidthIncrease(value)
-}
-
-func (b *bandwidthSampler) EnableOverestimateAvoidance() {
-	if b.overestimateAvoidance {
-		return
-	}
-
-	b.overestimateAvoidance = true
-	b.maxAckHeightTracker.SetAckAggregationBandwidthThreshold(2.0)
-}
-
-func (b *bandwidthSampler) IsOverestimateAvoidanceEnabled() bool {
-	return b.overestimateAvoidance
 }
 
 func (b *bandwidthSampler) OnPacketSent(
@@ -568,12 +449,6 @@ func (b *bandwidthSampler) OnPacketSent(
 	// importantly at the beginning of the connection.
 	if bytesInFlight == 0 {
 		b.lastAckedPacketAckTime = sentTime
-		if b.overestimateAvoidance {
-			b.recentAckPoints.Clear()
-			b.recentAckPoints.Update(sentTime, b.totalBytesAcked)
-			b.a0Candidates.Clear()
-			b.a0Candidates.PushBack(*b.recentAckPoints.MostRecentPoint())
-		}
 		b.totalBytesSentAtLastAckedPacket = b.totalBytesSent
 
 		// In this situation ack compression is not a concern, set send rate to
@@ -615,7 +490,6 @@ func (b *bandwidthSampler) OnCongestionEvent(
 	}
 
 	var lastAckedPacketSendState sendTimeState
-	var maxSendRate Bandwidth
 
 	for _, p := range ackedPackets {
 		sample := b.onPacketAcknowledged(ackTime, p.PacketNumber)
@@ -631,9 +505,6 @@ func (b *bandwidthSampler) OnCongestionEvent(
 		if sample.bandwidth > eventSample.sampleMaxBandwidth {
 			eventSample.sampleMaxBandwidth = sample.bandwidth
 			eventSample.sampleIsAppLimited = sample.stateAtSend.isAppLimited
-		}
-		if sample.sendRate != infBandwidth {
-			maxSendRate = Max(maxSendRate, sample.sendRate)
 		}
 		inflightSample := b.totalBytesAcked - lastAckedPacketSendState.totalBytesAcked
 		if inflightSample > eventSample.sampleMaxInflight {
@@ -659,9 +530,6 @@ func (b *bandwidthSampler) OnCongestionEvent(
 
 	isNewMaxBandwidth := eventSample.sampleMaxBandwidth > maxBandwidth
 	maxBandwidth = Max(maxBandwidth, eventSample.sampleMaxBandwidth)
-	if b.limitMaxAckHeightTrackerBySendRate {
-		maxBandwidth = Max(maxBandwidth, maxSendRate)
-	}
 
 	eventSample.extraAcked = b.onAckEventEnd(Min(estBandwidthUpperBound, maxBandwidth), isNewMaxBandwidth, roundTripCount)
 
@@ -705,35 +573,6 @@ func (b *bandwidthSampler) max_ack_height() ByteCount {
 	return b.maxAckHeightTracker.Get()
 }
 
-func (b *bandwidthSampler) chooseA0Point(totalBytesAcked ByteCount, a0 *ackPoint) bool {
-	if b.a0Candidates.Empty() {
-		return false
-	}
-
-	if b.a0Candidates.Len() == 1 {
-		*a0 = *b.a0Candidates.Front()
-		return true
-	}
-
-	for i := 1; i < b.a0Candidates.Len(); i++ {
-		if b.a0Candidates.Offset(i).totalBytesAcked > totalBytesAcked {
-			*a0 = *b.a0Candidates.Offset(i - 1)
-			if i > 1 {
-				for j := 0; j < i-1; j++ {
-					b.a0Candidates.PopFront()
-				}
-			}
-			return true
-		}
-	}
-
-	*a0 = *b.a0Candidates.Back()
-	for k := 0; k < b.a0Candidates.Len()-1; k++ {
-		b.a0Candidates.PopFront()
-	}
-	return true
-}
-
 func (b *bandwidthSampler) onPacketAcknowledged(ackTime time.Time, packetNumber PacketNumber) bandwidthSample {
 	sample := newBandwidthSample()
 	b.lastAckedPacket = packetNumber
@@ -747,9 +586,6 @@ func (b *bandwidthSampler) onPacketAcknowledged(ackTime time.Time, packetNumber 
 	b.totalBytesSentAtLastAckedPacket = sentPacketPointer.sendTimeState.totalBytesSent
 	b.lastAckedPacketSentTime = sentPacketPointer.sentTime
 	b.lastAckedPacketAckTime = ackTime
-	if b.overestimateAvoidance {
-		b.recentAckPoints.Update(ackTime, b.totalBytesAcked)
-	}
 
 	if b.isAppLimited {
 		// Exit app-limited phase in two cases:
@@ -779,28 +615,25 @@ func (b *bandwidthSampler) onPacketAcknowledged(ackTime time.Time, packetNumber 
 			sentPacketPointer.sentTime.Sub(sentPacketPointer.lastAckedPacketSentTime))
 	}
 
-	var a0 ackPoint
-	if b.overestimateAvoidance && b.chooseA0Point(sentPacketPointer.sendTimeState.totalBytesAcked, &a0) {
-	} else {
-		a0.ackTime = sentPacketPointer.lastAckedPacketAckTime
-		a0.totalBytesAcked = sentPacketPointer.sendTimeState.totalBytesAcked
-	}
+	// The ack line starts at the last acknowledgement before this one: the sample
+	// is what arrived between the two, over the time between the two.
+	a0AckTime := sentPacketPointer.lastAckedPacketAckTime
+	a0TotalBytesAcked := sentPacketPointer.sendTimeState.totalBytesAcked
 
 	// During the slope calculation, ensure that ack time of the current packet is
 	// always larger than the time of the previous packet, otherwise division by
 	// zero or integer underflow can occur.
-	if ackTime.Sub(a0.ackTime) <= 0 {
+	if ackTime.Sub(a0AckTime) <= 0 {
 		return *sample
 	}
 
-	ackRate := BandwidthFromDelta(b.totalBytesAcked-a0.totalBytesAcked, ackTime.Sub(a0.ackTime))
+	ackRate := BandwidthFromDelta(b.totalBytesAcked-a0TotalBytesAcked, ackTime.Sub(a0AckTime))
 
 	sample.bandwidth = Min(sendRate, ackRate)
 	// Note: this sample does not account for delayed acknowledgement time.  This
 	// means that the RTT measurements here can be artificially high, especially
 	// on low bandwidth connections.
 	sample.rtt = ackTime.Sub(sentPacketPointer.sentTime)
-	sample.sendRate = sendRate
 	sentPacketToSendTimeState(sentPacketPointer, &sample.stateAtSend)
 
 	return *sample
@@ -824,12 +657,6 @@ func (b *bandwidthSampler) onAckEventEnd(
 		b.lastAckedPacket,
 		b.lastAckedPacketAckTime,
 		newlyAckedBytes)
-	// If |extra_acked| is zero, i.e. this ack event marks the start of a new ack
-	// aggregation epoch, save LessRecentPoint, which is the last ack point of the
-	// previous epoch, as a A0 candidate.
-	if b.overestimateAvoidance && extraAcked == 0 {
-		b.a0Candidates.PushBack(*b.recentAckPoints.LessRecentPoint())
-	}
 	return extraAcked
 }
 
