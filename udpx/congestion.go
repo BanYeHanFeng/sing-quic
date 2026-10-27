@@ -122,11 +122,14 @@ func (a *association) pacingWait() time.Duration {
 	return a.cc.PacingWait(now)
 }
 
-// congestionSent records a packet that left.
-func (a *association) congestionSent(packetNumber uint32, size int, priorInFlight int, retransmittable bool) {
+// congestionSent records a packet that left, and returns what the controller has
+// to remember about it until its answer arrives. The flight table is where that
+// goes: it is the table that already holds the packet, and the one whose entries
+// leave when the answer does.
+func (a *association) congestionSent(packetNumber uint32, size int, priorInFlight int) congestion.SendState {
 	a.ccMu.Lock()
 	defer a.ccMu.Unlock()
-	a.cc.OnPacketSent(time.Now(), congestion.ByteCount(priorInFlight), congestion.PacketNumber(packetNumber), congestion.ByteCount(size), retransmittable)
+	return a.cc.OnPacketSent(time.Now(), congestion.ByteCount(priorInFlight), congestion.PacketNumber(packetNumber), congestion.ByteCount(size))
 }
 
 // congestionAcked reports what one acknowledgement settled: the packets it
@@ -142,6 +145,7 @@ func (a *association) congestionAcked(acked, lost []*sentPacket, priorInFlight i
 	acknowledged := make([]congestion.AckedPacketInfo, 0, len(acked))
 	for _, packet := range acked {
 		acknowledged = append(acknowledged, congestion.AckedPacketInfo{
+			SendState:    packet.sendState,
 			TimeSent:     packet.sentAt,
 			BytesAcked:   congestion.ByteCount(packet.size),
 			PacketNumber: congestion.PacketNumber(packet.packetNumber),
@@ -150,6 +154,7 @@ func (a *association) congestionAcked(acked, lost []*sentPacket, priorInFlight i
 	lostPackets := make([]congestion.LostPacketInfo, 0, len(lost))
 	for _, packet := range lost {
 		lostPackets = append(lostPackets, congestion.LostPacketInfo{
+			SendState:    packet.sendState,
 			TimeSent:     packet.sentAt,
 			BytesLost:    congestion.ByteCount(packet.size),
 			PacketNumber: congestion.PacketNumber(packet.packetNumber),

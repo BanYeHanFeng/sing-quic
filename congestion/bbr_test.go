@@ -27,7 +27,7 @@ type bbrSimulation struct {
 	controller Controller
 	now        time.Time
 	packet     PacketNumber
-	acked      []AckedPacketInfo
+	sent       []AckedPacketInfo
 	inFlight   ByteCount
 }
 
@@ -41,15 +41,17 @@ func newBBRSimulation() *bbrSimulation {
 }
 
 // send puts count packets in flight, which is what the transport reports as they
-// leave.
+// leave: what the controller hands back is kept beside each packet, as the flight
+// table of the transport keeps it.
 func (s *bbrSimulation) send(count int) {
-	s.acked = s.acked[:0]
+	s.sent = s.sent[:0]
 	for index := 0; index < count; index++ {
 		sentAt := s.now
 		s.packet++
-		s.controller.OnPacketSent(sentAt, s.inFlight, s.packet, testDatagramSize, true)
+		state := s.controller.OnPacketSent(sentAt, s.inFlight, s.packet, testDatagramSize)
 		s.inFlight += testDatagramSize
-		s.acked = append(s.acked, AckedPacketInfo{
+		s.sent = append(s.sent, AckedPacketInfo{
+			SendState:    state,
 			TimeSent:     sentAt,
 			BytesAcked:   testDatagramSize,
 			PacketNumber: s.packet,
@@ -61,9 +63,9 @@ func (s *bbrSimulation) send(count int) {
 func (s *bbrSimulation) acknowledge() {
 	priorInFlight := s.inFlight
 	s.now = s.now.Add(testRoundTrip)
-	s.controller.OnCongestionEvent(priorInFlight, s.now, s.acked, nil)
-	s.inFlight -= ByteCount(len(s.acked)) * testDatagramSize
-	s.acked = s.acked[:0]
+	s.controller.OnCongestionEvent(priorInFlight, s.now, s.sent, nil)
+	s.inFlight -= ByteCount(len(s.sent)) * testDatagramSize
+	s.sent = s.sent[:0]
 }
 
 // lose settles everything in flight with half of it lost, which is the shape of an
@@ -71,18 +73,19 @@ func (s *bbrSimulation) acknowledge() {
 func (s *bbrSimulation) lose() {
 	priorInFlight := s.inFlight
 	s.now = s.now.Add(testRoundTrip)
-	lost := make([]LostPacketInfo, 0, len(s.acked)/2)
-	for index := 0; index < len(s.acked); index += 2 {
-		acked := s.acked[index]
+	lost := make([]LostPacketInfo, 0, len(s.sent)/2)
+	for index := 0; index < len(s.sent); index += 2 {
+		acked := s.sent[index]
 		lost = append(lost, LostPacketInfo{
+			SendState:    acked.SendState,
 			TimeSent:     acked.TimeSent,
 			BytesLost:    acked.BytesAcked,
 			PacketNumber: acked.PacketNumber,
 		})
 	}
-	s.controller.OnCongestionEvent(priorInFlight, s.now, s.acked, lost)
+	s.controller.OnCongestionEvent(priorInFlight, s.now, s.sent, lost)
 	s.inFlight = 0
-	s.acked = s.acked[:0]
+	s.sent = s.sent[:0]
 }
 
 // TestBbrWindowGrows requires the window to leave the initial one when nothing is

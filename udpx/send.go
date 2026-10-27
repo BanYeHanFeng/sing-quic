@@ -5,6 +5,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/sagernet/sing-quic/congestion"
 	"github.com/sagernet/sing-quic/udpio"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -207,6 +208,12 @@ type sentPacket struct {
 	size         int
 	packetNumber uint32
 	ackEliciting bool
+	// sendState is what the congestion controller remembers about the packet,
+	// which it hands out when the packet leaves and is done with when the answer
+	// for the packet arrives. It lives here rather than in the controller for that
+	// reason: this is the table whose entries leave, and a table of every packet
+	// ever sent is a table that grows for the length of the association.
+	sendState congestion.SendState
 	// parity says the packet is a redundancy shard of a group. It counts into the
 	// window like any other packet and is acknowledged like any other, and the only
 	// thing it does not carry is a frame to send again: a parity shard that is lost
@@ -686,7 +693,7 @@ func (a *association) writePendingLocked() error {
 	for index := range current.pending {
 		packet := &current.pending[index]
 		if packet.sent.ackEliciting {
-			a.congestionSent(packet.sent.packetNumber, packet.sent.size, packet.priorInFlight, true)
+			packet.sent.sendState = a.congestionSent(packet.sent.packetNumber, packet.sent.size, packet.priorInFlight)
 		}
 	}
 	a.resetIdle()

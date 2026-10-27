@@ -28,9 +28,39 @@ const (
 	MaxCongestionWindowPackets = 20000
 )
 
+// SendState is what the controller has to remember about one packet from the
+// moment it leaves to the moment the answer for it arrives: the two points the
+// delivery rate is sampled between, taken while the packet was being sent.
+//
+// The transport keeps it beside the packet, in the table it already has for the
+// packets in flight and already trims as their answers arrive. A controller that
+// kept it itself would need a table of every packet ever sent, which is the same
+// table with nothing removing from it: an association that lasts a day would
+// remember every packet of the day.
+type SendState struct {
+	// priorAckTime is when the last acknowledgement before this packet arrived,
+	// which is where the ack rate is counted from.
+	priorAckTime time.Time
+	// delivered is how many bytes the peer had acknowledged when this packet left,
+	// which is what that count is subtracted from.
+	delivered ByteCount
+	// sentTotal is how many bytes this end had sent when the packet left, counting
+	// it: the send rate of the packet after it is counted from here.
+	sentTotal ByteCount
+	// sendRate is how fast this end was sending up to this packet, and is the upper
+	// bound of the sample: an ack rate above it is the peer's acknowledgements
+	// arriving compressed, not a faster path.
+	sendRate Bandwidth
+	// appLimited says this end had nothing more to send when the packet left, so a
+	// low rate measured from it says something about the application and nothing
+	// about the path.
+	appLimited bool
+}
+
 // AckedPacketInfo is what the transport tells the controller about a packet that
 // was acknowledged.
 type AckedPacketInfo struct {
+	SendState
 	TimeSent     time.Time
 	BytesAcked   ByteCount
 	PacketNumber PacketNumber
@@ -39,6 +69,7 @@ type AckedPacketInfo struct {
 // LostPacketInfo is what the transport tells the controller about a packet that
 // was given up on.
 type LostPacketInfo struct {
+	SendState
 	TimeSent     time.Time
 	BytesLost    ByteCount
 	PacketNumber PacketNumber
@@ -53,7 +84,10 @@ type LostPacketInfo struct {
 // of the same acknowledgement together with the bytes that arrived despite them,
 // and a transport cannot know which of them a controller considers one event.
 type Controller interface {
-	OnPacketSent(sentTime time.Time, bytesInFlight ByteCount, packetNumber PacketNumber, bytes ByteCount, isRetransmittable bool)
+	// OnPacketSent records a packet that left, and returns what has to be kept
+	// beside it until its answer arrives. A packet that asks for no acknowledgement
+	// is not reported: nothing will ever answer it.
+	OnPacketSent(sentTime time.Time, bytesInFlight ByteCount, packetNumber PacketNumber, bytes ByteCount) SendState
 	// OnCongestionEvent reports what one acknowledgement settled: the packets it
 	// covered and the packets that were declared lost by the same answer, with
 	// what was in flight before either of them left the flight table.

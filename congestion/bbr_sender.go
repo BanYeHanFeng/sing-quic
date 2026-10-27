@@ -260,14 +260,9 @@ func (b *bbrSender) PacingWait(now time.Time) time.Duration {
 	return b.pacer.Wait(now)
 }
 
-// OnPacketSent records a packet that left and what was in flight before it.
-func (b *bbrSender) OnPacketSent(
-	sentTime time.Time,
-	bytesInFlight ByteCount,
-	packetNumber PacketNumber,
-	bytes ByteCount,
-	isRetransmittable bool,
-) {
+// OnPacketSent records a packet that left and what was in flight before it, and
+// hands back what has to be kept beside that packet until its answer arrives.
+func (b *bbrSender) OnPacketSent(sentTime time.Time, bytesInFlight ByteCount, packetNumber PacketNumber, bytes ByteCount) SendState {
 	b.pacer.SentPacket(sentTime, bytes)
 
 	b.lastSentPacket = packetNumber
@@ -277,7 +272,7 @@ func (b *bbrSender) OnPacketSent(
 		b.exitingQuiescence = true
 	}
 
-	b.sampler.OnPacketSent(sentTime, packetNumber, bytes, bytesInFlight, isRetransmittable)
+	return b.sampler.OnPacketSent(sentTime, packetNumber, bytes, bytesInFlight)
 }
 
 // CanSend reports whether the window has room for another packet.
@@ -336,9 +331,7 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 
 	sample := b.sampler.OnCongestionEvent(eventTime,
 		ackedPackets, lostPackets, b.maxBandwidth.GetBest(), infBandwidth, b.roundTripCount)
-	if sample.lastPacketSendState.isValid {
-		b.lastSampleIsAppLimited = sample.lastPacketSendState.isAppLimited
-	}
+	b.lastSampleIsAppLimited = sample.lastPacketState.appLimited
 	// Avoid updating |max_bandwidth_| if a) this is a loss-only event, or b) all
 	// packets in |acked_packets| did not generate valid samples. (e.g. ack of
 	// ack-only packets). In both cases, sampler_.total_bytes_acked() will not
