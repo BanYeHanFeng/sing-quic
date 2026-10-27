@@ -1043,3 +1043,36 @@ func TestStreamSlotIsHeldUntilAccepted(t *testing.T) {
 		t.Fatalf("the peer allows %d streams after the stream was taken, expected %d", limit, streamBudget+1)
 	}
 }
+
+// TestStreamLateFramePastTheRing requires a frame for a stream this end opened and
+// ended to be dropped however many streams ended in between: the count of the streams
+// this end opened is what says whether the id existed, and the ring the peer's streams
+// are remembered in cannot answer for this end's own.
+func TestStreamLateFramePastTheRing(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 30*time.Second)
+	late := uint32(0)
+	for index := range 2 * endedStreamsCount {
+		stream, err := client.OpenStream(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if index == 0 {
+			late = stream.ID()
+		}
+		if _, err = stream.Write([]byte{0}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = server.AcceptStream(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err = stream.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// What the peer sent for the first stream arrives after the ring forgot it.
+	err := client.(*association).handleStreamFrame(streamData{streamID: late, data: []byte("late")})
+	if err != nil {
+		t.Fatalf("a frame for an ended stream was rejected: %v", err)
+	}
+}

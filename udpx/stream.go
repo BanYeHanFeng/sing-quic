@@ -794,15 +794,21 @@ func (a *association) stream(id uint32) (*Stream, bool) {
 	return stream, loaded
 }
 
-// endedStreams remembers the streams that ended recently.
+// endedStreams remembers the streams the peer opened that ended recently.
 //
 // A stream ends here before the peer hears about it, so what it already sent for
 // it keeps arriving for a while. Without a memory of the end, a frame for an
 // ended stream looks exactly like the first frame of a stream being opened, and
 // the application would be handed bytes it already read. The memory is a fixed
-// ring, because a peer that opens streams forever must not grow the association;
-// what arrives after the whole ring turned over is dropped too, and by then the
-// path kept it longer than any reordering.
+// ring, because a peer that opens streams forever must not grow the association.
+// A frame for an id the ring forgot opens a stream that is empty or already
+// served, which is noise rather than a stall — and it is the price of the only
+// thing that can tell a late frame from a new stream: the peer opens its streams
+// in order but its frames arrive out of order, so an id below the highest one it
+// opened may still be one this end has never seen.
+//
+// The streams this end opened need no ring: their ids are counted, so the count
+// says whether one existed.
 const endedStreamsCount = 64
 
 type endedStreams struct {
@@ -834,8 +840,11 @@ func (a *association) removeStream(id uint32) {
 	a.streamsMu.Lock()
 	stream, loaded := a.streams[id]
 	delete(a.streams, id)
-	a.endedStreams.add(id)
-	freed := loaded && !stream.queued && id&streamInitiatorBit != a.initiatorBit()
+	peerStream := id&streamInitiatorBit != a.initiatorBit()
+	if peerStream {
+		a.endedStreams.add(id)
+	}
+	freed := loaded && !stream.queued && peerStream
 	if freed {
 		// The peer may open one more now that this one is gone for good.
 		a.peerStreamLimit++
@@ -906,14 +915,21 @@ func (a *association) initiatorBit() uint32 {
 func (a *association) handleStreamFrame(data streamData) error {
 	stream, loaded := a.stream(data.streamID)
 	if !loaded {
+		if data.streamID&streamInitiatorBit == a.initiatorBit() {
+			// A stream this end opened, which it no longer has: the ids of them are
+			// counted, so the count is what says whether this one existed. A frame
+			// for one that did is what the peer sent before it heard about the end,
+			// however many streams ended here since.
+			if data.streamID>>1 < a.nextStreamID {
+				return nil
+			}
+			return E.New("stream frame for stream ", data.streamID, " that was never opened")
+		}
 		// A stream that just ended is not a stream the peer is opening now: what
 		// is still in flight for it arrives after the end and is dropped, the
 		// same way a stream that ended on both sides drops it.
 		if a.streamEnded(data.streamID) {
 			return nil
-		}
-		if data.streamID&streamInitiatorBit == a.initiatorBit() {
-			return E.New("stream frame for stream ", data.streamID, " that was never opened")
 		}
 		var err error
 		stream, err = a.acceptOpenedStream(data.streamID)
