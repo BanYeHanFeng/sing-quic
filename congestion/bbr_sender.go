@@ -3,11 +3,8 @@ package congestion
 // src from https://github.com/google/quiche/blob/e7872fc9e12bb1d46a118949c3d4da36de58aa44/quiche/quic/core/congestion_control/bbr_sender.cc
 
 import (
-	"fmt"
 	"math/rand"
 	"time"
-
-	E "github.com/sagernet/sing/common/exceptions"
 )
 
 // BbrSender implements BBR congestion control algorithm.  BBR aims to estimate
@@ -88,83 +85,6 @@ const (
 	bbrRecoveryStateGrowth
 )
 
-type Profile struct {
-	name                                string
-	highGain                            float64
-	highCwndGain                        float64
-	congestionWindowGainConstant        float64
-	numStartupRtts                      int64
-	drainToTarget                       bool
-	detectOvershooting                  bool
-	bytesLostMultiplier                 uint8
-	enableAckAggregationStartup         bool
-	expireAckAggregationStartup         bool
-	enableOverestimateAvoidance         bool
-	reduceExtraAckedOnBandwidthIncrease bool
-	valid                               bool
-}
-
-var (
-	ProfileConservative = Profile{
-		name:                                "conservative",
-		highGain:                            2.25,
-		highCwndGain:                        1.75,
-		congestionWindowGainConstant:        1.75,
-		numStartupRtts:                      2,
-		drainToTarget:                       true,
-		detectOvershooting:                  true,
-		bytesLostMultiplier:                 1,
-		enableOverestimateAvoidance:         true,
-		reduceExtraAckedOnBandwidthIncrease: true,
-		valid:                               true,
-	}
-	ProfileStandard = Profile{
-		name:                         "standard",
-		highGain:                     defaultHighGain,
-		highCwndGain:                 derivedHighCWNDGain,
-		congestionWindowGainConstant: 2.0,
-		numStartupRtts:               roundTripsWithoutGrowthBeforeExitingStartup,
-		bytesLostMultiplier:          2,
-		valid:                        true,
-	}
-	ProfileAggressive = Profile{
-		name:                         "aggressive",
-		highGain:                     3.0,
-		highCwndGain:                 2.25,
-		congestionWindowGainConstant: 2.5,
-		numStartupRtts:               4,
-		bytesLostMultiplier:          2,
-		enableAckAggregationStartup:  true,
-		expireAckAggregationStartup:  true,
-		valid:                        true,
-	}
-)
-
-func (p Profile) Name() string {
-	return p.name
-}
-
-func (p Profile) String() string {
-	return p.name
-}
-
-func (p Profile) isValid() bool {
-	return p.valid
-}
-
-func ParseProfile(profile string) (Profile, error) {
-	switch profile {
-	case ProfileStandard.name:
-		return ProfileStandard, nil
-	case ProfileConservative.name:
-		return ProfileConservative, nil
-	case ProfileAggressive.name:
-		return ProfileAggressive, nil
-	default:
-		return Profile{}, E.New("unsupported BBR profile: ", profile)
-	}
-}
-
 type bbrSender struct {
 	rttStats RTTStatsProvider
 	pacer    *Pacer
@@ -211,9 +131,6 @@ type bbrSender struct {
 
 	// The smallest value the |congestion_window_| can achieve.
 	minCongestionWindow ByteCount
-
-	// The BBR profile used by the sender.
-	profile Profile
 
 	// The pacing gain applied during the STARTUP phase.
 	highGain float64
@@ -314,19 +231,8 @@ type bbrSender struct {
 	bytesInFlight ByteCount
 }
 
-func NewBbrSenderWithProfile(
-	initialMaxDatagramSize ByteCount,
-	profile Profile,
-) *bbrSender {
-	return NewBbrSenderWithInitialWindow(
-		initialMaxDatagramSize,
-		profile,
-		initialCongestionWindowPackets,
-	)
-}
-
-// NewBbrSenderWithInitialWindow builds a sender whose window starts at
-// initialWindowPackets packets. Zero or less asks for the default.
+// NewBbrSender builds a sender whose window starts at initialWindowPackets
+// packets. Zero or less asks for the default.
 //
 // The first window is the caller's answer, not the algorithm's: how much may leave
 // before the path has said anything about itself is the path's bandwidth-delay
@@ -335,11 +241,7 @@ func NewBbrSenderWithProfile(
 // ramp at the start of a transfer by a round trip per doubling; the cost is that
 // the first window arrives as one burst, so it is bounded by what the peer was
 // told to expect.
-func NewBbrSenderWithInitialWindow(
-	initialMaxDatagramSize ByteCount,
-	profile Profile,
-	initialWindowPackets int64,
-) *bbrSender {
+func NewBbrSender(initialMaxDatagramSize ByteCount, initialWindowPackets int64) *bbrSender {
 	if initialWindowPackets <= 0 {
 		initialWindowPackets = initialCongestionWindowPackets
 	}
@@ -350,7 +252,6 @@ func NewBbrSenderWithInitialWindow(
 		initialMaxDatagramSize,
 		ByteCount(initialWindowPackets)*initialMaxDatagramSize,
 		MaxCongestionWindowPackets*initialMaxDatagramSize,
-		profile,
 	)
 }
 
@@ -358,7 +259,6 @@ func newBbrSender(
 	initialMaxDatagramSize,
 	initialCongestionWindow,
 	initialMaxCongestionWindow ByteCount,
-	profile Profile,
 ) *bbrSender {
 	b := &bbrSender{
 		mode:                         bbrModeStartup,
@@ -371,7 +271,7 @@ func newBbrSender(
 		maxCongestionWindow:          initialMaxCongestionWindow,
 		minCongestionWindow:          minCongestionWindowForMaxDatagramSize(initialMaxDatagramSize),
 		highGain:                     defaultHighGain,
-		highCwndGain:                 defaultHighGain,
+		highCwndGain:                 derivedHighCWNDGain,
 		drainGain:                    1.0 / defaultHighGain,
 		pacingGain:                   1.0,
 		congestionWindowGain:         1.0,
@@ -386,7 +286,6 @@ func newBbrSender(
 		maxDatagramSize: initialMaxDatagramSize,
 	}
 	b.pacer = NewPacer(initialMaxDatagramSize, b.bandwidthForPacer)
-	b.applyProfile(profile)
 
 	b.enterStartupMode(time.Now())
 
@@ -395,27 +294,6 @@ func newBbrSender(
 
 func minCongestionWindowForMaxDatagramSize(maxDatagramSize ByteCount) ByteCount {
 	return minCongestionWindowPackets * maxDatagramSize
-}
-
-func (b *bbrSender) applyProfile(profile Profile) {
-	if !profile.isValid() {
-		panic(fmt.Sprintf("congestion BUG: invalid BBR profile %q", profile.Name()))
-	}
-	b.profile = profile
-	b.highGain = profile.highGain
-	b.highCwndGain = profile.highCwndGain
-	b.drainGain = 1.0 / profile.highGain
-	b.congestionWindowGainConstant = profile.congestionWindowGainConstant
-	b.numStartupRtts = profile.numStartupRtts
-	b.drainToTarget = profile.drainToTarget
-	b.detectOvershooting = profile.detectOvershooting
-	b.bytesLostMultiplierWhileDetectingOvershooting = profile.bytesLostMultiplier
-	b.enableAckAggregationDuringStartup = profile.enableAckAggregationStartup
-	b.expireAckAggregationInStartup = profile.expireAckAggregationStartup
-	if profile.enableOverestimateAvoidance {
-		b.sampler.EnableOverestimateAvoidance()
-	}
-	b.sampler.SetReduceExtraAckedOnBandwidthIncrease(profile.reduceExtraAckedOnBandwidthIncrease)
 }
 
 func (b *bbrSender) SetRTTStatsProvider(provider RTTStatsProvider) {

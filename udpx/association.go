@@ -110,10 +110,6 @@ type Options struct {
 	// was created through.
 	KeepAlivePeriod time.Duration
 
-	// Congestion is the BBR profile of the congestion controller. The zero value
-	// is the default one (defaultCongestionProfile).
-	Congestion congestion.Profile
-
 	// FEC is the forward error correction applied to what this end sends. It
 	// protects one direction only, so an association that should survive a lossy
 	// path in both directions sets it on both ends.
@@ -144,9 +140,6 @@ func (o Options) withDefaults() Options {
 	}
 	if o.KeepAlivePeriod < 0 {
 		o.KeepAlivePeriod = 0
-	}
-	if o.Congestion == (congestion.Profile{}) {
-		o.Congestion = defaultCongestionProfile
 	}
 	return o
 }
@@ -334,7 +327,7 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 	// The controller comes first: a timer that fires before it exists would send
 	// through a half built association, and the idle timer is armed with the
 	// configured timeout, which may be short enough to win the race.
-	a.cc = newCongestionController(a.options)
+	a.cc = newCongestionController()
 	a.cc.SetRTTStatsProvider(&a.rttStats)
 	if a.fecSender != nil {
 		a.maxPayload = a.fecSender.payloadBudget()

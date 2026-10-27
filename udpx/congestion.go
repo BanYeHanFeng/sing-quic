@@ -73,26 +73,10 @@ func (s *rttSnapshot) LatestRTT() time.Duration {
 // sender are 5 percent slower and everything else is unchanged.
 const initialCongestionWindowPackets = 128
 
-// defaultCongestionProfile is the BBR profile an association runs when the caller
-// does not ask for one.
-//
-// What a profile decides is the steady state window and where the startup ends, and
-// on a path with capacity it is the window that holds the send path back for half of
-// a transfer. The standard profile keeps two bandwidth-delay products of window
-// instead of the conservative 1.75 and ends the startup after three round trips
-// without growth instead of two: on a 12.5 MiB/s path with 200 ms of round trip that
-// is 8 percent of a sixteen megabyte transfer at no loss and about the same on top of
-// five percent loss, where the aggressive profile is faster still on a clean path but
-// swings too much once the queue it builds up starts to drop. What it costs: nothing
-// measurable on loopback, where the bandwidth-delay product is a few packets, and
-// nothing on a path with no capacity, where the window never limits.
-var defaultCongestionProfile = congestion.ProfileStandard
-
 // newCongestionController builds the controller of an association.
-func newCongestionController(options Options) congestion.Controller {
-	return congestion.NewBbrControllerWithInitialWindow(
+func newCongestionController() congestion.Controller {
+	return congestion.NewBbrController(
 		congestion.ByteCount(maxPacketSize),
-		options.Congestion,
 		int64(initialCongestionWindowPackets),
 	)
 }

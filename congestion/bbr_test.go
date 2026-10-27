@@ -32,7 +32,7 @@ type bbrSimulation struct {
 }
 
 func newBBRSimulation() *bbrSimulation {
-	controller := NewBbrController(testDatagramSize, ProfileConservative)
+	controller := NewBbrController(testDatagramSize, initialCongestionWindowPackets)
 	controller.SetRTTStatsProvider(fixedRTT(testRoundTrip))
 	return &bbrSimulation{
 		controller: controller,
@@ -148,7 +148,7 @@ func TestBbrInitialWindowIsTheCallers(t *testing.T) {
 		{packets: 128, window: 128 * testDatagramSize},
 		{packets: 2, window: minCongestionWindowPackets * testDatagramSize},
 	} {
-		sender := NewBbrSenderWithInitialWindow(testDatagramSize, ProfileConservative, test.packets)
+		sender := NewBbrSender(testDatagramSize, test.packets)
 		window := sender.GetCongestionWindow()
 		if window != test.window {
 			t.Errorf("window of %d for %d packets asked for, want %d", window, test.packets, test.window)

@@ -3,8 +3,6 @@ package udpx
 import (
 	"testing"
 	"time"
-
-	"github.com/sagernet/sing-quic/congestion"
 )
 
 // TestCongestionWindowBounds requires the window of the congestion controller to
@@ -60,26 +58,9 @@ func TestCongestionWindowBounds(t *testing.T) {
 // what the peer was told to expect and what the path can take, both of which are
 // known here and neither of which is known in the controller.
 func TestInitialCongestionWindow(t *testing.T) {
-	controller := newCongestionController(Options{}.withDefaults())
+	controller := newCongestionController()
 	want := initialCongestionWindowPackets * maxPacketSize
 	if window := int(controller.GetCongestionWindow()); window != want {
 		t.Errorf("initial window is %d bytes, want %d", window, want)
-	}
-}
-
-// TestDefaultCongestionProfile requires the transport to pick the profile and the
-// caller only to be able to override it: what a profile decides is how much window
-// the steady state keeps and when the startup ends, which on a path with capacity is
-// what holds the send path back, so the default is the one measured to be faster
-// there and to cost nothing on loopback.
-func TestDefaultCongestionProfile(t *testing.T) {
-	if got := (Options{}).withDefaults().Congestion; got != defaultCongestionProfile {
-		t.Errorf("the default profile is %s, want %s", got.Name(), defaultCongestionProfile.Name())
-	}
-	if defaultCongestionProfile != congestion.ProfileStandard {
-		t.Errorf("the default profile is %s, want the standard one", defaultCongestionProfile.Name())
-	}
-	if got := (Options{Congestion: congestion.ProfileConservative}).withDefaults().Congestion; got != congestion.ProfileConservative {
-		t.Errorf("the profile asked for is %s, want conservative", got.Name())
 	}
 }

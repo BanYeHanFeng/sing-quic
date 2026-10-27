@@ -26,7 +26,7 @@ type ClientOptions struct {
 	Password      string
 	IdleTimeout   time.Duration
 	Heartbeat     time.Duration
-	BBRProfile    string
+
 	// FEC protects what this client sends, which is the direction its requests
 	// travel in: a lost packet that the redundancy replaces does not cost a round
 	// trip of the request it belongs to.
@@ -61,10 +61,6 @@ func NewClient(options ClientOptions) (*Client, error) {
 	if options.Logger == nil {
 		options.Logger = logger.NOP()
 	}
-	bbrProfile, err := parseBBRProfile(options.BBRProfile)
-	if err != nil {
-		return nil, err
-	}
 	return &Client{
 		ctx:        options.Context,
 		dialer:     options.Dialer,
@@ -76,7 +72,6 @@ func NewClient(options ClientOptions) (*Client, error) {
 			// this protocol is exactly what the keepalive of the transport does:
 			// a ping the peer acknowledges.
 			KeepAlivePeriod: options.Heartbeat,
-			Congestion:      bbrProfile,
 			FEC:             options.FEC,
 		},
 		logger: options.Logger,

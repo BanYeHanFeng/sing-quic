@@ -32,7 +32,6 @@ type ServiceOptions struct {
 	Heartbeat   time.Duration
 	UDPTimeout  time.Duration
 	Handler     ServiceHandler
-	BBRProfile  string
 	// FEC protects what this server sends, which is the direction the answers
 	// travel in. It is per direction: a client that wants its own requests covered
 	// sets it on the client.
@@ -79,10 +78,6 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	if options.Heartbeat == 0 {
 		options.Heartbeat = 10 * time.Second
 	}
-	bbrProfile, err := parseBBRProfile(options.BBRProfile)
-	if err != nil {
-		return nil, err
-	}
 	return &Service[U]{
 		ctx:        options.Context,
 		logger:     options.Logger,
@@ -91,7 +86,6 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		transport: udpx.Options{
 			IdleTimeout:     options.IdleTimeout,
 			KeepAlivePeriod: options.Heartbeat,
-			Congestion:      bbrProfile,
 			FEC:             options.FEC,
 		},
 		userMap: make(map[[8]byte]userEntry[U]),

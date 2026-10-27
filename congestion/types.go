@@ -77,13 +77,9 @@ type RTTStatsProvider interface {
 	LatestRTT() time.Duration
 }
 
-// NewBbrController returns a BBR controller for a transport.
-func NewBbrController(initialMaxDatagramSize ByteCount, profile Profile) Controller {
-	return NewBbrSenderWithProfile(initialMaxDatagramSize, profile)
-}
-
-// NewBbrControllerWithInitialWindow is NewBbrController with the first window
-// chosen by the transport, in packets. Zero or less asks for the default.
-func NewBbrControllerWithInitialWindow(initialMaxDatagramSize ByteCount, profile Profile, initialWindowPackets int64) Controller {
-	return NewBbrSenderWithInitialWindow(initialMaxDatagramSize, profile, initialWindowPackets)
+// NewBbrController returns the controller an association runs: BBR with the
+// standard gains, and a first window the transport chooses in packets. Zero or
+// less asks for the controller's own default.
+func NewBbrController(initialMaxDatagramSize ByteCount, initialWindowPackets int64) Controller {
+	return NewBbrSender(initialMaxDatagramSize, initialWindowPackets)
 }
