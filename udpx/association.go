@@ -145,10 +145,12 @@ func (o Options) withDefaults() Options {
 
 // associationTimers is what an association wakes up on.
 //
-// The four belong together because a timer that fires runs into the association
-// and arms one of the others: a retransmission is paced, an acknowledgement is
-// sent, a probe rearms itself. They are therefore built as one set, before any of
-// them can fire, and the set is what the association hands out.
+// The three belong together because a timer that fires runs into the association
+// and arms one of the others: an acknowledgement is sent, a probe rearms itself.
+// They are therefore built as one set, before any of them can fire, and the set is
+// what the association hands out. Pacing is not one of them: it has its own
+// goroutine, because what it needs from the clock is a resolution a timer does not
+// have (paceLoop).
 type associationTimers struct {
 	// idle closes the association when it falls silent. It is reset from both
 	// sides.
@@ -157,8 +159,6 @@ type associationTimers struct {
 	ack *time.Timer
 	// pto asks the peer about the oldest packet in flight.
 	pto *time.Timer
-	// pace wakes the send path when the pacing rate allows the next batch.
-	pace *time.Timer
 }
 
 // association is one association as this end keeps it.
@@ -199,6 +199,9 @@ type association struct {
 	writing   int
 	writeStop chan struct{}
 	writeDone chan struct{}
+	// paceWake asks the pacing goroutine to look at the clock again, and holds one
+	// request: whoever asks while it is already awake has nothing to add.
+	paceWake chan struct{}
 	// sealNonce is the nonce of the packet being sealed, reused: twelve bytes per
 	// packet is a third of what sealing one costs.
 	sealNonce [nonceLen]byte
@@ -305,6 +308,7 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		written:      make(chan *batch, writeBatchSlots),
 		writeStop:    make(chan struct{}),
 		writeDone:    make(chan struct{}),
+		paceWake:     make(chan struct{}, 1),
 		maxPayload:   maxPacketSize - headerLen - tagLen,
 		fecSender:    newFECSender(options.FEC),
 		fec:          newFECReceiver(),
@@ -343,14 +347,13 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		idle: time.AfterFunc(time.Hour, func() { a.shutdown(ErrIdleTimeout, true) }),
 		ack:  time.AfterFunc(time.Hour, a.flushAck),
 		pto:  time.AfterFunc(time.Hour, a.probe),
-		pace: time.AfterFunc(time.Hour, func() { _ = a.flush() }),
 	}
 	timers.ack.Stop()
 	timers.pto.Stop()
-	timers.pace.Stop()
 	a.timers.Store(timers)
 	timers.idle.Reset(a.options.IdleTimeout)
 	go a.writeLoop()
+	go a.paceLoop()
 	if a.options.KeepAlivePeriod > 0 {
 		go a.keepAliveLoop()
 	}
@@ -400,7 +403,6 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 		timers.idle.Stop()
 		timers.ack.Stop()
 		timers.pto.Stop()
-		timers.pace.Stop()
 		if a.fecSender != nil {
 			a.fecSender.timer.Stop()
 		}

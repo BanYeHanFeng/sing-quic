@@ -512,7 +512,7 @@ func (a *association) flush() error {
 			// socket was asked to avoid. What a batch spends beyond the tokens it
 			// found is what the next one waits for.
 			if wait := a.pacingWait(); wait > 0 {
-				a.timers.Load().pace.Reset(wait)
+				a.wakePacer()
 				return nil
 			}
 		}
@@ -525,6 +525,73 @@ func (a *association) flush() error {
 			return err
 		}
 	}
+}
+
+// wakePacer asks the pacing goroutine to look at the clock again. Whoever asks
+// while it is already awake has nothing to add, so the request is a token rather
+// than a queue.
+func (a *association) wakePacer() {
+	select {
+	case a.paceWake <- struct{}{}:
+	default:
+	}
+}
+
+// paceLoop is the clock the send path follows: it waits out what the pacer says the
+// last batch still owes, and then asks for the next one.
+//
+// It used to be a timer, and a timer cannot be the clock of a send path: a wait under
+// a millisecond is served as 1.07 of them whatever it was asked for, so a batch of
+// sixteen packets could not leave more often than once per 1.07 ms — 21 MiB/s however
+// fast the path was. The bucket that made up the difference is a burst of rate times
+// the wait, and on a path whose queue is 25 KB a burst is the loss. Sleeping here
+// instead is late by about sixty microseconds, which the bucket covers and a path
+// does not notice.
+//
+// It is a goroutine rather than a wait inside flush because flush is called from the
+// receive path: an acknowledgement has to be able to open the window without first
+// waiting out a rate, and waiting under the send lock is the same wait under the lock
+// that acknowledgement needs.
+func (a *association) paceLoop() {
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-a.paceWake:
+		}
+		for {
+			wait := a.pacingWait()
+			if wait <= 0 {
+				break
+			}
+			sleepAtLeast(wait)
+			select {
+			case <-a.ctx.Done():
+				return
+			default:
+			}
+		}
+		if err := a.flush(); err != nil {
+			return
+		}
+	}
+}
+
+// sleepCoarse is how much of a wait is left to nanosleep. A timer serves a whole
+// number of milliseconds, so what it is asked for has to be at least a millisecond
+// short of the wait and rounded up from there; two is that plus the rounding.
+const sleepCoarse = 2 * time.Millisecond
+
+// sleepAtLeast waits at least d, precisely enough that the bucket does not have to
+// make up more than the sixty microseconds nanosleep is late by. The coarse part is
+// a timer so that a slow path does not sit on an operating system thread for the
+// whole of a wait it could have slept through.
+func sleepAtLeast(d time.Duration) {
+	if d > sleepCoarse {
+		time.Sleep(d - sleepCoarse)
+		d = sleepCoarse
+	}
+	nanosleep(d)
 }
 
 // planLocked puts the frames into the batch as one packet and, when this packet is
