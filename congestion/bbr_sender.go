@@ -51,10 +51,6 @@ const (
 	// will exit the STARTUP mode.
 	startupGrowthTarget                         = 1.25
 	roundTripsWithoutGrowthBeforeExitingStartup = int64(3)
-
-	// Flag.
-	defaultStartupFullLossCount  = 8
-	quicBbr2DefaultLossThreshold = 0.02
 )
 
 type bbrMode int
@@ -103,12 +99,6 @@ type bbrSender struct {
 	// Acknowledgement of any packet after |current_round_trip_end_| will cause
 	// the round trip counter to advance.
 	currentRoundTripEnd PacketNumber
-
-	// Number of congestion events with some losses, in the current round.
-	numLossEventsInRound uint64
-
-	// Number of total bytes lost in the current round.
-	bytesLostInRound ByteCount
 
 	// The filter that tracks the maximum bandwidth over the multiple recent
 	// round-trips.
@@ -369,11 +359,6 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 	var isRoundStart, minRttExpired bool
 	var excessAcked, bytesLost ByteCount
 
-	// The send state of the largest packet in acked_packets, unless it is
-	// empty. If acked_packets is empty, it's the send state of the largest
-	// packet in lost_packets.
-	var lastPacketSendState sendTimeState
-
 	// Update bytesInFlight
 	b.bytesInFlight = priorInFlight
 	for _, p := range ackedPackets {
@@ -411,12 +396,6 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 	bytesLost = b.sampler.TotalBytesLost() - totalBytesLostBefore
 
 	excessAcked = sample.extraAcked
-	lastPacketSendState = sample.lastPacketSendState
-
-	if len(lostPackets) != 0 {
-		b.numLossEventsInRound++
-		b.bytesLostInRound += bytesLost
-	}
 
 	// Handle logic specific to PROBE_BW mode.
 	if b.mode == bbrModeProbeBw {
@@ -425,7 +404,7 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 
 	// Handle logic specific to STARTUP and DRAIN modes.
 	if isRoundStart && !b.isAtFullBandwidth {
-		b.checkIfFullBandwidthReached(&lastPacketSendState)
+		b.checkIfFullBandwidthReached()
 	}
 
 	b.maybeExitStartupOrDrain(eventTime)
@@ -441,11 +420,6 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 	b.calculatePacingRate(bytesLost)
 	b.calculateCongestionWindow(bytesAcked, excessAcked)
 	b.calculateRecoveryWindow(bytesAcked, bytesLost)
-
-	if isRoundStart {
-		b.numLossEventsInRound = 0
-		b.bytesLostInRound = 0
-	}
 }
 
 func (b *bbrSender) PacingRate() Bandwidth {
@@ -598,8 +572,11 @@ func (b *bbrSender) updateGainCyclePhase(now time.Time, priorInFlight ByteCount,
 }
 
 // Tracks for how many round-trips the bandwidth has not increased
-// significantly.
-func (b *bbrSender) checkIfFullBandwidthReached(lastPacketSendState *sendTimeState) {
+// significantly, which is the one signal startup ends on: the path has stopped
+// saying that it carries more. Losing packets is not one of them, because a path
+// that drops some of what it carries still carries the rest, and an estimate that
+// stops where the first loss arrived is one the sender never gets back.
+func (b *bbrSender) checkIfFullBandwidthReached() {
 	if b.lastSampleIsAppLimited {
 		return
 	}
@@ -616,8 +593,7 @@ func (b *bbrSender) checkIfFullBandwidthReached(lastPacketSendState *sendTimeSta
 	}
 
 	b.roundsWithoutBandwidthGain++
-	if b.roundsWithoutBandwidthGain >= b.numStartupRtts ||
-		b.shouldExitStartupDueToLoss(lastPacketSendState) {
+	if b.roundsWithoutBandwidthGain >= b.numStartupRtts {
 		b.isAtFullBandwidth = true
 	}
 }
@@ -820,23 +796,6 @@ func (b *bbrSender) calculateRecoveryWindow(bytesAcked, bytesLost ByteCount) {
 	// Always allow sending at least |bytes_acked| in response.
 	b.recoveryWindow = Max(b.recoveryWindow, b.bytesInFlight+bytesAcked)
 	b.recoveryWindow = Max(b.minCongestionWindow, b.recoveryWindow)
-}
-
-// Return whether we should exit STARTUP due to excessive loss.
-func (b *bbrSender) shouldExitStartupDueToLoss(lastPacketSendState *sendTimeState) bool {
-	if b.numLossEventsInRound < defaultStartupFullLossCount || !lastPacketSendState.isValid {
-		return false
-	}
-
-	inflightAtSend := lastPacketSendState.bytesInFlight
-
-	if inflightAtSend > 0 && b.bytesLostInRound > 0 {
-		if b.bytesLostInRound > ByteCount(float64(inflightAtSend)*quicBbr2DefaultLossThreshold) {
-			return true
-		}
-		return false
-	}
-	return false
 }
 
 func bdpFromRttAndBandwidth(rtt time.Duration, bandwidth Bandwidth) ByteCount {
