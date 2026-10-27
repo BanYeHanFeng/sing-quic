@@ -125,6 +125,11 @@ type Stream struct {
 	// after the ceiling it was given has usually been replaced already. What says the
 	// window is too small is the peer reaching the ceiling it knew, which is one
 	// announcement behind the one this end holds.
+	//
+	// recvMarked is where recvHighest stood when the window last moved and recvMarkedAt
+	// when it was, which is what the rate the peer delivered at is measured from;
+	// recvRate is that rate the last time the window grew or was passed over, and what
+	// it is compared against.
 	recvMu       sync.Mutex
 	segments     []recvSegment
 	readOffset   uint64
@@ -133,6 +138,9 @@ type Stream struct {
 	recvLimitWas uint64
 	recvWindow   uint64
 	windowSpent  bool
+	recvMarked   uint64
+	recvMarkedAt time.Time
+	recvRate     uint64
 	finOffset    uint64
 	finReceived  bool
 	readDeadline pipe.Deadline
@@ -226,6 +234,7 @@ func newStream(association *association, id uint32, sendLimit uint64) *Stream {
 		sendCredit:    credit{limit: sendLimit},
 		recvLimit:     initialStreamWindow,
 		recvWindow:    initialStreamWindow,
+		recvMarkedAt:  time.Now(),
 		writeDeadline: pipe.MakeDeadline(),
 		readDeadline:  pipe.MakeDeadline(),
 		done:          make(chan struct{}),
@@ -477,7 +486,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 				s.segments[0] = segment
 			}
 			s.readOffset += uint64(read)
-			limit, window, moved := s.windowMoved()
+			limit, window, moved := s.windowMoved(time.Now())
 			s.recvMu.Unlock()
 			// What was read is counted before the windows move, so that the
 			// association window a stream asks for is measured from where this
@@ -708,16 +717,22 @@ func (s *Stream) insertSegment(segment recvSegment) {
 // windowMoved reports whether the window this end granted has to be moved forward,
 // to where, and how large it is now. The caller holds recvMu.
 //
-// A window the peer spent is doubled as it moves: half of a window that is too small
-// for the path is still too small, and the window is the one thing a receiver can
-// move that the peer cannot move itself.
-func (s *Stream) windowMoved() (uint64, uint64, bool) {
+// A window the peer spent is doubled as it moves, unless it is already larger than the
+// path: half of a window that is too small for the path is still too small, and the
+// window is the one thing a receiver can move that the peer cannot move itself.
+func (s *Stream) windowMoved(now time.Time) (uint64, uint64, bool) {
 	if s.recvLimit-s.readOffset > s.recvWindow/2 {
 		return 0, s.recvWindow, false
 	}
+	rate := deliveryRate(s.recvHighest-s.recvMarked, now.Sub(s.recvMarkedAt))
+	s.recvMarked = s.recvHighest
+	s.recvMarkedAt = now
 	if s.windowSpent {
 		s.windowSpent = false
-		s.recvWindow = growWindow(s.recvWindow, maxStreamWindow)
+		if windowGrows(rate, s.recvRate) {
+			s.recvWindow *= 2
+		}
+		s.recvRate = rate
 	}
 	// The ceiling about to be replaced is the one the peer was last told about, so it
 	// is what the next arrival is compared against.
@@ -950,9 +965,16 @@ func (a *association) dataRead(n int) {
 		a.fcMu.Unlock()
 		return
 	}
+	now := time.Now()
+	rate := deliveryRate(a.recvReceived-a.recvMarked, now.Sub(a.recvMarkedAt))
+	a.recvMarked = a.recvReceived
+	a.recvMarkedAt = now
 	if a.windowSpent {
 		a.windowSpent = false
-		a.recvWindow = growWindow(a.recvWindow, maxConnectionWindow)
+		if windowGrows(rate, a.recvRate) {
+			a.recvWindow *= 2
+		}
+		a.recvRate = rate
 	}
 	a.recvLimitWas = a.recvLimit
 	a.recvLimit = a.recvRead + a.recvWindow
@@ -966,7 +988,6 @@ func (a *association) dataRead(n int) {
 // it, so a stream window left larger than a quarter of it would let one hole end the
 // association — what arrived is counted against what was read plus this window.
 func (a *association) raiseRecvWindow(want uint64) {
-	want = min(want, maxConnectionWindow)
 	a.fcMu.Lock()
 	if want <= a.recvWindow {
 		a.fcMu.Unlock()
