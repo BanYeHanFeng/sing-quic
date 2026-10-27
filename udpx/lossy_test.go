@@ -78,6 +78,8 @@ func newSimulatedLink(t *testing.T, server net.Addr, options linkOptions) *simul
 // forward copies datagrams from one socket to the other, handing each of them to
 // the path and remembering where the client is.
 func (l *simulatedLink) forward(from, to net.PacketConn, destination func() net.Addr) {
+	queue := make(chan simulatedPacket, 1<<14)
+	go l.deliver(queue)
 	buffer := make([]byte, maxPacketSize)
 	// The path is one queue in each direction: free is when the datagram that
 	// follows may leave.
@@ -85,6 +87,7 @@ func (l *simulatedLink) forward(from, to net.PacketConn, destination func() net.
 	for {
 		n, source, err := from.ReadFrom(buffer)
 		if err != nil {
+			close(queue)
 			return
 		}
 		if from == l.front {
@@ -95,9 +98,9 @@ func (l *simulatedLink) forward(from, to net.PacketConn, destination func() net.
 		// The buffer is reused for the next datagram, so what the path decided to
 		// keep has to be its own copy.
 		packet := append([]byte(nil), buffer[:n]...)
-		l.send(packet, to, destination, &free)
+		l.send(queue, packet, to, destination, &free)
 		if l.roll(l.options.duplicate) {
-			l.send(packet, to, destination, &free)
+			l.send(queue, packet, to, destination, &free)
 		}
 	}
 }
@@ -105,7 +108,7 @@ func (l *simulatedLink) forward(from, to net.PacketConn, destination func() net.
 // send puts one datagram on the path, which either drops it or arrives after the
 // delay the path picked for it. A path with a capacity takes its time carrying one
 // datagram, and the next one waits for it.
-func (l *simulatedLink) send(packet []byte, to net.PacketConn, destination func() net.Addr, free *time.Time) {
+func (l *simulatedLink) send(queue chan<- simulatedPacket, packet []byte, to net.PacketConn, destination func() net.Addr, free *time.Time) {
 	if l.roll(l.options.loss) {
 		return
 	}
@@ -127,13 +130,66 @@ func (l *simulatedLink) send(packet []byte, to net.PacketConn, destination func(
 		}
 	}
 	arrival = arrival.Add(delay)
-	if !arrival.After(time.Now()) {
-		l.write(packet, to, destination)
-		return
+	queue <- simulatedPacket{arrival: arrival, data: packet, to: to, destination: destination}
+}
+
+// simulatedPacket is one datagram on its way, with the moment it should arrive.
+type simulatedPacket struct {
+	arrival     time.Time
+	data        []byte
+	to          net.PacketConn
+	destination func() net.Addr
+}
+
+// deliver writes the datagrams of one direction in arrival order.
+//
+// It is one goroutine with the packets sorted, not a timer per packet. A timer per
+// packet runs every callback in a goroutine of its own, so two datagrams scheduled a
+// tenth of a millisecond apart leave in whatever order the scheduler picks: a path
+// that was asked for a fixed delay would reorder by dozens of packets, and the
+// transport answers that with a retransmission because three packets past a hole is
+// what it calls lost. What the path does has to be what the options say it does.
+func (l *simulatedLink) deliver(queue <-chan simulatedPacket) {
+	var pending []simulatedPacket
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+	for {
+		wait := time.Hour
+		if len(pending) > 0 {
+			wait = time.Until(pending[0].arrival)
+			if wait < 0 {
+				wait = 0
+			}
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(wait)
+		select {
+		case packet, ok := <-queue:
+			if !ok {
+				return
+			}
+			index := len(pending)
+			for index > 0 && pending[index-1].arrival.After(packet.arrival) {
+				index--
+			}
+			pending = append(pending, simulatedPacket{})
+			copy(pending[index+1:], pending[index:])
+			pending[index] = packet
+		case <-timer.C:
+			now := time.Now()
+			for len(pending) > 0 && !pending[0].arrival.After(now) {
+				l.write(pending[0].data, pending[0].to, pending[0].destination)
+				pending = pending[1:]
+			}
+		case <-l.closing:
+			return
+		}
 	}
-	time.AfterFunc(time.Until(arrival), func() {
-		l.write(packet, to, destination)
-	})
 }
 
 // write hands one datagram to the socket, unless the link was closed meanwhile.
