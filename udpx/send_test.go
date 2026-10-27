@@ -204,10 +204,12 @@ func TestStreamFrameSize(t *testing.T) {
 
 // TestStreamWriteAllocatesPerWrite requires writing to a stream to cost the write
 // and not the frames it becomes. A stream frame carries a piece of the write, so
-// encoding it when it is queued copies every byte of the transfer once more and
-// turns one allocation per write into one per 1.4 KB of it, which is what made the
-// send path allocate twice the payload. The peer reads none of this, so what is
-// counted here is the send path alone.
+// encoding it when it is queued copies every byte of the transfer once more, which
+// is what made the send path allocate twice the payload.
+//
+// What is counted is the bytes, not the allocations: a packet that leaves carries an
+// entry of its own, so the count is one per 1.4 KB whatever the frames do, and only
+// the bytes tell the bookkeeping of a packet apart from a copy of what it carries.
 func TestStreamWriteAllocatesPerWrite(t *testing.T) {
 	client, _, _ := testSetup(t, Options{}, Options{})
 	ctx := testContext(t, 30*time.Second)
@@ -233,12 +235,13 @@ func TestStreamWriteAllocatesPerWrite(t *testing.T) {
 	if written == 0 {
 		t.Fatal("a write of 1 MiB wrote nothing")
 	}
+	allocated := after.TotalAlloc - before.TotalAlloc
 	allocations := after.Mallocs - before.Mallocs
-	t.Logf("a write of %d bytes allocated %d bytes in %d allocations", written, after.TotalAlloc-before.TotalAlloc, allocations)
-	// One allocation per 64 KiB of payload is generous for the chunks a write
-	// becomes, and it is an order of magnitude below the one per frame this test
-	// exists to catch.
-	if allocations > 128+uint64(written)/(64<<10) {
-		t.Fatalf("a write of %d bytes took %d allocations", written, allocations)
+	t.Logf("a write of %d bytes allocated %d bytes in %d allocations", written, allocated, allocations)
+	// The payload, once, plus what the packets it becomes cost to describe: a frame
+	// that copied its bytes would add the payload a second time and land well above
+	// twice it.
+	if allocated > uint64(written)+uint64(written)*3/4 {
+		t.Fatalf("a write of %d bytes allocated %d bytes", written, allocated)
 	}
 }
