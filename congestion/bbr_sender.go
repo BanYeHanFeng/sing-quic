@@ -254,9 +254,6 @@ func (b *bbrSender) SetRTTStatsProvider(provider RTTStatsProvider) {
 
 // PacingWait is how long the send path has to wait before the next batch may leave.
 func (b *bbrSender) PacingWait(now time.Time) time.Duration {
-	if !b.isAtFullBandwidth {
-		return 0
-	}
 	return b.pacer.Wait(now)
 }
 
@@ -623,10 +620,12 @@ func (b *bbrSender) updateRecoveryState(lastAckedPacket PacketNumber, hasLosses,
 // Determines the appropriate pacing rate for the connection: the gain the mode
 // asks for times the bandwidth estimate.
 //
-// Startup is the exception, and not because the rate there is different: the pacer
-// is not asked at all until the path has been measured (see PacingWait), because
-// what probes in startup is the window, and a rate derived from an estimate a round
-// trip behind that window would make the pacer the thing the ramp follows.
+// Startup is paced like everything else. What the window does there is probe, and
+// the rate is what gives that probe its shape: a window's worth of data leaves over
+// the round trip instead of in one burst, and a burst is what a path with a buffer
+// answers with loss. A rate that followed an estimate a round trip behind the window
+// is the thing that made pacing look like a slower ramp; the estimate is the same one
+// the window is grown from, so the two climb together.
 func (b *bbrSender) calculatePacingRate() {
 	if b.bandwidthEstimate() == 0 {
 		return
