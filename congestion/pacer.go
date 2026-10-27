@@ -5,9 +5,24 @@ import (
 )
 
 const (
-	// burstWindow is how much time a bucket that owes nothing may hold: a sender
-	// that had nothing to say arrives as one batch, not as everything it did not
-	// send while it was quiet.
+	// burstWindow is how much time a bucket that owes nothing may hold, and it is
+	// what lets the send path reach the rate it was given at all: a wait is handed
+	// to a timer, and a timer on a Linux host rounds anything under a millisecond up
+	// to about 1.07 of them, so one batch per wait is 21 MiB/s whatever the rate
+	// says. What the bucket keeps is the part of the interval the timer swallowed,
+	// and that is also what a sender that had nothing to say arrives with: one
+	// burst, not everything it did not send while it was quiet.
+	//
+	// The two are the same knob, and it is a trade rather than a tuning: the burst
+	// the path sees is a rate times this window, so a path that carries 400 Mbit/s
+	// through a 25 KB buffer loses the tail of every burst of 24 packets or more
+	// (measured: 16 packets 2.3 percent, 24 15 percent, 32 34 percent). Taking the
+	// window down to a few packets does remove the loss — a 64 MiB transfer goes
+	// from 106 MB on the wire and 35 percent of it declared lost to 70 MB and 1.5
+	// percent — and it also removes the throughput, because the rate the pacer asks
+	// for is then never reached and the bandwidth estimate follows it down: the same
+	// change takes a 256 MiB transfer from 27 MiB/s to 7.3. What has to change to
+	// have both is the clock the wait is handed to, not this window.
 	burstWindow = 2 * time.Millisecond
 
 	// burstPackets is the floor of that, because a path that says it is slow still
