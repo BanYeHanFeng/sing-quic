@@ -1,68 +1,93 @@
 package congestion
 
 import (
-	"math"
 	"time"
 )
 
 const (
-	maxBurstPackets = 10
+	// burstWindow is how much time a bucket that owes nothing may hold: a sender
+	// that had nothing to say arrives as one batch, not as everything it did not
+	// send while it was quiet.
+	burstWindow = 2 * time.Millisecond
+
+	// burstPackets is the floor of that, because a path that says it is slow still
+	// has to be able to send a run of packets in one write.
+	burstPackets = 10
 )
 
-// Pacer implements a token bucket pacing algorithm.
+// Pacer is the token bucket that turns a pacing rate into a time to wait.
+//
+// Bytes accrue at the rate the controller asked for, and every packet that leaves
+// takes its bytes out. The bucket may go into debt: the transport hands a batch of
+// packets to the socket in one write, so a batch is spent before the tokens for it
+// have accrued, and the next batch waits until the debt is paid. That is what makes
+// the rate on the wire the rate the controller asked for at the granularity the
+// socket works in, instead of one packet's worth of tokens buying a whole batch.
 type Pacer struct {
-	budgetAtLastSent ByteCount
-	maxDatagramSize  ByteCount
-	lastSentTime     time.Time
-	getBandwidth     func() ByteCount // in bytes/s
+	// budgetAtLastSent is what the bucket held when the last packet left. A
+	// negative number is the debt of a batch that spent more than it had.
+	budgetAtLastSent int64
+
+	maxDatagramSize ByteCount
+	lastSentTime    time.Time
+
+	// getBandwidth is the rate the bucket fills at, in bytes per second. It is
+	// never zero: a rate of zero would be a bucket that never fills.
+	getBandwidth func() ByteCount
 }
 
 func NewPacer(initialMaxDatagramSize ByteCount, getBandwidth func() ByteCount) *Pacer {
-	p := &Pacer{
-		budgetAtLastSent: maxBurstPackets * initialMaxDatagramSize,
-		maxDatagramSize:  initialMaxDatagramSize,
-		getBandwidth:     getBandwidth,
+	return &Pacer{
+		maxDatagramSize: initialMaxDatagramSize,
+		getBandwidth:    getBandwidth,
 	}
-	return p
 }
 
+// SentPacket records a packet that left at sendTime, taking its bytes out of the
+// bucket.
 func (p *Pacer) SentPacket(sendTime time.Time, size ByteCount) {
-	budget := p.Budget(sendTime)
-	if size > budget {
-		p.budgetAtLastSent = 0
-	} else {
-		p.budgetAtLastSent = budget - size
-	}
+	p.budgetAtLastSent = p.Budget(sendTime) - int64(size)
 	p.lastSentTime = sendTime
 }
 
-func (p *Pacer) Budget(now time.Time) ByteCount {
+// Budget is what the bucket holds at now: what accrued since the last packet left,
+// on top of what was left over, and no more than a sender that was quiet may arrive
+// with. It is negative when the batch that went out last is still owed for.
+func (p *Pacer) Budget(now time.Time) int64 {
 	if p.lastSentTime.IsZero() {
 		return p.maxBurstSize()
 	}
-	budget := p.budgetAtLastSent + (p.getBandwidth()*ByteCount(now.Sub(p.lastSentTime).Nanoseconds()))/1e9
-	if budget < 0 { // protect against overflows
-		budget = ByteCount(1<<62 - 1)
+	// A batch spends more than the bucket holds, so the debt is repaid by accrual
+	// alone and the arithmetic has to stay exact for as long as that takes. What
+	// keeps it inside an int64 is the float: a product of a rate and a duration
+	// overflows one long before the cap it is on its way to.
+	budget := float64(p.budgetAtLastSent) + float64(p.getBandwidth())*now.Sub(p.lastSentTime).Seconds()
+	if budget > float64(p.maxBurstSize()) {
+		return p.maxBurstSize()
 	}
-	return Min(p.maxBurstSize(), budget)
+	return int64(budget)
 }
 
-func (p *Pacer) maxBurstSize() ByteCount {
+// Wait is how long the next batch has to wait for the bucket to be out of debt, or
+// zero when it may leave now.
+func (p *Pacer) Wait(now time.Time) time.Duration {
+	debt := -p.Budget(now)
+	if debt <= 0 {
+		return 0
+	}
+	return p.timeFor(debt)
+}
+
+// maxBurstSize is the most the bucket may hold: what accrues in a burst window, and
+// at least a run of packets for a path whose rate is below that.
+func (p *Pacer) maxBurstSize() int64 {
 	return Max(
-		ByteCount((MinPacingDelay+time.Millisecond).Nanoseconds())*p.getBandwidth()/1e9,
-		maxBurstPackets*p.maxDatagramSize,
+		int64(p.getBandwidth())*burstWindow.Nanoseconds()/1e9,
+		burstPackets*int64(p.maxDatagramSize),
 	)
 }
 
-// TimeUntilSend returns when the next packet should be sent.
-// It returns the zero value of time.Time if a packet can be sent immediately.
-func (p *Pacer) TimeUntilSend() time.Time {
-	if p.budgetAtLastSent >= p.maxDatagramSize {
-		return time.Time{}
-	}
-	return p.lastSentTime.Add(Max(
-		MinPacingDelay,
-		time.Duration(math.Ceil(float64(p.maxDatagramSize-p.budgetAtLastSent)*1e9/
-			float64(p.getBandwidth())))*time.Nanosecond,
-	))
+// timeFor is how long it takes to accrue bytes at the current rate.
+func (p *Pacer) timeFor(bytes int64) time.Duration {
+	return time.Duration(float64(bytes) * 1e9 / float64(p.getBandwidth()))
 }

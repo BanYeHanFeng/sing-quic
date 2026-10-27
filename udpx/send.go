@@ -502,10 +502,10 @@ func (a *association) flush() error {
 			// The pacing rate is what spreads the batches over time, so it is
 			// asked once per batch: a batch that waited for its own last packet
 			// would hold one packet, and one packet per call is the thing the
-			// socket was asked to avoid.
-			waitUntil := a.pacingWait()
-			if !waitUntil.IsZero() {
-				a.timers.Load().pace.Reset(time.Until(waitUntil))
+			// socket was asked to avoid. What a batch spends beyond the tokens it
+			// found is what the next one waits for.
+			if wait := a.pacingWait(); wait > 0 {
+				a.timers.Load().pace.Reset(wait)
 				return nil
 			}
 		}

@@ -17,10 +17,6 @@ type ByteCount uint64
 type PacketNumber int64
 
 const (
-	// MinPacingDelay is the shortest wait the pacer hands out. A pacing delay below
-	// the resolution of a timer would turn the send loop into a busy loop.
-	MinPacingDelay = time.Millisecond
-
 	// PacketsPerConnectionID is only used to size a window; the transport here has
 	// one packet number space per association.
 	PacketsPerConnectionID = 100
@@ -63,8 +59,11 @@ type Controller interface {
 	// what was in flight before either of them left the flight table.
 	OnCongestionEvent(priorInFlight ByteCount, eventTime time.Time, ackedPackets []AckedPacketInfo, lostPackets []LostPacketInfo)
 	CanSend(bytesInFlight ByteCount) bool
-	TimeUntilSend(bytesInFlight ByteCount) time.Time
-	HasPacingBudget(now time.Time) bool
+	// PacingWait is how long the send path has to wait before the next batch may
+	// leave, or zero when it may leave now. It is asked once per batch, because a
+	// batch is one write to the socket: the rate is enforced on batches, and the
+	// bucket is allowed to go into debt for one.
+	PacingWait(now time.Time) time.Duration
 	GetCongestionWindow() ByteCount
 	SetRTTStatsProvider(provider RTTStatsProvider)
 }

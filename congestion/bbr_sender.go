@@ -300,14 +300,14 @@ func (b *bbrSender) SetRTTStatsProvider(provider RTTStatsProvider) {
 	b.rttStats = provider
 }
 
-// TimeUntilSend reports when the pacer would let the next packet leave.
-func (b *bbrSender) TimeUntilSend(bytesInFlight ByteCount) time.Time {
-	return b.pacer.TimeUntilSend()
-}
-
-// HasPacingBudget reports whether the pacer has budget for one more packet.
-func (b *bbrSender) HasPacingBudget(now time.Time) bool {
-	return b.pacer.Budget(now) >= b.maxDatagramSize
+// PacingWait is how long the send path has to wait before the next batch may leave.
+func (b *bbrSender) PacingWait(now time.Time) time.Duration {
+	if !b.isAtFullBandwidth {
+		// Startup is where the window probes the path, and what the pacer would
+		// follow there is an estimate a round trip behind that window.
+		return 0
+	}
+	return b.pacer.Wait(now)
 }
 
 // OnPacketSent records a packet that left and what was in flight before it.
