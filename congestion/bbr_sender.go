@@ -171,9 +171,6 @@ type bbrSender struct {
 	// Indicates whether the most recent bandwidth sample was marked as
 	// app-limited.
 	lastSampleIsAppLimited bool
-	// Indicates whether any non app-limited samples have been recorded.
-	hasNoAppLimitedSample bool
-
 	// Current state of recovery.
 	recoveryState bbrRecoveryState
 	// Receiving acknowledgement of a packet after |end_recovery_at_| will cause
@@ -182,38 +179,6 @@ type bbrSender struct {
 	endRecoveryAt PacketNumber
 	// A window used to limit the number of bytes in flight during loss recovery.
 	recoveryWindow ByteCount
-	// If true, consider all samples in recovery app-limited.
-	isAppLimitedRecovery bool // not used
-
-	// When true, pace at 1.5x and disable packet conservation in STARTUP.
-	slowerStartup bool // not used
-	// When true, disables packet conservation in STARTUP.
-	rateBasedStartup bool // not used
-
-	// When true, add the most recent ack aggregation measurement during STARTUP.
-	enableAckAggregationDuringStartup bool
-	// When true, expire the windowed ack aggregation values in STARTUP when
-	// bandwidth increases more than 25%.
-	expireAckAggregationInStartup bool
-
-	// If true, will not exit low gain mode until bytes_in_flight drops below BDP
-	// or it's time for high gain mode.
-	drainToTarget bool
-
-	// If true, slow down pacing rate in STARTUP when overshooting is detected.
-	detectOvershooting bool
-	// Bytes lost while detect_overshooting_ is true.
-	bytesLostWhileDetectingOvershooting ByteCount
-	// Slow down pacing rate if
-	// bytes_lost_while_detecting_overshooting_ *
-	// bytes_lost_multiplier_while_detecting_overshooting_ > IW.
-	bytesLostMultiplierWhileDetectingOvershooting uint8
-	// When overshooting is detected, do not drop pacing_rate_ below this value /
-	// min_rtt.
-	cwndToCalculateMinPacingRate ByteCount
-
-	// Max congestion window when adjusting network parameters.
-	maxCongestionWindowWithNetworkParametersAdjusted ByteCount // not used
 
 	// Params.
 	maxDatagramSize ByteCount
@@ -270,10 +235,7 @@ func newBbrSender(
 		recoveryState:                bbrRecoveryStateNotInRecovery,
 		endRecoveryAt:                invalidPacketNumber,
 		recoveryWindow:               initialMaxCongestionWindow,
-		bytesLostMultiplierWhileDetectingOvershooting:    2,
-		cwndToCalculateMinPacingRate:                     initialCongestionWindow,
-		maxCongestionWindowWithNetworkParametersAdjusted: initialMaxCongestionWindow,
-		maxDatagramSize: initialMaxDatagramSize,
+		maxDatagramSize:              initialMaxDatagramSize,
 	}
 	b.pacer = NewPacer(initialMaxDatagramSize, b.bandwidthForPacer)
 
@@ -293,8 +255,6 @@ func (b *bbrSender) SetRTTStatsProvider(provider RTTStatsProvider) {
 // PacingWait is how long the send path has to wait before the next batch may leave.
 func (b *bbrSender) PacingWait(now time.Time) time.Duration {
 	if !b.isAtFullBandwidth {
-		// Startup is where the window probes the path, and what the pacer would
-		// follow there is an estimate a round trip behind that window.
 		return 0
 	}
 	return b.pacer.Wait(now)
@@ -357,7 +317,7 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 	totalBytesLostBefore := b.sampler.TotalBytesLost()
 
 	var isRoundStart, minRttExpired bool
-	var excessAcked, bytesLost ByteCount
+	var bytesLost ByteCount
 
 	// Update bytesInFlight
 	b.bytesInFlight = priorInFlight
@@ -378,7 +338,6 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 		ackedPackets, lostPackets, b.maxBandwidth.GetBest(), infBandwidth, b.roundTripCount)
 	if sample.lastPacketSendState.isValid {
 		b.lastSampleIsAppLimited = sample.lastPacketSendState.isAppLimited
-		b.hasNoAppLimitedSample = b.hasNoAppLimitedSample || !b.lastSampleIsAppLimited
 	}
 	// Avoid updating |max_bandwidth_| if a) this is a loss-only event, or b) all
 	// packets in |acked_packets| did not generate valid samples. (e.g. ack of
@@ -394,8 +353,6 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 		minRttExpired = b.maybeUpdateMinRtt(eventTime, sample.sampleRtt)
 	}
 	bytesLost = b.sampler.TotalBytesLost() - totalBytesLostBefore
-
-	excessAcked = sample.extraAcked
 
 	// Handle logic specific to PROBE_BW mode.
 	if b.mode == bbrModeProbeBw {
@@ -417,8 +374,8 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 
 	// After the model is updated, recalculate the pacing rate and congestion
 	// window.
-	b.calculatePacingRate(bytesLost)
-	b.calculateCongestionWindow(bytesAcked, excessAcked)
+	b.calculatePacingRate()
+	b.calculateCongestionWindow(bytesAcked)
 	b.calculateRecoveryWindow(bytesAcked, bytesLost)
 }
 
@@ -431,14 +388,6 @@ func (b *bbrSender) PacingRate() Bandwidth {
 	return b.pacingRate
 }
 
-// Sets the CWND gain used in STARTUP.  Must be greater than 1.
-func (b *bbrSender) setHighCwndGain(highCwndGain float64) {
-	b.highCwndGain = highCwndGain
-	if b.mode == bbrModeStartup {
-		b.congestionWindowGain = highCwndGain
-	}
-}
-
 // What's the current estimated bandwidth in bytes per second.
 func (b *bbrSender) bandwidthEstimate() Bandwidth {
 	return b.maxBandwidth.GetBest()
@@ -447,9 +396,7 @@ func (b *bbrSender) bandwidthEstimate() Bandwidth {
 func (b *bbrSender) bandwidthForPacer() ByteCount {
 	bps := ByteCount(float64(b.PacingRate()) / float64(BytesPerSecond))
 	if bps < minBps {
-		// We need to make sure that the bandwidth value for pacer is never zero,
-		// otherwise it will go into an edge case where HasPacingBudget = false
-		// but TimeUntilSend is before, causing the quic-go send loop to go crazy and get stuck.
+		// The pacer divides by this rate, so it is never zero.
 		return minBps
 	}
 	return bps
@@ -560,22 +507,13 @@ func (b *bbrSender) updateGainCyclePhase(now time.Time, priorInFlight ByteCount,
 	if shouldAdvanceGainCycling {
 		b.cycleCurrentOffset = (b.cycleCurrentOffset + 1) % gainCycleLength
 		b.lastCycleStart = now
-		// Stay in low gain mode until the target BDP is hit.
-		// Low gain mode will be exited immediately when the target BDP is achieved.
-		if b.drainToTarget && b.pacingGain < 1 &&
-			pacingGain[b.cycleCurrentOffset] == 1 &&
-			b.bytesInFlight > b.getTargetCongestionWindow(1) {
-			return
-		}
 		b.pacingGain = pacingGain[b.cycleCurrentOffset]
 	}
 }
 
 // Tracks for how many round-trips the bandwidth has not increased
 // significantly, which is the one signal startup ends on: the path has stopped
-// saying that it carries more. Losing packets is not one of them, because a path
-// that drops some of what it carries still carries the rest, and an estimate that
-// stops where the first loss arrived is one the sender never gets back.
+// saying that it carries more.
 func (b *bbrSender) checkIfFullBandwidthReached() {
 	if b.lastSampleIsAppLimited {
 		return
@@ -585,10 +523,6 @@ func (b *bbrSender) checkIfFullBandwidthReached() {
 	if b.bandwidthEstimate() >= target {
 		b.bandwidthAtLastRound = b.bandwidthEstimate()
 		b.roundsWithoutBandwidthGain = 0
-		if b.expireAckAggregationInStartup {
-			// Expire old excess delivery measurements now that bandwidth increased.
-			b.sampler.ResetMaxAckHeightTracker(0, b.roundTripCount)
-		}
 		return
 	}
 
@@ -693,48 +627,22 @@ func (b *bbrSender) updateRecoveryState(lastAckedPacket PacketNumber, hasLosses,
 	}
 }
 
-// Determines the appropriate pacing rate for the connection.
-func (b *bbrSender) calculatePacingRate(bytesLost ByteCount) {
+// Determines the appropriate pacing rate for the connection: the gain the mode
+// asks for times the bandwidth estimate.
+//
+// Startup is the exception, and not because the rate there is different: the pacer
+// is not asked at all until the path has been measured (see PacingWait), because
+// what probes in startup is the window, and a rate derived from an estimate a round
+// trip behind that window would make the pacer the thing the ramp follows.
+func (b *bbrSender) calculatePacingRate() {
 	if b.bandwidthEstimate() == 0 {
 		return
 	}
-
-	targetRate := Bandwidth(b.pacingGain * float64(b.bandwidthEstimate()))
-	if b.isAtFullBandwidth {
-		b.pacingRate = targetRate
-		return
-	}
-
-	// Pace at the rate of initial_window / RTT as soon as RTT measurements are
-	// available.
-	if b.pacingRate == 0 && b.rttStats.MinRTT() != 0 {
-		b.pacingRate = BandwidthFromDelta(b.initialCongestionWindow, b.rttStats.MinRTT())
-		return
-	}
-
-	if b.detectOvershooting {
-		b.bytesLostWhileDetectingOvershooting += bytesLost
-		// Check for overshooting with network parameters adjusted when pacing rate
-		// > target_rate and loss has been detected.
-		if b.pacingRate > targetRate && b.bytesLostWhileDetectingOvershooting > 0 {
-			if b.hasNoAppLimitedSample ||
-				b.bytesLostWhileDetectingOvershooting*ByteCount(b.bytesLostMultiplierWhileDetectingOvershooting) > b.initialCongestionWindow {
-				// We are fairly sure overshoot happens if 1) there is at least one
-				// non app-limited bw sample or 2) half of IW gets lost. Slow pacing
-				// rate.
-				b.pacingRate = Max(targetRate, BandwidthFromDelta(b.cwndToCalculateMinPacingRate, b.getMinRtt()))
-				b.bytesLostWhileDetectingOvershooting = 0
-				b.detectOvershooting = false
-			}
-		}
-	}
-
-	// Do not decrease the pacing rate during startup.
-	b.pacingRate = Max(b.pacingRate, targetRate)
+	b.pacingRate = Bandwidth(b.pacingGain * float64(b.bandwidthEstimate()))
 }
 
 // Determines the appropriate congestion window for the connection.
-func (b *bbrSender) calculateCongestionWindow(bytesAcked, excessAcked ByteCount) {
+func (b *bbrSender) calculateCongestionWindow(bytesAcked ByteCount) {
 	if b.mode == bbrModeProbeRtt {
 		return
 	}
@@ -743,10 +651,6 @@ func (b *bbrSender) calculateCongestionWindow(bytesAcked, excessAcked ByteCount)
 	if b.isAtFullBandwidth {
 		// Add the max recently measured ack aggregation to CWND.
 		targetWindow += b.sampler.MaxAckHeight()
-	} else if b.enableAckAggregationDuringStartup {
-		// Add the most recent excess acked.  Because CWND never decreases in
-		// STARTUP, this will automatically create a very localized max filter.
-		targetWindow += excessAcked
 	}
 
 	// Instead of immediately setting the target CWND as the new one, BBR grows

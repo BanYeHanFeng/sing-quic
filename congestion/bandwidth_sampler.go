@@ -189,18 +189,6 @@ func (m *maxAckHeightTracker) Update(
 	return extraBytesAcked
 }
 
-func (m *maxAckHeightTracker) SetFilterWindowLength(length roundTripCount) {
-	m.maxAckHeightFilter.SetWindowLength(length)
-}
-
-func (m *maxAckHeightTracker) Reset(newHeight ByteCount, newTime roundTripCount) {
-	newEvent := extraAckedEvent{
-		extraAcked: newHeight,
-		round:      newTime,
-	}
-	m.maxAckHeightFilter.Reset(newEvent, newTime)
-}
-
 // ConnectionStateOnSentPacket represents the information about a sent packet
 // and the state of the connection at the moment the packet was sent,
 // specifically the information about the most recently acknowledged packet at
@@ -348,10 +336,6 @@ type congestionEventSample struct {
 	// empty. If acked_packets is empty, it's the send state of the largest
 	// packet in lost_packets.
 	lastPacketSendState sendTimeState
-	// The number of extra bytes acked from this ack event, compared to what is
-	// expected from the flow's bandwidth. Larger value means more ack
-	// aggregation.
-	extraAcked ByteCount
 }
 
 func newCongestionEventSample() *congestionEventSample {
@@ -420,10 +404,6 @@ func newBandwidthSampler(maxAckHeightTrackerWindowLength roundTripCount) *bandwi
 
 func (b *bandwidthSampler) MaxAckHeight() ByteCount {
 	return b.maxAckHeightTracker.Get()
-}
-
-func (b *bandwidthSampler) ResetMaxAckHeightTracker(newHeight ByteCount, newTime roundTripCount) {
-	b.maxAckHeightTracker.Reset(newHeight, newTime)
 }
 
 func (b *bandwidthSampler) OnPacketSent(
@@ -531,7 +511,7 @@ func (b *bandwidthSampler) OnCongestionEvent(
 	isNewMaxBandwidth := eventSample.sampleMaxBandwidth > maxBandwidth
 	maxBandwidth = Max(maxBandwidth, eventSample.sampleMaxBandwidth)
 
-	eventSample.extraAcked = b.onAckEventEnd(Min(estBandwidthUpperBound, maxBandwidth), isNewMaxBandwidth, roundTripCount)
+	b.onAckEventEnd(Min(estBandwidthUpperBound, maxBandwidth), isNewMaxBandwidth, roundTripCount)
 
 	return *eventSample
 }
@@ -643,13 +623,13 @@ func (b *bandwidthSampler) onAckEventEnd(
 	bandwidthEstimate Bandwidth,
 	isNewMaxBandwidth bool,
 	roundTripCount roundTripCount,
-) ByteCount {
+) {
 	newlyAckedBytes := b.totalBytesAcked - b.totalBytesAckedAfterLastAckEvent
 	if newlyAckedBytes == 0 {
-		return 0
+		return
 	}
 	b.totalBytesAckedAfterLastAckEvent = b.totalBytesAcked
-	extraAcked := b.maxAckHeightTracker.Update(
+	b.maxAckHeightTracker.Update(
 		bandwidthEstimate,
 		isNewMaxBandwidth,
 		roundTripCount,
@@ -657,7 +637,6 @@ func (b *bandwidthSampler) onAckEventEnd(
 		b.lastAckedPacket,
 		b.lastAckedPacketAckTime,
 		newlyAckedBytes)
-	return extraAcked
 }
 
 func sentPacketToSendTimeState(sentPacket *connectionStateOnSentPacket, sendTimeState *sendTimeState) {

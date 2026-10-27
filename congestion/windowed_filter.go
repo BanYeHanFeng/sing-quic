@@ -70,11 +70,6 @@ func NewWindowedFilter[V any](windowLength roundTripCount, comparator func(V, V)
 	}
 }
 
-// Changes the window length.  Does not update any current samples.
-func (f *WindowedFilter[V]) SetWindowLength(windowLength roundTripCount) {
-	f.windowLength = windowLength
-}
-
 func (f *WindowedFilter[V]) GetBest() V {
 	return f.estimates[0].sample
 }
