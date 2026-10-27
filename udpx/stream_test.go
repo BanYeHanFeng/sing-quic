@@ -161,8 +161,9 @@ func TestStreamStarvation(t *testing.T) {
 	}
 	blockedWrite := make(chan error, 1)
 	go func() {
-		// Twice the stream window, which the peer never reads.
-		_, writeErr := stalled.Write(testPayload(2 * initialStreamWindow))
+		// More than the peer may hold: two windows of arrival is the ceiling
+		// this end grants before the application reads anything.
+		_, writeErr := stalled.Write(testPayload(3 * initialStreamWindow))
 		blockedWrite <- writeErr
 	}()
 	if _, err = server.AcceptStream(ctx); err != nil {
@@ -466,10 +467,10 @@ func TestStreamResetEndsWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Twice the stream window, so the write has to wait for the peer to read.
+	// More than the peer may hold, so the write has to wait for the peer to read.
 	blocked := make(chan error, 1)
 	go func() {
-		_, writeErr := stream.Write(testPayload(2 * initialStreamWindow))
+		_, writeErr := stream.Write(testPayload(3 * initialStreamWindow))
 		blocked <- writeErr
 	}()
 	accepted, err := server.AcceptStream(ctx)

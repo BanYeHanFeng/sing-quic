@@ -13,35 +13,39 @@ import "time"
 //   - per association, so that a hundred streams that are each inside their own
 //     window cannot add up to more memory than the association may use.
 //
-// The windows are moved forward as the application reads, which is what keeps the
-// memory a receiver holds bounded by the windows rather than by how fast the peer
-// sends. A window is only moved when half of it has been read, so the two ends
-// exchange one update per half window instead of one per read.
+// The windows are moved forward as data arrives, which is what keeps the peer sending
+// on a path that loses packets: what the application can read is what arrived in
+// order, and one hole stops the read while everything behind the hole is already
+// here. A window that followed the read would wait for the retransmission that fills
+// the hole before moving at all, so the peer would spend every round trip waiting for
+// a window the receiver is holding for a hole. What bounds the memory instead is the
+// read: a window never goes further than two windows past it, one for what the peer
+// may have in flight and one for what arrived behind a hole and is waiting.
 //
 // A window also grows, because half of a window that is too small for the path is
 // still too small. The evidence a receiver has is the peer spending the whole window
 // and nothing coming after it: what stopped the peer was this window and not the
 // path, which stops a peer wherever it happens to be. The window is then doubled
 // unless it is already larger than the path, and a stream window that grew takes the
-// association window with it — a receiver that moved its window forward by reading is
-// the only one that can tell, since moving it forward on arrival instead would let the
-// memory grow with the peer's speed rather than with the application's.
+// association window with it.
 //
-// Whether the window is larger than the path is answered by the rate the peer
-// delivered at: a window that is what limits the peer doubles the rate when it
-// doubles, because the peer sends one window per round trip; a window larger than the
-// path leaves the rate where the path put it, and what the doubling adds is memory the
-// peer may fill before the application reads. The window is therefore doubled only
-// when the rate grew with it, and the test is asked again at every move, so a path
-// that gets faster later takes a larger window with it and nothing here is remembered
-// as a ceiling.
+// Whether the window is larger than the path is answered by the rate the application
+// read at: a window that is what limits the peer doubles that rate when it doubles,
+// because the peer sends one window per round trip; a window larger than the path
+// leaves the rate where the path put it, and what the doubling adds is memory the peer
+// may fill before the application reads. The rate the peer sent at would answer the
+// wrong question — it follows the window by itself, so it says a window twice as large
+// is twice as good on every path. The window is therefore doubled only when the read
+// rate grew with it, and the test is asked again at every move, so a path that gets
+// faster later takes a larger window with it and nothing here is remembered as a
+// ceiling.
 //
 // What is compared is the ceiling the peer was told about, not the one this end holds:
-// a window moves forward on the read, so by the time the packet that reached a ceiling
+// the window moves as data arrives, so by the time the packet that reached a ceiling
 // arrives, that ceiling has usually been replaced by a larger one, and a peer whose
-// data always arrives one round trip behind the read would then never be seen to reach
-// any ceiling at all. A peer that fills the window it was given is the same evidence
-// whether or not the read has moved the limit since.
+// data always arrives one round trip behind would then never be seen to reach any
+// ceiling at all. A peer that fills the window it was given is the same evidence
+// whether or not the limit has moved since.
 const (
 	// initialStreamWindow is where the window of one stream starts: how much data
 	// it may have in flight before the receiver has to raise the window.
@@ -82,6 +86,11 @@ const (
 // doubles the rate, and one that is twice the size of the path leaves it alone, so
 // what the test has to tell apart is a rate that moved from one that did not.
 func windowGrows(rate, previous uint64) bool {
+	if rate == 0 {
+		// An application that reads nothing is not evidence of anything, and a
+		// window that grew on that answer would keep growing.
+		return false
+	}
 	return previous == 0 || 2*rate >= 3*previous
 }
 
