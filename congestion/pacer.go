@@ -4,31 +4,27 @@ import (
 	"time"
 )
 
-const (
-	// burstWindow is how much time a bucket that owes nothing may hold, and it is
-	// what lets the send path reach the rate it was given at all: a wait is handed
-	// to a timer, and a timer on a Linux host rounds anything under a millisecond up
-	// to about 1.07 of them, so one batch per wait is 21 MiB/s whatever the rate
-	// says. What the bucket keeps is the part of the interval the timer swallowed,
-	// and that is also what a sender that had nothing to say arrives with: one
-	// burst, not everything it did not send while it was quiet.
-	//
-	// The two are the same knob, and it is a trade rather than a tuning: the burst
-	// the path sees is a rate times this window, so a path that carries 400 Mbit/s
-	// through a 25 KB buffer loses the tail of every burst of 24 packets or more
-	// (measured: 16 packets 2.3 percent, 24 15 percent, 32 34 percent). Taking the
-	// window down to a few packets does remove the loss — a 64 MiB transfer goes
-	// from 106 MB on the wire and 35 percent of it declared lost to 70 MB and 1.5
-	// percent — and it also removes the throughput, because the rate the pacer asks
-	// for is then never reached and the bandwidth estimate follows it down: the same
-	// change takes a 256 MiB transfer from 27 MiB/s to 7.3. What has to change to
-	// have both is the clock the wait is handed to, not this window.
-	burstWindow = 2 * time.Millisecond
+// burstWindow is how far behind the clock the bucket may be: it holds the bytes that
+// accrue while a wait is being served late, and nothing else.
+//
+// It used to be two milliseconds, because the send path handed its waits to a timer
+// and a timer on Linux serves anything under a millisecond as 1.07 of them. The
+// bucket was then the only way to reach the rate the controller asked for — a batch
+// of sixteen packets per wait is 21 MiB/s whatever the rate says — and what it held
+// was also the burst the path saw, which on a path whose queue is 25 KB is the loss:
+// 35 percent of a 64 MiB transfer went out and never arrived.
+//
+// The send path now sleeps with a clock that is late by about sixty microseconds, so
+// the window is that: enough to keep the rate exact at any rate the path can carry,
+// small enough that the burst is the batch and not a multiple of it.
+const burstWindow = 200 * time.Microsecond
 
-	// burstPackets is the floor of that, because a path that says it is slow still
-	// has to be able to send a run of packets in one write.
-	burstPackets = 10
-)
+// burstPackets is the floor of that, and it is one write: the transport hands the
+// socket a run of packets at a time, and the bucket has to be able to hold the first
+// of those without the wait being a lie. It is what lets an association send before
+// it has measured anything — the rate it starts at is a guess, and a guess is not a
+// reason to make the first batch wait for it.
+const burstPackets = 16
 
 // Pacer is the token bucket that turns a pacing rate into a time to wait.
 //
@@ -93,8 +89,8 @@ func (p *Pacer) Wait(now time.Time) time.Duration {
 	return p.timeFor(debt)
 }
 
-// maxBurstSize is the most the bucket may hold: what accrues in a burst window, and
-// at least a run of packets for a path whose rate is below that.
+// maxBurstSize is the most the bucket may hold: what accrues while the clock is
+// being late, and at least one write.
 func (p *Pacer) maxBurstSize() int64 {
 	return Max(
 		int64(p.getBandwidth())*burstWindow.Nanoseconds()/1e9,
