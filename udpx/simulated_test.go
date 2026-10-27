@@ -391,9 +391,9 @@ func TestStreamBothDirectionsBlocked(t *testing.T) {
 		if read, readErr := readExactly(accepted, 1); readErr != nil || read[0] != 0 {
 			t.Fatalf("round %d: the first byte is %v, %v", round, read, readErr)
 		}
-		// The writer fills the whole window and has a few bytes left over, so it
+		// The writer fills the whole budget and has a few bytes left over, so it
 		// is waiting for credit when the peer reads.
-		payload := testPayload(initialStreamWindow + 4096)
+		payload := testPayload(2*streamWindow + 4096)
 		written := make(chan error, 1)
 		go func() {
 			_, writeErr := stream.Write(payload)
@@ -452,9 +452,9 @@ func TestAssociationEndsUnderLoad(t *testing.T) {
 	}
 	writeDone := make(chan error, 1)
 	go func() {
-		// More than the windows allow, so the write is waiting for credit when
-		// the association goes away.
-		_, writeErr := stream.Write(testPayload(2 * initialConnectionWindow))
+		// More than the budget allows, so the write is waiting for credit when the
+		// association goes away.
+		_, writeErr := stream.Write(testPayload(2*streamWindow + 4096))
 		writeDone <- writeErr
 	}()
 	accepted, err := server.AcceptStream(ctx)

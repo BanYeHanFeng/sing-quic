@@ -299,20 +299,14 @@ func TestTransferUnderLoss(t *testing.T) {
 	}
 }
 
-// TestWindowGrowsOverALossyCapacityPath requires the window to grow over a path that
-// has a capacity and loses packets, which is the case the growth exists for: a lost
-// packet leaves a hole, the application cannot read past it, and the credit update
-// that the hole delayed is a round trip the peer spends waiting. Growing the window
-// is what puts that round trip back to work (on a 50 Mbit/s path of the same shape,
-// 16 MiB went from 2.1 to 2.9 MiB/s; here 8 MiB went from 2.1 to 2.3–2.5 and 16 MiB
-// to 3.3–3.5).
+// TestStreamOverALossyCapacityPath requires a transfer to keep moving over a path that
+// has a capacity and loses packets: a lost packet leaves a hole, the application cannot
+// read past it, and the credit the peer is given has to be enough that the path does
+// not go idle for the round trip the hole costs.
 //
-// Two things are pinned and only one of them is a rate. A window that never grew
-// would leave the path idle after every hole, which is what the first check is for
-// and what fails without the growth; the rate is a floor against a collapse and not a
-// measurement, because most of the distance to the capacity is the congestion
-// controller's startup and not the window.
-func TestWindowGrowsOverALossyCapacityPath(t *testing.T) {
+// The rate is a floor against a collapse and not a measurement: most of the distance to
+// the capacity is the congestion controller's ramp and not the window.
+func TestStreamOverALossyCapacityPath(t *testing.T) {
 	if testing.Short() {
 		t.Skip("a path with a capacity takes its time")
 	}
@@ -342,9 +336,9 @@ func TestWindowGrowsOverALossyCapacityPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Several times the window the peer starts with, so the one it has is filled and
-	// the reads after that double it, without spending seconds on a path this slow.
-	payload := testPayload(4 * initialStreamWindow)
+	// More than the credit a stream is granted, so the transfer runs on the window
+	// moving forward rather than on what one announcement gave it.
+	payload := testPayload(2*streamWindow + 4096)
 	start := time.Now()
 	go func() {
 		if _, writeErr := stream.Write(payload); writeErr != nil {
@@ -365,12 +359,6 @@ func TestWindowGrowsOverALossyCapacityPath(t *testing.T) {
 		read = append(read, buffer[:n]...)
 	}
 	elapsed := time.Since(start)
-	if granted := grantedTo(t, server, accepted.ID()); granted.window <= initialStreamWindow {
-		t.Fatalf("the window stayed at %d bytes over a path that loses packets", granted.window)
-	}
-	if window, _, _ := associationWindowOf(t, server); window <= initialConnectionWindow {
-		t.Fatalf("the association window stayed at %d bytes", window)
-	}
 	if rate := float64(len(payload)) / elapsed.Seconds(); rate < capacity/8 {
 		t.Fatalf("%.2f MiB/s over a path of %.2f MiB/s", rate/1024/1024, capacity/1024/1024)
 	}

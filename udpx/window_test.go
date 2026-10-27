@@ -51,15 +51,6 @@ func associationWindowOf(t *testing.T, conn Association) (window, limit, read ui
 	return a.recvWindow, a.recvLimit, a.recvRead
 }
 
-// associationCreditOf reads what the peer allows this end to send overall.
-func associationCreditOf(t *testing.T, conn Association) uint64 {
-	t.Helper()
-	a := conn.(*association)
-	a.fcMu.Lock()
-	defer a.fcMu.Unlock()
-	return a.sendCredit.limit
-}
-
 // waitUntil waits for something a transfer makes true on the other end of the link,
 // so that a test does not depend on how many round trips it takes.
 func waitUntil(t *testing.T, what string, condition func() bool) {
@@ -76,57 +67,23 @@ func waitUntil(t *testing.T, what string, condition func() bool) {
 	}
 }
 
-// fillWindow has the peer write everything it is still allowed to write, and waits
-// until all of it arrived. The sender ends up stopped at the credit rather than at
-// the end of what it had to send, which is the difference between a window that is
-// too small and one that is not.
-func fillWindow(t *testing.T, sender Association, stream *Stream, receiver Association, id uint32) {
-	t.Helper()
-	// What the peer may write is what this end granted, which takes a frame to
-	// arrive: filling before that would be filling a window that moved.
-	waitUntil(t, "the peer to hear about the window", func() bool {
-		return allowedOn(t, sender, id) == grantedTo(t, receiver, id).limit
-	})
-	stream.sendMu.Lock()
-	available := int(stream.sendCredit.available())
-	stream.sendMu.Unlock()
-	written := make(chan error, 1)
-	go func() {
-		_, writeErr := stream.Write(testPayload(available))
-		written <- writeErr
-	}()
-	waitUntil(t, "the window to be filled", func() bool {
-		granted := grantedTo(t, receiver, id)
-		return granted.highest == granted.limit
-	})
-	select {
-	case err := <-written:
-		if err != nil {
-			t.Fatalf("write: %v", err)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("writing one window did not finish")
-	}
-}
-
-// TestStreamWindowStopsGrowingOnASmallPath requires the window a receiver grants to
-// stop growing when the path is smaller than it: a loopback carries a few packets per
-// round trip, so two megabytes are a hundred round trips of data and doubling the
-// window buys memory rather than rate.
+// TestStreamWindowIsABudget requires the credit a stream is granted to be a budget and
+// nothing else: the credit both ends know without a frame, raised to the budget once
+// the stream exists, never more than two budgets past what the application read, and
+// moved by the read once the buffer is what holds it.
 //
-// The peer filling the window is still what a window that is too small looks like, so
-// what stops the doubling is the other half of the evidence — the rate did not grow
-// with the window. The first doubling is the one the rate cannot answer, since there
-// is no window before it to compare against, so what this pins is that the growth stops
-// at the second: eight windows go through a window that stays where it is, which is the
-// case that has to keep working while it does. What the peer follows is the limit
-// moving forward on the read, not the window growing.
-func TestStreamWindowStopsGrowingOnASmallPath(t *testing.T) {
+// The two budgets are what bounds the memory one stream costs, so the ceiling is what
+// this pins: a window that grew would make the bound a function of the path, which is
+// the congestion controller's question and not this one.
+func TestStreamWindowIsABudget(t *testing.T) {
 	client, server, _ := testSetup(t, Options{}, Options{})
 	ctx := testContext(t, 60*time.Second)
 	stream, err := client.OpenStream(ctx)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if limit := allowedOn(t, client, stream.ID()); limit != initialStreamWindow {
+		t.Fatalf("a new stream starts with %d bytes of credit", limit)
 	}
 	// A stream exists on the peer only once something was written on it.
 	if _, err = stream.Write([]byte{0}); err != nil {
@@ -136,97 +93,43 @@ func TestStreamWindowStopsGrowingOnASmallPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const size = 8 * initialStreamWindow
-	wrote := make(chan error, 1)
+	waitUntil(t, "the peer to hear about the budget", func() bool {
+		return allowedOn(t, client, stream.ID()) == grantedTo(t, server, stream.ID()).limit
+	})
+	granted := grantedTo(t, server, stream.ID())
+	if granted.window != streamWindow {
+		t.Fatalf("the stream window is %d bytes, expected %d", granted.window, streamWindow)
+	}
+	if granted.limit < streamWindow {
+		t.Fatalf("the ceiling is %d bytes, expected at least the budget %d", granted.limit, streamWindow)
+	}
+	if window, _, _ := associationWindowOf(t, server); window != connectionWindow {
+		t.Fatalf("the association window is %d bytes, expected %d", window, connectionWindow)
+	}
+	// Nothing is read from here on, so the peer is stopped where the read holds the
+	// ceiling: two budgets past it, which is the memory this stream may cost.
+	stopped := make(chan error, 1)
 	go func() {
-		if _, writeErr := stream.Write(testPayload(size)); writeErr != nil {
-			wrote <- writeErr
-			return
-		}
-		wrote <- stream.CloseWrite()
+		_, writeErr := stream.Write(testPayload(int(2*streamWindow) + 4096))
+		stopped <- writeErr
 	}()
-	if _, err = readExactly(accepted, size); err != nil {
+	waitUntil(t, "the peer to be stopped at the ceiling", func() bool {
+		granted := grantedTo(t, server, stream.ID())
+		return granted.limit == granted.highest
+	})
+	if granted := grantedTo(t, server, stream.ID()); granted.limit > granted.read+2*streamWindow {
+		t.Fatalf("the ceiling is %d bytes with %d bytes read", granted.limit, granted.read)
+	}
+	// Reading is what moves the ceiling from there: the peer is waiting at it and has
+	// nothing left to send, so an arrival is not what this can wait for.
+	ceiling := allowedOn(t, client, stream.ID())
+	if _, err = readExactly(accepted, 1<<20); err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if err = <-wrote; err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	if granted := grantedTo(t, server, accepted.ID()); granted.window != 2*initialStreamWindow {
-		t.Fatalf("the window grew to %d bytes after %d bytes through it", granted.window, size)
-	}
-}
-
-// TestStreamWindowStaysWhenThePeerStopsShort requires a window that the peer did not
-// fill to stay where it is: a peer that wrote less than it was allowed to was not
-// stopped by the credit, and a window that grew anyway is memory spent on nothing.
-func TestStreamWindowStaysWhenThePeerStopsShort(t *testing.T) {
-	client, server, _ := testSetup(t, Options{}, Options{})
-	ctx := testContext(t, 30*time.Second)
-	stream, err := client.OpenStream(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload := testPayload(initialStreamWindow / 2)
-	if _, err = stream.Write(payload); err != nil {
-		t.Fatal(err)
-	}
-	accepted, err := server.AcceptStream(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if read, readErr := readExactly(accepted, len(payload)); readErr != nil || len(read) != len(payload) {
-		t.Fatalf("the peer read %d bytes: %v", len(read), readErr)
-	}
-	if granted := grantedTo(t, server, accepted.ID()); granted.window != initialStreamWindow {
-		t.Fatalf("the window grew to %d bytes with %d of %d sent", granted.window, granted.read, initialStreamWindow)
-	}
-	if window, _, _ := associationWindowOf(t, server); window != initialConnectionWindow {
-		t.Fatalf("the association window grew to %d bytes", window)
-	}
-	// What the peer hears is either the window as it started or that window moved
-	// forward by the read, and which of the two depends on whether the update has
-	// arrived yet. The window itself not growing is what the two checks above say;
-	// this one is only about the update not carrying a larger one.
-	if limit := allowedOn(t, client, accepted.ID()); limit != initialStreamWindow &&
-		limit != uint64(len(payload))+initialStreamWindow {
-		t.Fatalf("the peer was told about %d bytes", limit)
-	}
-}
-
-// TestWindowMovedDoublesOnlyWhileThePathIsLarger requires the move of a window to
-// depend on the rate the peer delivered at: a window that is what limits the peer
-// doubles the rate when it doubles, and one that is larger than the path leaves the
-// rate where the path put it.
-func TestWindowMovedDoublesOnlyWhileThePathIsLarger(t *testing.T) {
-	const megabyte = 1 << 20
-	for _, test := range []struct {
-		name     string
-		previous uint64
-		elapsed  time.Duration
-		expected uint64
-	}{
-		{"twice the rate of the window before", 0, 100 * time.Millisecond, 2 * initialStreamWindow},
-		{"half again the rate", 10 * megabyte, 60 * time.Millisecond, 2 * initialStreamWindow},
-		{"the same rate", 10 * megabyte, 100 * time.Millisecond, initialStreamWindow},
-		{"a rate that fell", 10 * megabyte, 400 * time.Millisecond, initialStreamWindow},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			now := time.Now()
-			stream := newStream(&association{}, 4, initialStreamWindow)
-			stream.readOffset = initialStreamWindow / 2
-			stream.recvLimit = initialStreamWindow
-			stream.windowSpent = true
-			stream.recvRate = test.previous
-			stream.recvMarked = 0
-			stream.recvMarkedAt = now.Add(-test.elapsed)
-			stream.recvHighest = megabyte
-			_, window, moved := stream.windowMoved(now)
-			if !moved {
-				t.Fatal("the window did not move")
-			}
-			if window != test.expected {
-				t.Fatalf("the window is %d bytes, expected %d", window, test.expected)
-			}
-		})
+	waitUntil(t, "the peer to hear about the read", func() bool {
+		return allowedOn(t, client, stream.ID()) > ceiling
+	})
+	if granted := grantedTo(t, server, stream.ID()); granted.window != streamWindow {
+		t.Fatalf("the window grew to %d bytes", granted.window)
 	}
 }

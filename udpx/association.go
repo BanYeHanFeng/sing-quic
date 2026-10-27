@@ -263,26 +263,16 @@ type association struct {
 	defragger       datagramDefragger
 	datagrams       chan Datagram
 
-	// fcMu guards the association window: what the peer allows this end to send,
-	// and what this end allows the peer to send. recvWindow is how large that
-	// credit is, which starts at initialConnectionWindow and doubles while the
-	// streams together are what fills it. recvLimit is the ceiling the peer was last
-	// told about and recvLimitWas the one before it, for the reason a stream keeps
-	// both: the peer's last packet arrives after the ceiling it knew may have been
-	// replaced. recvMarked is how much had arrived when the window last moved and
-	// recvMarkedAt when it was, which is how the rate the streams were delivered at is
-	// measured, and recvRate is that rate the last time the window was asked about.
+	// fcMu guards the association window: what the peer allows this end to send, and
+	// what this end allows the peer to send. recvWindow is the budget every stream
+	// together may cost, recvLimit is the ceiling the peer was last told about, and
+	// recvRead is where the application got to, which is what the buffer is bounded by.
 	fcMu         sync.Mutex
 	sendCredit   credit
 	recvLimit    uint64
-	recvLimitWas uint64
 	recvWindow   uint64
-	windowSpent  bool
 	recvRead     uint64
 	recvReceived uint64
-	recvMarked   uint64
-	recvMarkedAt time.Time
-	recvRate     uint64
 
 	// isClient says which half of the protocol this association is. It is what
 	// stream ids are built from and what tells an incoming stream id apart from an
@@ -324,8 +314,7 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		datagrams:    make(chan Datagram, datagramBacklog),
 		sendCredit:   credit{limit: initialConnectionWindow},
 		recvLimit:    initialConnectionWindow,
-		recvWindow:   initialConnectionWindow,
-		recvMarkedAt: time.Now(),
+		recvWindow:   connectionWindow,
 		isClient:     isClient,
 		ownsConn:     ownsConn,
 	}

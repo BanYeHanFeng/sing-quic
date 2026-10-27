@@ -1,7 +1,5 @@
 package udpx
 
-import "time"
-
 // Flow control
 //
 // A window is credit, not a rate: the receiver says how much more data the peer
@@ -13,57 +11,48 @@ import "time"
 //   - per association, so that a hundred streams that are each inside their own
 //     window cannot add up to more memory than the association may use.
 //
+// The size of a window is a memory budget and nothing else: how much may wait on this
+// side, which is a number this end picks rather than one the path teaches. What the
+// path is worth is the congestion controller's question, and a receiver that doubled
+// its window on a rate it measured would be running a second controller with worse
+// information — the only rate a receiver sees is the one its own window allows.
+//
 // The windows are moved forward as data arrives, which is what keeps the peer sending
 // on a path that loses packets: what the application can read is what arrived in
 // order, and one hole stops the read while everything behind the hole is already
 // here. A window that followed the read would wait for the retransmission that fills
 // the hole before moving at all, so the peer would spend every round trip waiting for
 // a window the receiver is holding for a hole. What bounds the memory instead is the
-// read: a window never goes further than two windows past it, one for what the peer
+// read: a window never goes further than two budgets past it, one for what the peer
 // may have in flight and one for what arrived behind a hole and is waiting.
 //
-// A window also grows, because half of a window that is too small for the path is
-// still too small. The evidence a receiver has is the peer spending the whole window
-// and nothing coming after it: what stopped the peer was this window and not the
-// path, which stops a peer wherever it happens to be. The window is then doubled
-// unless it is already larger than the path, and a stream window that grew takes the
-// association window with it.
-//
-// Whether the window is larger than the path is answered by the rate the application
-// read at: a window that is what limits the peer doubles that rate when it doubles,
-// because the peer sends one window per round trip; a window larger than the path
-// leaves the rate where the path put it, and what the doubling adds is memory the peer
-// may fill before the application reads. The rate the peer sent at would answer the
-// wrong question — it follows the window by itself, so it says a window twice as large
-// is twice as good on every path. The window is therefore doubled only when the read
-// rate grew with it, and the test is asked again at every move, so a path that gets
-// faster later takes a larger window with it and nothing here is remembered as a
-// ceiling.
-//
-// What is compared is the ceiling the peer was told about, not the one this end holds:
-// the window moves as data arrives, so by the time the packet that reached a ceiling
-// arrives, that ceiling has usually been replaced by a larger one, and a peer whose
-// data always arrives one round trip behind would then never be seen to reach any
-// ceiling at all. A peer that fills the window it was given is the same evidence
-// whether or not the limit has moved since.
+// Both budgets are fixed, so the memory an association costs is bounded by a number
+// known before the first packet. A window that grew to fit the path would need a bound
+// of its own, and the one it had was the rate the application read at, which is the
+// window judging itself: the peer's rate follows the window by construction, so every
+// doubling looked justified. A path whose bandwidth-delay product was 7 MB ended up
+// with a 71 MB window and 128 MB of buffer.
 const (
-	// initialStreamWindow is where the window of one stream starts: how much data
-	// it may have in flight before the receiver has to raise the window.
-	//
-	// A path that takes 200 ms per round trip carries one window per round trip, so
-	// 2 MiB is a little over 3 MiB/s for one stream and 40 MiB/s for a path of
-	// 50 ms. A smaller window is what kept a single stream at 0.6 MiB/s on that
-	// path; a path that loses packets needs more than 2 MiB even when its round trip
-	// is short, and that is what the growth is for.
+	// initialStreamWindow is the credit a stream starts with, before this end has said
+	// anything: it is the number both ends know without a frame, so it is what a sender
+	// assumes and what a receiver starts out allowing. It is not the budget below — the
+	// budget is announced as soon as the first bytes of a stream arrive.
 	initialStreamWindow = 2 * 1024 * 1024
 
-	// initialConnectionWindow is how much data all streams together may have in
-	// flight.
-	//
-	// This is where the number that bounds the memory one association costs starts:
-	// what arrived and was not read yet on one side, and what was sent and not
-	// acknowledged yet on the other. Four streams of the stream window fill it.
+	// initialConnectionWindow is the same for the association.
 	initialConnectionWindow = 8 * 1024 * 1024
+
+	// streamWindow is what one stream is granted once this end has said anything: the
+	// memory one stream may cost, which is two windows of buffer — one the peer may
+	// have in flight and one that arrived behind a hole. Two of these at a 200 ms
+	// round trip is 160 MiB/s of credit, and the congestion controller is what decides
+	// whether a path is given that much.
+	streamWindow = 16 * 1024 * 1024
+
+	// connectionWindow is the same for every stream together, and it is the number
+	// that bounds what one association costs: four streams of the stream window fill
+	// it.
+	connectionWindow = 64 * 1024 * 1024
 
 	// maxStreams is how many streams an association may have open at once. It is
 	// a constant of the protocol rather than a number to negotiate: the number is
@@ -75,32 +64,6 @@ const (
 	// AcceptStream.
 	acceptStreamBacklog = 64
 )
-
-// windowGrows reports whether a window the peer filled is worth doubling, given the
-// rate the peer delivered at with it and the rate it delivered at with the window
-// before.
-//
-// A rate that grew by half is the evidence that the window was still what limited the
-// peer. The half is slack for the path's own variation and for a loss that cost a
-// retransmission to fill the window: a window that is half the size of the path still
-// doubles the rate, and one that is twice the size of the path leaves it alone, so
-// what the test has to tell apart is a rate that moved from one that did not.
-func windowGrows(rate, previous uint64) bool {
-	if rate == 0 {
-		// An application that reads nothing is not evidence of anything, and a
-		// window that grew on that answer would keep growing.
-		return false
-	}
-	return previous == 0 || 2*rate >= 3*previous
-}
-
-// deliveryRate is how many bytes per second the peer delivered over elapsed.
-func deliveryRate(delivered uint64, elapsed time.Duration) uint64 {
-	if elapsed <= 0 {
-		return 0
-	}
-	return delivered * uint64(time.Second) / uint64(elapsed)
-}
 
 // credit is a send-side window: how much data may still be sent.
 type credit struct {
