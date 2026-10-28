@@ -5,6 +5,7 @@ package udpio
 import (
 	"bytes"
 	"net"
+	"os"
 	"syscall"
 	"testing"
 	"time"
@@ -361,5 +362,19 @@ func TestSocketBuffers(t *testing.T) {
 	t.Logf("receive buffer %d -> %d (asked for %d)", before, after, desiredReceiveBuffer)
 	if after < desiredReceiveBuffer {
 		t.Logf("the host capped the buffer, so only %d bytes are usable", after)
+	}
+}
+
+func TestIsGSOError(t *testing.T) {
+	for _, errno := range []syscall.Errno{unix.EIO, unix.EINVAL, unix.EMSGSIZE} {
+		if !isGSOError(os.NewSyscallError("sendmsg", errno)) {
+			t.Fatalf("%v was not reported as a segmentation failure", errno)
+		}
+	}
+	if isGSOError(os.NewSyscallError("sendmsg", unix.ECONNREFUSED)) {
+		t.Fatal("a refused connection was reported as a segmentation failure")
+	}
+	if isGSOError(nil) {
+		t.Fatal("no error was reported as a segmentation failure")
 	}
 }
