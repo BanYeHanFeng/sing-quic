@@ -195,10 +195,10 @@ func TestFECRejects(t *testing.T) {
 	if _, err := codec.recover(2, 1, [][]byte{make([]byte, 4), make([]byte, 4)}); err == nil {
 		t.Fatal("a group of the wrong number of shards was recovered")
 	}
-	// One member short is what one parity shard is for, so this one comes back
-	// where the interleaved code would have refused it.
+	// Two members missing and two parity shards: the code is MDS, so which two
+	// went missing is not part of the question.
 	together := [][]byte{nil, make([]byte, 4), nil, make([]byte, 4), make([]byte, 4), make([]byte, 4)}
 	if filled, err := codec.recover(4, 2, together); err != nil || filled != 2 {
-		t.Fatalf("%d members filled in for two missing from one subset", filled)
+		t.Fatalf("%d members filled in for two missing", filled)
 	}
 }
