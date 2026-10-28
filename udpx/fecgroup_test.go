@@ -632,3 +632,54 @@ func TestFECRecoveryReportedAsLoss(t *testing.T) {
 		t.Fatalf("%d packets still in flight", inFlight)
 	}
 }
+
+// TestFECGroupMixedLengths requires a group whose members are not the same size to
+// be recovered. A group is a run of packets, not a run of equal packets: an
+// acknowledgement or a short write rides beside a full one, and the code is written
+// over shards of one length, so a receiver that hands it the packets as they
+// arrived hands it shards that do not line up.
+func TestFECGroupMixedLengths(t *testing.T) {
+	sender, receiver, conn := newTestFECPair(t, Options{IdleTimeout: time.Minute, MTU: mtuIPv4, FEC: FECOptions{DataShards: 4, ParityShards: 2}})
+	sizes := []int{1000, 100, 800, 50}
+	expected := make([]byte, 0)
+	offset := uint64(0)
+	for index, size := range sizes {
+		expected = append(expected, fecQueueFrame(t, sender, offset, size, byte(index))...)
+		offset += uint64(size)
+	}
+	packets := fecTestPackets(t, conn, &sender.sendRing)
+	if len(packets) != len(sizes)+2 {
+		t.Fatalf("%d packets written for %d members and two parity shards", len(packets), len(sizes))
+	}
+	// The largest member is lost. The first parity packet comes first, which is
+	// when a receiver learns that the peer protects what it sends: a member that
+	// arrived before that was not kept.
+	fecFeed(t, receiver, packets[4:5])
+	fecFeed(t, receiver, packets[1:4])
+	fecFeed(t, receiver, packets[5:6])
+	receiver.streamsMu.Lock()
+	stream := receiver.streams[fecTestStreamID]
+	receiver.streamsMu.Unlock()
+	if stream == nil {
+		t.Fatal("no stream was opened by the frames")
+	}
+	received := make([]byte, len(expected))
+	stream.SetReadDeadline(time.Now().Add(5 * time.Second))
+	read := 0
+	for read < len(received) {
+		n, err := stream.Read(received[read:])
+		if err != nil {
+			t.Fatalf("read %d of %d bytes: %v", read, len(received), err)
+		}
+		read += n
+	}
+	if !bytes.Equal(received, expected) {
+		t.Fatal("what the stream delivered is not what was written")
+	}
+	receiver.ackMu.Lock()
+	recovered := receiver.ack.recovered.contains(0)
+	receiver.ackMu.Unlock()
+	if !recovered {
+		t.Fatal("the recovered packet was not reported as lost")
+	}
+}
