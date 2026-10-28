@@ -72,7 +72,7 @@ func TestHeaderRoundTrip(t *testing.T) {
 		t.Fatalf("parsed %+v, want %+v", parsed, testHeader(0))
 	}
 	for _, epoch := range []uint8{0, 1, 2, epochMask} {
-		for _, packetTypeValue := range []packetType{packetTypeHandshake, packetTypeData, packetTypeFEC, packetTypeReset} {
+		for _, packetTypeValue := range []packetType{packetTypeHandshake, packetTypeData, packetTypeFEC} {
 			h := testHeader(epoch)
 			h.Type = packetTypeValue
 			parsed, err = parseHeader(h.appendTo(nil))
@@ -100,7 +100,7 @@ func TestParseHeaderRejects(t *testing.T) {
 	}
 
 	unknown := bytes.Clone(valid)
-	unknown[connectionIDLen] = byte(packetTypeReset) + 1
+	unknown[connectionIDLen] = byte(packetTypeFEC) + 1
 	if _, err := parseHeader(unknown); err != errUnknownType {
 		t.Fatalf("unknown type: %v", err)
 	}

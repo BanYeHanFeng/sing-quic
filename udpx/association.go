@@ -29,8 +29,7 @@ type Association interface {
 	// never load bearing.
 	RemoteAddr() net.Addr
 	// Context is done when the association ended. context.Cause says why:
-	// net.ErrClosed for a close of either end, ErrIdleTimeout for silence,
-	// ErrStatelessReset for a reset.
+	// net.ErrClosed for a close of either end, ErrIdleTimeout for silence.
 	Context() context.Context
 	// CloseWithError closes the association towards the peer, which reports err
 	// as the reason.
@@ -57,14 +56,8 @@ type Association interface {
 	ReceiveDatagram(ctx context.Context) (Datagram, error)
 }
 
-var (
-	// ErrIdleTimeout is the reason of an association both ends fell silent on.
-	ErrIdleTimeout = E.New("udpx: idle timeout")
-
-	// ErrStatelessReset is the reason of an association reset by a peer that
-	// kept no state for it.
-	ErrStatelessReset = E.New("udpx: stateless reset")
-)
+// ErrIdleTimeout is the reason of an association both ends fell silent on.
+var ErrIdleTimeout = E.New("udpx: idle timeout")
 
 const (
 	// maxPacketSize is the size of the largest packet either end sends. Path MTU
@@ -77,11 +70,6 @@ const (
 	// them in one buffer, so the buffer has to hold a whole run: one that is too
 	// small truncates the last datagram of it.
 	maxReceiveSize = 64 * 1024
-
-	// resetLen is the size of the body of a reset packet. It is random and
-	// carries nothing: a reset says that the peer has no state for the
-	// association, and there is nothing further to say.
-	resetLen = 16
 
 	// defaultIdleTimeout is how long an association may see no traffic before it
 	// closes itself.
@@ -493,9 +481,6 @@ func (a *association) handlePacket(packet []byte, source net.Addr) error {
 	if packetHeader.ConnectionID != a.localConnID {
 		return errAuthentication
 	}
-	if packetHeader.Type == packetTypeReset {
-		return a.handleReset(packet, source)
-	}
 	if packetHeader.Type == packetTypeFEC {
 		return a.handleParity(packet, packetHeader, source)
 	}
@@ -658,25 +643,6 @@ func (a *association) handleParity(packet []byte, packetHeader header, source ne
 	// packet in flight that nothing acknowledges is a packet that keeps the window
 	// closed until the association ends.
 	a.scheduleAck(packetHeader.PacketNumber, time.Now())
-	return nil
-}
-
-// handleReset accepts a reset packet, the one packet type that is not
-// authenticated: it exists for a peer that has already dropped the keys.
-//
-// What keeps an off-path attacker from resetting every association is that the
-// packet has to carry the connection id of an association this end knows and
-// come from the address the peer is at. Both are visible to anyone on the path,
-// so a reset is a signal rather than a proof, which is the trade QUIC makes as
-// well.
-func (a *association) handleReset(packet []byte, source net.Addr) error {
-	if len(packet) != headerLen+resetLen {
-		return errShortPacket
-	}
-	if source.String() != a.RemoteAddr().String() {
-		return E.New("reset from ", source)
-	}
-	a.shutdown(ErrStatelessReset, false)
 	return nil
 }
 

@@ -241,39 +241,6 @@ func TestKeepAlive(t *testing.T) {
 	}
 }
 
-// TestStatelessReset requires a reset from the peer address to end the
-// association, and a reset from anywhere else to be ignored.
-func TestStatelessReset(t *testing.T) {
-	client, server, listener := testSetup(t, Options{}, Options{})
-	clientAssociation, isAssociation := client.(*association)
-	if !isAssociation {
-		t.Fatal("client is not an association")
-	}
-	reset := header{ConnectionID: clientAssociation.localConnID, Type: packetTypeReset}.appendTo(nil)
-	reset = append(reset, make([]byte, resetLen)...)
-
-	// From another address first: the association must not care.
-	_, err := udpConn(t).WriteTo(reset, clientAssociation.LocalAddr())
-	if err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-client.Context().Done():
-		t.Fatalf("a reset from a third party ended the association: %v", context.Cause(client.Context()))
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	_, err = listener.conn.WriteTo(reset, clientAssociation.LocalAddr())
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitDone(t, client.Context(), time.Second)
-	if cause := context.Cause(client.Context()); !errors.Is(cause, ErrStatelessReset) {
-		t.Fatalf("client ended with %v", cause)
-	}
-	_ = server.CloseWithError(nil)
-}
-
 // TestPacketTamperedOnTheWire requires a packet that carries an association's
 // connection id but does not authenticate to be dropped without ending it.
 func TestPacketTamperedOnTheWire(t *testing.T) {

@@ -114,11 +114,6 @@ const (
 	// of it is in the clear: a parity shard is useless unless it can be applied
 	// the moment it arrives, next to members that are still missing.
 	packetTypeFEC
-
-	// packetTypeReset ends an association from an endpoint that keeps no state
-	// for it, so a peer that lost its own state learns about it instead of
-	// retransmitting into a black hole until its idle timeout expires.
-	packetTypeReset
 )
 
 // header is the clear header of every packet.
@@ -158,7 +153,7 @@ func parseHeader(packet []byte) (header, error) {
 	}
 	copy(h.ConnectionID[:], packet[:connectionIDLen])
 	switch h.Type {
-	case packetTypeHandshake, packetTypeData, packetTypeFEC, packetTypeReset:
+	case packetTypeHandshake, packetTypeData, packetTypeFEC:
 	default:
 		return header{}, errUnknownType
 	}

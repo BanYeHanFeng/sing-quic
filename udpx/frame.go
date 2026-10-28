@@ -317,10 +317,6 @@ const (
 	// closeCodeIdleTimeout is an association closed for silence.
 	closeCodeIdleTimeout
 
-	// closeCodeReset is an association the peer reset without keeping state for
-	// it.
-	closeCodeReset
-
 	// closeCodeError is any other local error.
 	closeCodeError
 )
@@ -332,8 +328,6 @@ func (c closeCode) err() error {
 		return net.ErrClosed
 	case closeCodeIdleTimeout:
 		return ErrIdleTimeout
-	case closeCodeReset:
-		return ErrStatelessReset
 	default:
 		return E.New("udpx: closed by peer with code ", int(c))
 	}
@@ -346,8 +340,6 @@ func closeCodeOf(err error) closeCode {
 		return closeCodeNormal
 	case ErrIdleTimeout:
 		return closeCodeIdleTimeout
-	case ErrStatelessReset:
-		return closeCodeReset
 	default:
 		return closeCodeError
 	}
