@@ -96,14 +96,6 @@ func testAck(largest uint32, ranges ...pnRange) []byte {
 	return built.appendTo(nil)[1:]
 }
 
-// drainWrites waits for the socket to have taken what the send path handed to it.
-// Writing is the work of the association's own goroutine, so a test that reads what
-// the socket got waits for it first.
-func drainWrites(t *testing.T, a *association) {
-	t.Helper()
-	a.drainWrites()
-}
-
 // queueStream queues one stream frame of size bytes and sends it.
 func queueStream(t *testing.T, a *association, offset uint64, size int) []byte {
 	t.Helper()
@@ -113,7 +105,6 @@ func queueStream(t *testing.T, a *association, offset uint64, size int) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	drainWrites(t, a)
 	return frame
 }
 
@@ -151,7 +142,9 @@ func TestLossByPacketThreshold(t *testing.T) {
 	}
 
 	a.handleAck(testAck(4, pnRange{start: 4, end: 4}), time.Now())
-	drainWrites(t, a)
+	if err := a.flush(); err != nil {
+		t.Fatal(err)
+	}
 
 	payloads := conn.payloads(t, &a.sendRing)
 	if len(payloads) != 7 {
@@ -189,13 +182,17 @@ func TestLossByTimeThreshold(t *testing.T) {
 	// Packet 2 was acknowledged, and not enough packets came after 0 for the
 	// packet number threshold to be what finds it.
 	a.handleAck(testAck(2, pnRange{start: 2, end: 2}), now)
-	drainWrites(t, a)
+	if err := a.flush(); err != nil {
+		t.Fatal(err)
+	}
 	if written := conn.len(); written != 3 {
 		t.Fatalf("%d packets written before the delay passed", written)
 	}
 	// The packets that are still in flight have been for longer than a round trip.
 	a.handleAck(testAck(2, pnRange{start: 2, end: 2}), now.Add(time.Second))
-	drainWrites(t, a)
+	if err := a.flush(); err != nil {
+		t.Fatal(err)
+	}
 	payloads := conn.payloads(t, &a.sendRing)
 	if len(payloads) != 5 {
 		t.Fatalf("%d packets written", len(payloads))
@@ -230,7 +227,9 @@ func TestNoLossWithoutEvidence(t *testing.T) {
 	for index := 1; index < 5; index++ {
 		a.handleAck(testAck(0, pnRange{start: 0, end: 0}), now.Add(time.Duration(index)*time.Second))
 	}
-	drainWrites(t, a)
+	if err := a.flush(); err != nil {
+		t.Fatal(err)
+	}
 	payloads := conn.payloads(t, &a.sendRing)
 	if len(payloads) != 2 {
 		t.Fatalf("%d packets written", len(payloads))
@@ -253,7 +252,9 @@ func TestProbe(t *testing.T) {
 	a := newTestAssociation(t, conn)
 	frame := queueStream(t, a, 0, 1000)
 	a.probe()
-	drainWrites(t, a)
+	if err := a.flush(); err != nil {
+		t.Fatal(err)
+	}
 	if conn.len() != 2 {
 		t.Fatalf("%d packets written", conn.len())
 	}
@@ -282,8 +283,13 @@ func TestProbeWithoutData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err = a.flush(); err != nil {
+		t.Fatal(err)
+	}
 	a.probe()
-	drainWrites(t, a)
+	if err = a.flush(); err != nil {
+		t.Fatal(err)
+	}
 	payloads := conn.payloads(t, &a.sendRing)
 	if len(payloads) != 2 {
 		t.Fatalf("%d packets written", len(payloads))
@@ -302,6 +308,9 @@ func TestProbingIsBounded(t *testing.T) {
 	queueStream(t, a, 0, 1000)
 	for range 100 {
 		a.probe()
+	}
+	if err := a.flush(); err != nil {
+		t.Fatal(err)
 	}
 	a.sendMu.Lock()
 	queued := a.queue.len()

@@ -225,7 +225,8 @@ func (a *association) SendDatagram(channel uint32, data []byte) error {
 			data:    data[start:end],
 		}))
 	}
-	return a.flush()
+	a.wake()
+	return nil
 }
 
 // ReceiveDatagram returns the next message the peer sent, whichever channel it

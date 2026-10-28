@@ -85,16 +85,17 @@ func retransmittableFrames(packets []*sentPacket) []outFrame {
 }
 
 // sendFramesRetransmitted puts frames back at the head of the send queue, so a
-// recovered packet does not wait behind data produced after it, and sends what can
-// go out now.
-func (a *association) sendFramesRetransmitted(frames []outFrame) error {
+// recovered packet does not wait behind data produced after it, and wakes the send
+// loop. The caller is the receive path: a retransmission waits for the loop, and
+// the loop never waits for the receive path.
+func (a *association) sendFramesRetransmitted(frames []outFrame) {
 	if len(frames) == 0 {
-		return nil
+		return
 	}
 	a.sendMu.Lock()
 	a.queue.pushFront(frames)
 	a.sendMu.Unlock()
-	return a.flush()
+	a.wake()
 }
 
 // armPTO starts the probe timer. The wait doubles with every probe that went
@@ -118,6 +119,11 @@ func (a *association) disarmPTO() {
 }
 
 // probe declares the oldest packet in flight lost and sends it again.
+//
+// The probe is one packet that the window does not count, which is the point: a
+// probe exists to find out whether a path that went quiet is still there, and a
+// question the window holds back is never asked. What a probe may not do is become
+// a second send path: one packet, then the timer again.
 func (a *association) probe() {
 	a.flightMu.Lock()
 	oldest := a.inFlight.oldest()
@@ -130,18 +136,17 @@ func (a *association) probe() {
 	a.probes++
 	a.flightMu.Unlock()
 
-	// The frames go out as a new packet, which arms the timer again through the
-	// send path; a probe of nothing but a ping is what asks a silent peer for an
-	// answer when there is nothing to send again.
-	err := a.sendFramesRetransmitted(frames)
-	if err != nil {
-		return
+	a.sendMu.Lock()
+	if len(frames) > 0 {
+		a.queue.pushFront(frames)
+	} else {
+		// A probe of nothing but a ping is what asks a silent peer for an answer
+		// when there is nothing to send again.
+		a.queue.push(outFrame{payload: appendPing(nil), ackEliciting: true})
 	}
-	if len(frames) == 0 {
-		_ = a.send(appendPing(nil))
-		return
-	}
-	a.armPTO()
+	a.probeCredits++
+	a.sendMu.Unlock()
+	a.wake()
 }
 
 // handleAck takes the acknowledged packets out of flight, samples the round trip,
@@ -183,11 +188,8 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	// The window is what the reset a stream owes goes out on, so the streams hear
 	// about their acknowledged frames after the controller heard about the packets.
 	a.ackStreamFrames(acked)
-	if len(recovered) > 0 {
-		_ = a.sendFramesRetransmitted(recovered)
-	}
-	// The window just opened, so whatever waited for it can go out.
-	if a.queueLength() > 0 {
-		_ = a.flush()
-	}
+	a.sendFramesRetransmitted(recovered)
+	// The window may have opened, so whatever waited for it can go out. The send
+	// loop is what sends it: this is the receive path and it does not write.
+	a.wake()
 }

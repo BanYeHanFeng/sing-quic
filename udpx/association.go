@@ -136,9 +136,9 @@ func (o Options) withDefaults() Options {
 // The three belong together because a timer that fires runs into the association
 // and arms one of the others: an acknowledgement is sent, a probe rearms itself.
 // They are therefore built as one set, before any of them can fire, and the set is
-// what the association hands out. Pacing is not one of them: it has its own
-// goroutine, because what it needs from the clock is a resolution a timer does not
-// have (paceLoop).
+// what the association hands out. Pacing is not one of them: it belongs to the
+// send loop, because what it needs from the clock is a resolution a timer does not
+// have.
 type associationTimers struct {
 	// idle closes the association when it falls silent. It is reset from both
 	// sides.
@@ -168,28 +168,37 @@ type association struct {
 	// atomic rather than a field under sendMu.
 	peerAddr atomic.Pointer[net.Addr]
 
+	// sendMu guards the send queue, the packet numbers and the batch being filled.
+	// It is never held across a write to the socket: the send loop writes, and a
+	// lock the receive path needs must not wait for a socket that stopped taking
+	// bytes.
 	sendMu     sync.Mutex
 	sendRing   keyRing
 	sendPacket uint32
 	// batchIO moves the packets of one batch in as few calls as the socket
-	// allows. batch is the one being filled; written carries it to the write loop
-	// once it is full, and freeBatches carries it back once the socket has taken
-	// it. What is written here is what is in flight, so a batch that is on its way
-	// into the socket already counts against the window.
-	batchIO     udpio.Conn
-	batch       *batch
-	written     chan *batch
-	freeBatches chan *batch
-	// writing counts the batches the write loop has been handed and has not
-	// written yet, which is what closing waits for before it takes the socket
-	// away: the close of an association is heard by its peer.
-	writingMu sync.Mutex
-	writing   int
-	writeStop chan struct{}
-	writeDone chan struct{}
-	// paceWake asks the pacing goroutine to look at the clock again, and holds one
-	// request: whoever asks while it is already awake has nothing to add.
-	paceWake chan struct{}
+	// allows, and batch is the one being filled. What is written here is what is in
+	// flight, so a batch that is on its way into the socket already counts against
+	// the window.
+	batchIO udpio.Conn
+	batch   *batch
+	// pumpMu serializes whoever sends: the send loop owns the send path, and flush
+	// borrows it. A pump is one pass over the queue, not one packet, so the lock is
+	// held for a batch and not for a write.
+	pumpMu sync.Mutex
+	// sendWake asks the send loop to look at the queue again and holds one request:
+	// whoever asks while the loop is already awake has nothing to add.
+	sendWake chan struct{}
+	// sendDone is closed when the send loop ends, which is what closing waits for
+	// before it takes the socket away.
+	sendDone chan struct{}
+	// probeCredits is how many packets the probe timer may send past a closed
+	// window. A probe asks whether a path that went quiet is still there, and a
+	// probe that the window holds back is a question nobody hears: the window opens
+	// on an acknowledgement, and the acknowledgement is what the probe is for.
+	probeCredits int
+	// closing is set before the close frame is queued, and makes the send path skip
+	// the window and the pacer: what is left to send is the close and nothing else.
+	closing atomic.Bool
 	// sealNonce is the nonce of the packet being sealed, reused: twelve bytes per
 	// packet is a third of what sealing one costs.
 	sealNonce [nonceLen]byte
@@ -301,11 +310,8 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		sendRing:        result.send,
 		recvRing:        result.recv,
 		batchIO:         udpio.New(conn, udpio.Options{GRO: true}),
-		freeBatches:     make(chan *batch, writeBatchSlots),
-		written:         make(chan *batch, writeBatchSlots),
-		writeStop:       make(chan struct{}),
-		writeDone:       make(chan struct{}),
-		paceWake:        make(chan struct{}, 1),
+		sendWake:        make(chan struct{}, 1),
+		sendDone:        make(chan struct{}),
 		maxPayload:      maxPacketSize - headerLen - tagLen,
 		fecSender:       newFECSender(options.FEC),
 		fec:             newFECReceiver(),
@@ -333,13 +339,10 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		a.fecSender.timer.Stop()
 	}
 	a.peerAddr.Store(&peer)
-	// The batches come before the loop that uses them, and the loop comes last: a
+	// The batch comes before the loop that uses it, and the loop comes last: a
 	// timer that fired before the association was complete would hand over a batch
 	// nothing is there to write.
-	for range writeBatchSlots {
-		a.freeBatches <- newBatch()
-	}
-	a.batch = <-a.freeBatches
+	a.batch = newBatch()
 	// Every timer starts out a hour away and is armed once the pointer to the set
 	// is in place: a timer whose callback runs before the association has finished
 	// building itself would read fields that nothing has written yet.
@@ -352,8 +355,7 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 	timers.pto.Stop()
 	a.timers.Store(timers)
 	timers.idle.Reset(a.options.IdleTimeout)
-	go a.writeLoop()
-	go a.paceLoop()
+	go a.sendLoop()
 	if a.options.KeepAlivePeriod > 0 {
 		go a.keepAliveLoop()
 	}
@@ -393,11 +395,21 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 			cause = net.ErrClosed
 		}
 		if notifyPeer {
-			_ = a.send(appendClose(nil, closeCodeOf(cause)))
-			// The close packet goes to the socket behind whatever was handed over
-			// before it, so the socket waits for the write loop before it is taken
-			// away: an association that ends is one whose peer heard why.
-			a.drainWrites()
+			// What is left to send is the close and nothing else: the queue holds
+			// data the peer is not going to get, and sending it first would be a
+			// close behind a window that may never open.
+			a.closing.Store(true)
+			a.sendMu.Lock()
+			a.queue.frames = nil
+			a.queue.push(outFrame{payload: appendClose(nil, closeCodeOf(cause)), ackEliciting: true})
+			a.sendMu.Unlock()
+			a.wake()
+			// The close packet goes to the socket before the socket is taken away,
+			// and the send loop is what writes it.
+			select {
+			case <-a.sendDone:
+			case <-time.After(writeDrainTimeout):
+			}
 		}
 		timers := a.timers.Load()
 		timers.idle.Stop()
@@ -408,15 +420,14 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 		}
 		a.cancel(cause)
 		a.closeStreams(cause)
-		// The write loop stops once the socket is gone: closing it is what wakes a
+		// The send loop stops once the socket is gone: closing it is what wakes a
 		// write that is waiting for room, and the loop is what a stuck write would
 		// otherwise keep alive.
-		close(a.writeStop)
 		if a.ownsConn {
 			_ = a.conn.Close()
 		}
 		select {
-		case <-a.writeDone:
+		case <-a.sendDone:
 		case <-time.After(writeDrainTimeout):
 		}
 		if a.onClose != nil {
@@ -425,7 +436,9 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 	})
 }
 
-// send queues one encoded frame and sends what can go out now.
+// send queues one encoded frame and wakes the send loop. It does not wait for the
+// frame to leave: what the caller needs to know is that it is queued, and waiting
+// for a socket would put the receive path behind the send path.
 func (a *association) send(frame []byte) error {
 	select {
 	case <-a.ctx.Done():
@@ -433,7 +446,8 @@ func (a *association) send(frame []byte) error {
 	default:
 	}
 	a.queueFrame(frame)
-	return a.flush()
+	a.wake()
+	return nil
 }
 
 // queueFrame places a frame at the end of the send queue, which takes its bytes

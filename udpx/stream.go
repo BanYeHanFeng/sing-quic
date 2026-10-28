@@ -417,7 +417,8 @@ func (s *Stream) sendQueued() error {
 		}
 		s.sendMu.Unlock()
 		if !frame.carried {
-			return s.association.flush()
+			s.association.wake()
+			return nil
 		}
 		s.association.queueStreamFrame(frame)
 	}

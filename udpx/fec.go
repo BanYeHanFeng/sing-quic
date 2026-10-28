@@ -403,8 +403,8 @@ func (a *association) flushFECGroup() {
 		return
 	}
 	// Nothing else is going to fill a batch on a timer: the group closed on its
-	// own, so the parity it produced leaves now.
-	_ = a.writePendingLocked()
+	// own, so the parity it produced is handed to the send loop now.
+	a.wake()
 }
 
 // closeGroupLocked ends the open group: it seals the members the group was
@@ -465,11 +465,9 @@ func (a *association) planParityLocked(description fecHeader, shard []byte) erro
 		Epoch:        a.sendRing.epoch(),
 		PacketNumber: a.sendPacket,
 	}
-	if len(a.batch.pending) >= maxSendBatch {
-		if err := a.writePendingLocked(); err != nil {
-			return err
-		}
-	}
+	// A group closes on the packet that fills it, so the parity shards of a batch
+	// may be one more than the data packets it holds: batchRoom is what bounds
+	// them, not maxSendBatch.
 	packet, payloadStart, err := a.reserveLocked(h, &description, len(shard))
 	if err != nil {
 		return err
