@@ -2,6 +2,8 @@ package udpx
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -348,5 +350,50 @@ func TestLossDelay(t *testing.T) {
 	estimator.sample(400 * time.Millisecond)
 	if delay := lossDelay(estimator); delay < 400*time.Millisecond {
 		t.Fatalf("delay after a slow sample: %v", delay)
+	}
+}
+
+// TestProbeTimeout requires a peer that answers nothing for long enough to be
+// declared gone: the association ends so that the next connection dials a new
+// one, instead of probing a session the peer has no state for any more.
+func TestProbeTimeout(t *testing.T) {
+	conn := newFakeConn()
+	a := newTestAssociation(t, conn)
+	queueStream(t, a, 0, 1000)
+	a.flightMu.Lock()
+	a.probeSince = time.Now().Add(-maxProbeSilence)
+	a.flightMu.Unlock()
+	a.probe()
+	select {
+	case <-a.Context().Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the association outlived a peer that answered nothing")
+	}
+	if cause := context.Cause(a.Context()); !errors.Is(cause, ErrProbeTimeout) {
+		t.Fatalf("the association ended with %v", cause)
+	}
+}
+
+// TestProbeSurvivesAnAnswer requires an answer to put the probes back to zero,
+// so a path that was quiet for less than maxProbeSilence is a path that was
+// interrupted rather than one that ended.
+func TestProbeSurvivesAnAnswer(t *testing.T) {
+	conn := newFakeConn()
+	a := newTestAssociation(t, conn)
+	queueStream(t, a, 0, 1000)
+	a.flightMu.Lock()
+	a.probes = 3
+	a.probeSince = time.Now().Add(-maxProbeSilence / 2)
+	a.flightMu.Unlock()
+	a.handleAck(testAck(0, pnRange{start: 0, end: 0}), time.Now())
+	a.flightMu.Lock()
+	probes := a.probes
+	since := a.probeSince
+	a.flightMu.Unlock()
+	if probes != 0 {
+		t.Fatalf("%d probes after an answer", probes)
+	}
+	if !since.IsZero() {
+		t.Fatalf("probe start %v after an answer", since)
 	}
 }
