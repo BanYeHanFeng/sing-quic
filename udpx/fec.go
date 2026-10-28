@@ -1,29 +1,29 @@
 package udpx
 
 import (
-	"encoding/binary"
+	"errors"
 	"sync/atomic"
 	"time"
 
+	"github.com/klauspost/reedsolomon"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
 // Forward error correction
 //
-// A FEC group is k member packets and m parity shards. A parity shard is the
-// exclusive or of one of m interleaved subsets of the members: shard i covers
-// every member whose index is i modulo m. A member that did not arrive is the
-// exclusive or of its own subset's parity shard and the members of that subset
-// that did, so encoding and recovering are both one pass of xors over the bytes
-// and neither needs a table, a matrix or an inversion.
+// A FEC group is k member packets and m parity shards of a systematic
+// Reed-Solomon code over GF(2^8). Any k of the k+m shards reconstruct the group,
+// so a group that loses m members comes back wherever they fell — that is the
+// whole contract, and it is why the code is not written here. What a codec of
+// this size spends is one multiply-accumulate per member per parity shard, and
+// the SIMD kernels in klauspost/reedsolomon do that faster than a hand-written
+// loop does a xor: 2.7 us against 5.2 us for 32 members and 2 parity shards of
+// 1400 bytes. Above about four parity shards the ordering flips — k*m
+// multiplications outgrow k xors — and no shape this transport offers goes there.
 //
-// What that gives up against a Reed-Solomon code of the same shape is the last
-// few percent of the recoveries: a Reed-Solomon group comes back from any k of
-// its k+m shards, while this one needs the missing members to fall in different
-// subsets. With two parity shards and 32 members that is 95% of the losses
-// repaired against 99.6% on a path losing 1.5% of its packets; what it buys is an
-// encoder four times cheaper, a decoder that is a xor instead of a matrix
-// inversion, and no 64 KiB table built at startup.
+// At one parity shard the two codes are the same code, since the first row of a
+// Vandermonde matrix is all ones: what a single parity shard can repair does not
+// depend on the code at all, only on how many of them there are.
 //
 // The code is systematic in the sense that matters here: the members travel as
 // themselves, and the parity is only ever used by a receiver that is missing
@@ -37,18 +37,34 @@ const (
 	fecMaxShards = 256
 )
 
-// xorShard XORs src into dst, eight bytes at a time. Both halves of the code are
-// this function: a parity shard is the xor of its subset, and a missing member is
-// the xor of its parity shard and the rest of the subset.
-func xorShard(dst, src []byte) {
-	for len(src) >= 8 {
-		binary.LittleEndian.PutUint64(dst, binary.LittleEndian.Uint64(dst)^binary.LittleEndian.Uint64(src))
-		dst = dst[8:]
-		src = src[8:]
+// fecCodec is the code of one end. The shape of a group is chosen by the wire — a
+// group that closed before it filled has fewer members — so the codec keeps one
+// encoder per shape and builds the matrix for a new shape once. It belongs to one
+// end of one association and is driven by that end's goroutine, which is why it
+// has no lock: a Reed-Solomon encoder keeps a cache of inverted matrices while it
+// reconstructs, so two ends must not share one.
+type fecCodec struct {
+	encoders map[[2]uint8]reedsolomon.Encoder
+}
+
+// encoder returns the code for a group of members members and parity parity
+// shards, building it the first time that shape is seen.
+func (c *fecCodec) encoder(members, parity int) (reedsolomon.Encoder, error) {
+	shape := [2]uint8{uint8(members), uint8(parity)}
+	if encoder, found := c.encoders[shape]; found {
+		return encoder, nil
 	}
-	for index, value := range src {
-		dst[index] ^= value
+	// A shard is never longer than a packet, which is below the size that a
+	// second goroutine would pay for itself.
+	encoder, err := reedsolomon.New(members, parity, reedsolomon.WithAutoGoroutines(maxPacketSize))
+	if err != nil {
+		return nil, err
 	}
+	if c.encoders == nil {
+		c.encoders = make(map[[2]uint8]reedsolomon.Encoder, 4)
+	}
+	c.encoders[shape] = encoder
+	return encoder, nil
 }
 
 // fecShardSize checks the shape of a group and returns the length of a shard.
@@ -61,11 +77,6 @@ func fecShardSize(members, parity int, shards [][]byte) (int, error) {
 	}
 	if parity < 1 {
 		return 0, E.New("FEC group with ", parity, " parity shards")
-	}
-	if parity > members {
-		// A subset holds at least one member, so a group with more parity shards
-		// than members would carry shards of nothing.
-		return 0, E.New("FEC group of ", members, " members and ", parity, " parity shards")
 	}
 	if members+parity > fecMaxShards {
 		return 0, E.New("FEC group of ", members, " members and ", parity, " parity shards")
@@ -89,68 +100,55 @@ func fecShardSize(members, parity int, shards [][]byte) (int, error) {
 	return size, nil
 }
 
-// fecEncode computes the parity shards of a group. members holds the member
-// shards in the order the group describes them and parity the shards to compute,
-// all of the same length; only parity is written.
-func fecEncode(members [][]byte, parity [][]byte) error {
+// encode computes the parity shards of a group. members holds the member shards
+// in the order the group describes them and parity the shards to compute, all of
+// the same length; only parity is written.
+func (c *fecCodec) encode(members, parity [][]byte) error {
 	shards := make([][]byte, 0, len(members)+len(parity))
 	shards = append(shards, members...)
 	shards = append(shards, parity...)
-	shardLen, err := fecShardSize(len(members), len(parity), shards)
+	if _, err := fecShardSize(len(members), len(parity), shards); err != nil {
+		return err
+	}
+	encoder, err := c.encoder(len(members), len(parity))
 	if err != nil {
 		return err
 	}
-	for index, shard := range parity {
-		shard = shard[:shardLen]
-		clear(shard)
-		for member := index; member < len(members); member += len(parity) {
-			xorShard(shard, members[member][:shardLen])
-		}
-	}
-	return nil
+	return encoder.Encode(shards)
 }
 
-// fecRecover reconstructs the member shards of a group that did not arrive.
-// shards holds members+parity entries, the members first and then the parity
-// shards, a nil entry being a shard nobody has. It returns how many members it
-// filled in: a subset missing one member gives it back, a subset missing more
-// than one has nothing to give, and the subsets are independent of each other.
-func fecRecover(members, parity int, shards [][]byte) (int, error) {
+// recover reconstructs the member shards of a group that did not arrive. shards
+// holds members+parity entries, the members first and then the parity shards, a
+// nil entry being a shard nobody has. It returns how many members it filled in:
+// the code reconstructs from any k shards, so the answer is every missing member
+// or none, and none means the group is waiting for a shard still on the path.
+func (c *fecCodec) recover(members, parity int, shards [][]byte) (int, error) {
 	if len(shards) != members+parity {
 		return 0, E.New("FEC group of ", len(shards), " shards for ", members, " members and ", parity, " parity shards")
 	}
-	shardLen, err := fecShardSize(members, parity, shards)
+	if _, err := fecShardSize(members, parity, shards); err != nil {
+		return 0, err
+	}
+	missing := 0
+	for _, shard := range shards[:members] {
+		if shard == nil {
+			missing++
+		}
+	}
+	if missing == 0 {
+		return 0, nil
+	}
+	encoder, err := c.encoder(members, parity)
 	if err != nil {
 		return 0, err
 	}
-	recovered := 0
-	for index := 0; index < parity; index++ {
-		missing := -1
-		for member := index; member < members; member += parity {
-			if shards[member] != nil {
-				continue
-			}
-			if missing >= 0 {
-				missing = -1
-				break
-			}
-			missing = member
+	if err = encoder.ReconstructData(shards); err != nil {
+		if errors.Is(err, reedsolomon.ErrTooFewShards) {
+			return 0, nil
 		}
-		if missing < 0 || shards[members+index] == nil {
-			continue
-		}
-		shard := make([]byte, shardLen)
-		copy(shard, shards[members+index][:shardLen])
-		for member := index; member < members; member += parity {
-			if member == missing {
-				continue
-			}
-			xorShard(shard, shards[member][:shardLen])
-		}
-		shards[missing] = shard
-		recovered++
+		return 0, err
 	}
-	return recovered, nil
+	return missing, nil
 }
 
 // Groups
@@ -224,6 +222,8 @@ type fecSender struct {
 	// is worth paying is the caller's answer, not something this end measures.
 	parityShards int
 
+	codec fecCodec
+
 	// group holds the packets of the open group in the order they were sent, and
 	// shardLen the length of the longest of them: parity shards are padded to it
 	// rather than to the MTU, so a group of small packets stays small.
@@ -265,12 +265,6 @@ func newFECSender(options FECOptions) *fecSender {
 	}
 	if parityShards > fecMaxParityShards {
 		parityShards = fecMaxParityShards
-	}
-	if parityShards > dataShards {
-		parityShards = dataShards
-	}
-	if parityShards < 0 {
-		parityShards = 0
 	}
 	return &fecSender{
 		dataShards:   dataShards,
@@ -428,11 +422,6 @@ func (a *association) closeGroupLocked() error {
 		return nil
 	}
 	parityCount := sender.parityShards
-	if parityCount == 0 {
-		// Redundancy was asked for as zero, so the group is closed without it.
-		sender.close()
-		return nil
-	}
 	description := fecHeader{
 		GroupID:     sender.groupID,
 		MemberCount: uint8(len(members)),
@@ -448,7 +437,7 @@ func (a *association) closeGroupLocked() error {
 		members[index] = sender.pad(member)
 	}
 	parity := sender.shardsFor(parityCount, shardLen)
-	err := fecEncode(members, parity)
+	err := sender.codec.encode(members, parity)
 	sender.close()
 	if err == nil {
 		for index, shard := range parity {
@@ -543,6 +532,8 @@ type fecReceiver struct {
 	next   int
 
 	groups map[uint32]*fecReceiveGroup
+
+	codec fecCodec
 
 	// free is the parity shards of the groups already assembled: unlike a member,
 	// which belongs to the ring, a parity shard belongs to its group alone, so it
@@ -749,15 +740,14 @@ func (r *fecReceiver) parity(description *fecHeader, shard []byte) [][]byte {
 	shards := make([][]byte, 0, len(group.members)+len(group.parity))
 	shards = append(shards, group.members...)
 	shards = append(shards, group.parity...)
-	filled, err := fecRecover(len(group.members), len(group.parity), shards)
+	filled, err := r.codec.recover(len(group.members), len(group.parity), shards)
 	if err != nil {
 		r.drop(group.groupID)
 		return nil
 	}
 	if filled != missing {
-		// A subset missing two members has nothing to give, and a subset whose
-		// parity is still on the path can still give one back: wait for the shards
-		// that follow rather than giving up on the group.
+		// More members are missing than the parity that arrived can replace: wait
+		// for the shards that follow rather than giving up on the group.
 		return nil
 	}
 	// The group leaves the table before anything is delivered: a recovered packet

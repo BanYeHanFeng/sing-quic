@@ -128,8 +128,8 @@ type FECOptions struct {
 	// correction.
 	DataShards int
 
-	// ParityShards is how many redundant packets a group gets, up to the number of
-	// members. Zero means the default of two.
+	// ParityShards is how many redundant packets a group gets. Zero means the
+	// default of two.
 	ParityShards int
 }
 

@@ -385,10 +385,11 @@ func TestFECParityIsTheCallers(t *testing.T) {
 	if parity := fixed.parityShards; parity != 3 {
 		t.Fatalf("%d parity shards for a group that asked for three", parity)
 	}
-	// More redundancy than members is not redundancy.
-	capped := newFECSender(FECOptions{DataShards: 2, ParityShards: 8})
-	if parity := capped.parityShards; parity != 2 {
-		t.Fatalf("%d parity shards for a group of two members", parity)
+	// Redundancy above the ceiling is the ceiling: eight shards is what the wire
+	// description of a group is bounded by, not a shape a caller may exceed.
+	capped := newFECSender(FECOptions{DataShards: 2, ParityShards: 9})
+	if parity := capped.parityShards; parity != fecMaxParityShards {
+		t.Fatalf("%d parity shards for a group that asked for nine", parity)
 	}
 	if sender := newFECSender(FECOptions{DataShards: 0}); sender != nil {
 		t.Fatal("zero data shards did not turn forward error correction off")
@@ -512,7 +513,8 @@ func TestFECRingDropsStaleGroup(t *testing.T) {
 	for index := range parity {
 		parity[index] = make([]byte, shardLen)
 	}
-	err := fecEncode(members, parity)
+	var codec fecCodec
+	err := codec.encode(members, parity)
 	if err != nil {
 		t.Fatal(err)
 	}

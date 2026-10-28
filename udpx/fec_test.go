@@ -23,25 +23,25 @@ func fecTestShards(members, parity, shardLen int, seed int64) ([][]byte, [][]byt
 	return shards, parityShards
 }
 
-// TestFECEncodeRecover requires a group to come back from one missing member
-// wherever it is, and from two only when they fall in different subsets: a subset
-// missing two has nothing to give, which is the price of a code whose parity is a
-// xor instead of a matrix row.
+// TestFECEncodeRecover requires a group to come back from as many missing members
+// as it has parity shards, wherever they fell: the code reconstructs from any k of
+// the k+m shards, so the position of a loss is not part of the question.
 func TestFECEncodeRecover(t *testing.T) {
 	for _, members := range []int{1, 2, 3, 4, 5, 6, 8, 32} {
 		for _, parity := range []int{1, 2, 3} {
-			if parity > members || members+parity > 40 {
+			if members+parity > 40 {
 				continue
 			}
 			for shardLen := 1; shardLen <= 9; shardLen += 4 {
 				original, parityShards := fecTestShards(members, parity, shardLen, int64(members*100+parity*10+shardLen))
-				if err := fecEncode(original, parityShards); err != nil {
+				var codec fecCodec
+				if err := codec.encode(original, parityShards); err != nil {
 					t.Fatalf("%d/%d: encode: %v", members, parity, err)
 				}
 				for lost := 0; lost < members; lost++ {
 					shards := fecGroup(original, parityShards)
 					shards[lost] = nil
-					filled, err := fecRecover(members, parity, shards)
+					filled, err := codec.recover(members, parity, shards)
 					if err != nil {
 						t.Fatalf("%d/%d: recover %d: %v", members, parity, lost, err)
 					}
@@ -55,12 +55,12 @@ func TestFECEncodeRecover(t *testing.T) {
 						shards := fecGroup(original, parityShards)
 						shards[first] = nil
 						shards[second] = nil
-						filled, err := fecRecover(members, parity, shards)
+						filled, err := codec.recover(members, parity, shards)
 						if err != nil {
 							t.Fatalf("%d/%d: recover %d and %d: %v", members, parity, first, second, err)
 						}
 						want := 0
-						if first%parity != second%parity {
+						if parity >= 2 {
 							want = 2
 						}
 						if filled != want {
@@ -129,14 +129,14 @@ func TestFECRecoverByPacketBytes(t *testing.T) {
 		copy(shards[index], member)
 	}
 	parityShards := [][]byte{make([]byte, shardLen), make([]byte, shardLen)}
-	err := fecEncode(shards, parityShards)
+	var codec fecCodec
+	err := codec.encode(shards, parityShards)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Lose two members in different subsets, which is what the two parity shards
-	// replace: members 1 and 2 are one of each.
+	// Lose two members anywhere: two parity shards replace two members.
 	recovered := [][]byte{shards[0], nil, nil, shards[3], parityShards[0], parityShards[1]}
-	filled, err := fecRecover(len(members), 2, recovered)
+	filled, err := codec.recover(len(members), 2, recovered)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,15 +161,16 @@ func TestFECRecoverByPacketBytes(t *testing.T) {
 // so a group description the wire allows but the code cannot serve is dropped
 // instead of producing garbage that then fails authentication.
 func TestFECRejects(t *testing.T) {
+	var codec fecCodec
 	shards := [][]byte{make([]byte, 4), make([]byte, 4), make([]byte, 4)}
-	if err := fecEncode(nil, shards[:1]); err == nil {
+	if err := codec.encode(nil, shards[:1]); err == nil {
 		t.Fatal("a group of no members was encoded")
 	}
-	if err := fecEncode(shards, nil); err == nil {
+	if err := codec.encode(shards, nil); err == nil {
 		t.Fatal("a group of no parity shards was encoded")
 	}
 	uneven := [][]byte{make([]byte, 4), make([]byte, 5)}
-	if err := fecEncode(uneven, shards[:1]); err == nil {
+	if err := codec.encode(uneven, shards[:1]); err == nil {
 		t.Fatal("shards of different lengths were encoded")
 	}
 	// 300 shards do not fit in the two bytes that describe a group.
@@ -177,25 +178,27 @@ func TestFECRejects(t *testing.T) {
 	for index := range tooMany {
 		tooMany[index] = make([]byte, 1)
 	}
-	if err := fecEncode(tooMany[:200], tooMany[200:]); err == nil {
+	if err := codec.encode(tooMany[:200], tooMany[200:]); err == nil {
 		t.Fatal("a group of 300 shards was encoded")
 	}
 	// k of k+m is the minimum: one short and nothing is promised.
 	full := [][]byte{make([]byte, 4), make([]byte, 4), make([]byte, 4)}
-	if _, err := fecRecover(3, 1, full[:2]); err == nil {
+	if _, err := codec.recover(3, 1, full[:2]); err == nil {
 		t.Fatal("a group without enough shards was recovered")
 	}
-	missing := [][]byte{make([]byte, 4), nil, nil}
-	if _, err := fecRecover(3, 1, missing); err == nil {
-		t.Fatal("a group without enough shards was recovered")
+	// Two members missing and one parity shard to replace them: nothing is filled
+	// in, but the group is not an error — a shard still on the path may arrive.
+	short := [][]byte{make([]byte, 4), nil, nil, nil}
+	if filled, err := codec.recover(3, 1, short); err != nil || filled != 0 {
+		t.Fatalf("%d members filled in from a group that is two shards short", filled)
 	}
-	if _, err := fecRecover(2, 1, [][]byte{make([]byte, 4), make([]byte, 4)}); err == nil {
+	if _, err := codec.recover(2, 1, [][]byte{make([]byte, 4), make([]byte, 4)}); err == nil {
 		t.Fatal("a group of the wrong number of shards was recovered")
 	}
-	// Two members of the same subset cannot be recovered, which is the shape the
-	// code refuses rather than one it gets wrong.
+	// One member short is what one parity shard is for, so this one comes back
+	// where the interleaved code would have refused it.
 	together := [][]byte{nil, make([]byte, 4), nil, make([]byte, 4), make([]byte, 4), make([]byte, 4)}
-	if filled, err := fecRecover(4, 2, together); err != nil || filled != 0 {
+	if filled, err := codec.recover(4, 2, together); err != nil || filled != 2 {
 		t.Fatalf("%d members filled in for two missing from one subset", filled)
 	}
 }
