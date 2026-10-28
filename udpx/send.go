@@ -324,10 +324,13 @@ func (s *sentPackets) lost(now time.Time, largestAcked uint32, lossDelay time.Du
 }
 
 // remove drops one packet from flight, which is what a failed write leaves
-// behind: the packet never left, so nothing will acknowledge it.
-func (s *sentPackets) remove(packet *sentPacket) {
-	s.markRemoved(packet)
+// behind: the packet never left, so nothing will acknowledge it. It reports
+// whether the packet was still in flight: one that an answer already settled is
+// not one to send again.
+func (s *sentPackets) remove(packet *sentPacket) bool {
+	removed := s.markRemoved(packet)
 	s.compact()
+	return removed
 }
 
 // oldest returns the packet that has been in flight longest.
@@ -798,21 +801,69 @@ func (a *association) writeBatch() error {
 	a.sendMu.Unlock()
 	err := a.batchIO.WritePackets(current.packets)
 	if err != nil {
-		if a.writingProbe.Load() && isMessageTooLong(err) {
-			// The probe was the one packet larger than the path: the socket said so
-			// before anything else had to be written, and the size it refused is
-			// the size that is not available. The batch is emptied like any other,
-			// or the room the refused packet took would be held until the next
-			// probe.
-			current.reset()
-			a.mtuProbeFailed()
-			return nil
+		if isMessageTooLong(err) {
+			if a.writingProbe.Load() {
+				// The probe was the one packet larger than the path: the socket said so
+				// before anything else had to be written, and the size it refused is
+				// the size that is not available. The batch is emptied like any other,
+				// or the room the refused packet took would be held until the next
+				// probe.
+				current.reset()
+				a.mtuProbeFailed()
+				return nil
+			}
+			if a.writeTooLong(written) {
+				current.reset()
+				return nil
+			}
 		}
 		a.writeFailed(written, err)
 		return err
 	}
 	current.reset()
 	return nil
+}
+
+// writeTooLong is what a batch the socket refused for being larger than the path
+// carries means: the size the association sends with is one the path does not
+// take, so it steps down to the next size that might be, and what the batch
+// carried goes back to the queue to leave again at that size. It reports whether
+// the association has a smaller size to send with, which is what tells the caller
+// to retry rather than to close.
+func (a *association) writeTooLong(failed []pendingPacket) bool {
+	a.sendMu.Lock()
+	refused := a.mtu
+	stepped := a.mtuStepDownLocked()
+	current := a.mtu
+	a.sendMu.Unlock()
+	if !stepped {
+		return false
+	}
+	a.logInfo("mtu ", refused, " refused by the socket, mtu now ", current)
+	a.flightMu.Lock()
+	removed := make([]*sentPacket, 0, len(failed))
+	for index := range failed {
+		packet := failed[index].sent
+		if !packet.ackEliciting {
+			continue
+		}
+		if a.inFlight.remove(packet) {
+			removed = append(removed, packet)
+		}
+	}
+	a.flightMu.Unlock()
+	if len(removed) > 0 {
+		a.sendFramesRetransmitted(retransmittableFrames(removed))
+	}
+	a.flightMu.Lock()
+	empty := a.inFlight.len() == 0
+	a.flightMu.Unlock()
+	if empty {
+		a.disarmPTO()
+	} else {
+		a.armPTO()
+	}
+	return true
 }
 
 // writeFailed takes the packets of a batch the socket refused out of flight and

@@ -257,6 +257,39 @@ func (a *association) mtuProbeFailed() {
 	a.logInfo("mtu ", candidate, " too large for the path")
 }
 
+// mtuStepDownLocked lowers the size the association sends with to the largest
+// candidate below it, and reports whether there was one. The size the socket
+// refused is taken out of the candidates as well, or the next probe would ask
+// about the very size the path just said it does not carry.
+//
+// A size the caller configured is not stepped down from: the caller said what to
+// send with, and a path that refuses it is not one to quietly send something else
+// on. The caller holds sendMu.
+func (a *association) mtuStepDownLocked() bool {
+	if a.options.MTU > 0 {
+		return false
+	}
+	refused := a.mtu
+	next := 0
+	for _, candidate := range a.mtuCandidates {
+		if candidate < refused && candidate > next {
+			next = candidate
+		}
+	}
+	if next == 0 {
+		return false
+	}
+	for index, candidate := range a.mtuCandidates {
+		if candidate == refused {
+			a.mtuCandidates = append(a.mtuCandidates[:index], a.mtuCandidates[index+1:]...)
+			break
+		}
+	}
+	a.mtu = next
+	a.updatePayloadLocked()
+	return true
+}
+
 // updatePayloadLocked recomputes how many payload bytes a packet may carry. The
 // caller holds sendMu.
 func (a *association) updatePayloadLocked() {
