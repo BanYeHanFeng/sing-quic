@@ -999,7 +999,10 @@ func (a *association) handleStreamFrame(data streamData) error {
 			// counted, so the count is what says whether this one existed. A frame
 			// for one that did is what the peer sent before it heard about the end,
 			// however many streams ended here since.
-			if data.streamID>>1 < a.nextStreamID {
+			a.streamsMu.Lock()
+			opened := data.streamID>>1 < a.nextStreamID
+			a.streamsMu.Unlock()
+			if opened {
 				return nil
 			}
 			return E.New("stream frame for stream ", data.streamID, " that was never opened")
