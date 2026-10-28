@@ -3,12 +3,14 @@ package udpx
 import (
 	"context"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/sagernet/sing-quic/congestion"
 	"github.com/sagernet/sing-quic/udpio"
 
 	E "github.com/sagernet/sing/common/exceptions"
+	F "github.com/sagernet/sing/common/format"
 )
 
 // Sending
@@ -822,7 +824,7 @@ func (a *association) writeFailed(failed []pendingPacket, err error) {
 	for index := range failed {
 		sizes = append(sizes, failed[index].sent.size)
 	}
-	a.logDebug("write failed: ", err, " packets=", sizes, " probe=", a.writingProbe.Load())
+	a.logDebug("write failed: ", err, " packets=", len(failed), " sizes=", strings.Join(F.MapToString(sizes), ","), " probe=", a.writingProbe.Load())
 	a.flightMu.Lock()
 	for index := range failed {
 		if failed[index].sent.ackEliciting {
