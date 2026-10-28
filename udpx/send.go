@@ -741,10 +741,14 @@ func (a *association) writeBatch() error {
 	now := time.Now()
 	remote := a.RemoteAddr()
 	current.packets = current.packets[:0]
+	bytes := 0
 	for index := range current.pending {
 		current.pending[index].sent.sentAt = now
+		bytes += current.pending[index].sent.size
 		current.packets = append(current.packets, udpio.Packet{Data: current.pending[index].packet, Addr: remote})
 	}
+	a.stats.sentPackets.Add(int64(len(current.packets)))
+	a.stats.sentBytes.Add(int64(bytes))
 	// The packets are recorded as in flight while the send lock is still held, so
 	// that a frame is reachable from exactly one place at any moment: the queue, the
 	// batch, or the flight table. A reader that took the send lock and then the

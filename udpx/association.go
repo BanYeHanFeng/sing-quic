@@ -537,6 +537,8 @@ func (a *association) handlePacket(packet []byte, source net.Addr) error {
 	if err != nil {
 		return err
 	}
+	a.stats.recvPackets.Add(1)
+	a.stats.recvBytes.Add(int64(len(packet)))
 	if packetHeader.ConnectionID != a.localConnID {
 		return errAuthentication
 	}

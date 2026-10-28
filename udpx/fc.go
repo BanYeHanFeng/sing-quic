@@ -37,22 +37,29 @@ const (
 	// anything: it is the number both ends know without a frame, so it is what a sender
 	// assumes and what a receiver starts out allowing. It is not the budget below — the
 	// budget is announced as soon as the first bytes of a stream arrive.
-	initialStreamWindow = 2 * 1024 * 1024
+	initialStreamWindow = 512 * 1024
 
 	// initialConnectionWindow is the same for the association.
-	initialConnectionWindow = 8 * 1024 * 1024
+	initialConnectionWindow = 2 * 1024 * 1024
 
 	// streamWindow is what one stream is granted once this end has said anything: the
 	// memory one stream may cost, which is two windows of buffer — one the peer may
-	// have in flight and one that arrived behind a hole. Two of these at a 200 ms
-	// round trip is 160 MiB/s of credit, and the congestion controller is what decides
-	// whether a path is given that much.
-	streamWindow = 16 * 1024 * 1024
+	// have in flight and one that arrived behind a hole. At a 200 ms round trip it is
+	// 160 MiB/s of credit, which is more than a path a proxy is used on carries, and
+	// the congestion controller is what decides how much of it is actually used.
+	//
+	// The number is a memory budget and is paid by both ends: what the receiver allows
+	// is what the sender buffers, so a window that is twice what a path needs is twice
+	// the memory on the sending side and twice the memory on the receiving side for
+	// every stream that is being written. Sixteen megabytes of window was 280 MB of
+	// resident memory on a server with four active streams, which is the number this
+	// constant exists to keep bounded.
+	streamWindow = 4 * 1024 * 1024
 
 	// connectionWindow is the same for every stream together, and it is the number
 	// that bounds what one association costs: four streams of the stream window fill
 	// it.
-	connectionWindow = 64 * 1024 * 1024
+	connectionWindow = 16 * 1024 * 1024
 
 	// initialStreams is how many streams this end may open before the peer has said
 	// anything: like the windows above, it is the number both ends know without a

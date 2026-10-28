@@ -92,6 +92,7 @@ func (a *association) sendFramesRetransmitted(frames []outFrame) {
 	if len(frames) == 0 {
 		return
 	}
+	a.stats.retransmits.Add(int64(len(frames)))
 	a.sendMu.Lock()
 	a.queue.pushFront(frames)
 	a.sendMu.Unlock()
@@ -134,6 +135,7 @@ func (a *association) probe() {
 	frames := retransmittableFrames([]*sentPacket{oldest})
 	a.inFlight.remove(oldest)
 	a.probes++
+	a.stats.probes.Add(1)
 	a.flightMu.Unlock()
 
 	a.sendMu.Lock()
@@ -188,6 +190,7 @@ func (a *association) handleAck(body []byte, now time.Time) {
 		a.probes = 0
 	}
 	lost := a.inFlight.lost(now, acknowledgement.largest, lossDelay(a.rtt))
+	a.stats.lostPackets.Add(int64(len(lost)))
 	recovered := retransmittableFrames(lost)
 	empty := a.inFlight.len() == 0
 	a.flightMu.Unlock()
