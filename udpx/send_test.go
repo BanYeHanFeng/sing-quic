@@ -186,7 +186,7 @@ func TestStreamFrameSize(t *testing.T) {
 	data := bytes.Repeat([]byte{0x5a}, 100)
 	for _, fin := range []bool{false, true} {
 		frame := outFrame{
-			stream:       streamFrame{carried: true, data: data, offset: 7, streamID: 3, fin: fin},
+			streamFrame:  streamFrame{carried: true, stream: &Stream{id: 3}, data: data, offset: 7, fin: fin},
 			ackEliciting: true,
 		}
 		encoded := frame.appendTo(nil)

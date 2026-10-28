@@ -42,9 +42,9 @@ type outFrame struct {
 	// payload is the encoded frame, for every frame that is not a stream frame.
 	payload []byte
 
-	// stream is what a stream frame is made of, and is the zero value for an
+	// streamFrame is what a stream frame is made of, and is the zero value for an
 	// encoded one.
-	stream streamFrame
+	streamFrame streamFrame
 
 	// lastSent is the packet number the frame was last sent in.
 	lastSent uint32
@@ -63,6 +63,11 @@ type streamFrame struct {
 	// until it is in a packet.
 	carried bool
 
+	// stream is the stream the frame belongs to, which is what counts the frames
+	// the peer has not acknowledged yet: a stream that closes tells the peer it is
+	// done only once none of them is left.
+	stream *Stream
+
 	// chunk is the send buffer chunk data is a piece of, and the zero value for
 	// a frame that carries no data. The frame is one of the holders of it, and it
 	// gives that up when the peer acknowledged the frame: that is what makes the
@@ -70,24 +75,23 @@ type streamFrame struct {
 	// collection.
 	chunk *sendChunk
 
-	data     []byte
-	offset   uint64
-	streamID uint32
-	fin      bool
+	data   []byte
+	offset uint64
+	fin    bool
 }
 
 // size is how many bytes the frame takes in a packet.
 func (f outFrame) size() int {
-	if f.stream.carried {
-		return streamFixedLen + len(f.stream.data)
+	if f.streamFrame.carried {
+		return streamFixedLen + len(f.streamFrame.data)
 	}
 	return len(f.payload)
 }
 
 // appendTo appends the frame to dst, encoding a stream frame now.
 func (f outFrame) appendTo(dst []byte) []byte {
-	if f.stream.carried {
-		return appendStream(dst, f.stream.streamID, f.stream.offset, f.stream.fin, f.stream.data)
+	if f.streamFrame.carried {
+		return appendStream(dst, f.streamFrame.stream.id, f.streamFrame.offset, f.streamFrame.fin, f.streamFrame.data)
 	}
 	return append(dst, f.payload...)
 }
@@ -97,15 +101,19 @@ func (f outFrame) appendTo(dst []byte) []byte {
 // a lost one goes back to the queue and is planned into the next packet instead of
 // staying in the one it was lost in — so this is where its hold on the chunk ends,
 // and the last holder of a chunk is what puts it back in the pool.
+//
+// What it does not do is count the frame as acknowledged for its stream: that is what
+// a reset waits for, and it is done outside the flight lock (ackStreamFrames), so that
+// the count and the release of the chunk stay in one critical section.
 func releaseFrames(frames []outFrame) {
 	for index := range frames {
-		chunk := frames[index].stream.chunk
+		chunk := frames[index].streamFrame.chunk
 		if chunk == nil {
 			continue
 		}
 		// The frame is not going to be sent again, so the reference goes with the
 		// hold: a second pass over the same frames releases nothing.
-		frames[index].stream.chunk = nil
+		frames[index].streamFrame.chunk = nil
 		chunk.release()
 	}
 }
@@ -195,7 +203,7 @@ func (q *frameQueue) takePrefix(count int) []outFrame {
 
 // frameType returns the type of the frame the entry carries.
 func (f outFrame) frameType() frameType {
-	if f.stream.carried {
+	if f.streamFrame.carried {
 		return frameTypeStream
 	}
 	return frameType(f.payload[0] & frameTypeBits)

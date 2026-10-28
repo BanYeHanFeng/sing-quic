@@ -473,7 +473,7 @@ func (a *association) queueFrame(frame []byte) {
 func (a *association) queueStreamFrame(frame streamFrame) {
 	a.sendMu.Lock()
 	a.queue.push(outFrame{
-		stream:       frame,
+		streamFrame:  frame,
 		ackEliciting: true,
 	})
 	a.sendMu.Unlock()

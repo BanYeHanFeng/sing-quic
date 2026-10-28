@@ -115,6 +115,13 @@ type Stream struct {
 	closeWrite    bool
 	finSent       bool
 	writeDeadline pipe.Deadline
+	// sendPending is how many frames of this stream the peer has not acknowledged,
+	// and resetOwed says the reset the close of the stream owes the peer waits for
+	// them: a reset ends the stream in both directions at the peer, so one that
+	// overtakes the last data packet makes the peer drop the tail of what was
+	// written.
+	sendPending int
+	resetOwed   bool
 
 	// The recv half: data received out of order, how much was read, and the credit
 	// this end granted. recvWindow is the budget this end allows the stream to cost,
@@ -380,11 +387,11 @@ func (s *Stream) sendQueued() error {
 			// bytes alive from here until the peer acknowledged them.
 			head.retain()
 			frame = streamFrame{
-				carried:  true,
-				data:     pending[:length],
-				chunk:    head,
-				offset:   s.sendFramed,
-				streamID: s.id,
+				carried: true,
+				stream:  s,
+				data:    pending[:length],
+				chunk:   head,
+				offset:  s.sendFramed,
 			}
 			s.sendFramed += uint64(length)
 			head.start += length
@@ -398,12 +405,15 @@ func (s *Stream) sendQueued() error {
 			// The FIN carries the offset the data ends at, so it does not have to
 			// wait for anything else, only for the data before it to be framed.
 			frame = streamFrame{
-				carried:  true,
-				offset:   s.sendOffset,
-				streamID: s.id,
-				fin:      true,
+				carried: true,
+				stream:  s,
+				offset:  s.sendOffset,
+				fin:     true,
 			}
 			s.finSent = true
+		}
+		if frame.carried {
+			s.sendPending++
 		}
 		s.sendMu.Unlock()
 		if !frame.carried {
@@ -432,7 +442,10 @@ func (s *Stream) CloseWrite() error {
 // The peer has to hear about it, unless its half was already complete: a stream that
 // ended on both sides needs no announcement, while one the application abandoned
 // would otherwise keep the peer writing into a stream nobody reads, and the entry
-// would stay here until the association closed.
+// would stay here until the association closed. That announcement is a reset, and a
+// reset ends the stream in both directions at the peer — so it waits until what this
+// end wrote is acknowledged, which is what keeps a connection closed right after a
+// write from losing the tail of it.
 func (s *Stream) Close() error {
 	_ = s.CloseWrite()
 	s.recvMu.Lock()
@@ -443,7 +456,7 @@ func (s *Stream) Close() error {
 	if finished {
 		s.association.removeStream(s.id)
 	} else {
-		s.association.resetStream(s.id)
+		s.association.resetStream(s)
 	}
 	return nil
 }
@@ -834,9 +847,54 @@ func (e *endedStreams) has(id uint32) bool {
 	return false
 }
 
+// ackStreamFrames records the frames of the acknowledged packets, which is what tells
+// a stream that closed that the peer has everything it wrote: the reset it owes goes
+// out once the last of them is acknowledged. It runs outside the flight lock, because
+// the last frame of a stream sends that reset and that takes the stream's lock, which
+// the send path takes before the flight one.
+func (a *association) ackStreamFrames(acked []*sentPacket) {
+	for _, packet := range acked {
+		for index := range packet.frames {
+			stream := packet.frames[index].streamFrame.stream
+			if stream != nil {
+				stream.frameAcked()
+			}
+		}
+	}
+}
+
+// frameAcked records that the peer acknowledged one frame of the stream, and sends
+// the reset the close of the stream was waiting for once none is left.
+func (s *Stream) frameAcked() {
+	s.sendMu.Lock()
+	s.sendPending--
+	due := s.sendPending == 0 && s.resetOwed
+	if due {
+		s.resetOwed = false
+	}
+	s.sendMu.Unlock()
+	if due {
+		s.association.sendReset(s.id)
+	}
+}
+
+// oweReset says the reset waits for the frames still in flight, and reports whether
+// it does: false means nothing of this stream is out there, and the caller announces
+// it now.
+func (s *Stream) oweReset() bool {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	if s.sendPending == 0 {
+		return false
+	}
+	s.resetOwed = true
+	return true
+}
+
 // removeStream forgets a stream that ended, which frees the entry and, for a stream
-// the peer opened, the slot it held against the stream budget.
-func (a *association) removeStream(id uint32) {
+// the peer opened, the slot it held against the stream budget. It reports whether
+// the stream was still there.
+func (a *association) removeStream(id uint32) bool {
 	a.streamsMu.Lock()
 	stream, loaded := a.streams[id]
 	delete(a.streams, id)
@@ -854,6 +912,7 @@ func (a *association) removeStream(id uint32) {
 	if freed {
 		_ = a.send(appendMaxStreams(nil, limit))
 	}
+	return loaded
 }
 
 // acceptedStream takes one stream out of the accept queue. A stream that ended while
@@ -883,10 +942,30 @@ func (a *association) streamEnded(id uint32) bool {
 }
 
 // resetStream ends a stream the application abandoned: the peer is told to stop
-// writing into it, and the stream is forgotten here at once rather than when the
-// peer's half closes, which may never happen.
-func (a *association) resetStream(id uint32) {
-	a.removeStream(id)
+// writing into it, and the stream is forgotten here rather than when the peer's half
+// closes, which may never happen.
+//
+// The announcement waits for what this end wrote to be acknowledged, and the stream
+// stays in the table meanwhile: a reset ends the stream in both directions at the
+// peer, so one that overtakes the last data packet — the packet was lost and the
+// reset was not — makes the peer throw away the tail of what was written, which is a
+// truncated connection rather than a closed one. Until then what arrives for the
+// stream is dropped, and the peer stalls at the window instead of spending the path
+// on bytes nobody reads.
+func (a *association) resetStream(stream *Stream) {
+	if stream.oweReset() {
+		return
+	}
+	a.sendReset(stream.id)
+}
+
+// sendReset announces the reset and forgets the stream. A stream that ended on its
+// own by now needs no announcement: the peer closed its half and this end closed its
+// own, and there is nothing left to tell it.
+func (a *association) sendReset(id uint32) {
+	if !a.removeStream(id) {
+		return
+	}
 	_ = a.send(appendResetStream(nil, id, resetCodeNormal))
 }
 

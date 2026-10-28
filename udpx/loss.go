@@ -180,6 +180,9 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	} else {
 		a.armPTO()
 	}
+	// The window is what the reset a stream owes goes out on, so the streams hear
+	// about their acknowledged frames after the controller heard about the packets.
+	a.ackStreamFrames(acked)
 	if len(recovered) > 0 {
 		_ = a.sendFramesRetransmitted(recovered)
 	}

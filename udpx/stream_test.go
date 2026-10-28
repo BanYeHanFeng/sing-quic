@@ -421,14 +421,13 @@ func TestStreamResetByClose(t *testing.T) {
 		t.Fatalf("the request arrived as %q", read)
 	}
 	// The peer never closed its half, so the stream is abandoned rather than
-	// finished, and the peer is what hears about it.
+	// finished, and the peer is what hears about it: the reset waits for what was
+	// written to be acknowledged, so the stream is released a round trip later.
 	err = stream.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count := streamCount(t, client); count != 0 {
-		t.Fatalf("%d streams are still open after a close", count)
-	}
+	waitStreamCount(t, client, 0)
 	buffer := make([]byte, 1)
 	_, err = accepted.Read(buffer)
 	if !errors.Is(err, net.ErrClosed) && err != io.EOF {
@@ -454,6 +453,81 @@ func TestStreamResetByClose(t *testing.T) {
 	}
 	if read := readAll(t, next, 4); string(read) != "next" {
 		t.Fatalf("the next stream carried %q", read)
+	}
+}
+
+// droppingConn is a socket that loses the first packets longer than a threshold,
+// which is how a path that loses one packet in a hundred is asked to lose the one
+// that matters: a full data frame is the only packet an association sends that is
+// longer than an acknowledgement.
+type droppingConn struct {
+	net.PacketConn
+	longer int
+	drops  int
+}
+
+func (c *droppingConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	for {
+		n, from, err := c.PacketConn.ReadFrom(p)
+		if err != nil {
+			return n, from, err
+		}
+		if c.drops > 0 && n > c.longer {
+			c.drops--
+			continue
+		}
+		return n, from, nil
+	}
+}
+
+// TestStreamCloseKeepsTheLastPacket requires a connection that writes and closes at
+// once to deliver what it wrote when the packet carrying it is lost: the reset that
+// tells the peer the stream is over ends it in both directions there, so one that
+// overtakes the data is a connection truncated by its own close.
+func TestStreamCloseKeepsTheLastPacket(t *testing.T) {
+	password := NewPassword("password")
+	listenerConn := udpConn(t)
+	listener := ListenPacket(&droppingConn{
+		PacketConn: listenerConn,
+		longer:     maxPacketSize - 16,
+		drops:      1,
+	}, testVerifier{password}, Options{})
+	defer listener.Close()
+	ctx := testContext(t, 30*time.Second)
+	client, err := Dial(ctx, udpConn(t), listenerConn.LocalAddr(), password, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseWithError(nil)
+	server, err := listener.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.CloseWithError(nil)
+
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One frame fills a packet, so the data and the FIN the close queues behind it
+	// go out in packets of their own: what the path loses is the data.
+	payload := testPayload(client.(*association).streamDataLen())
+	if _, err = stream.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err = stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, err := readToEnd(accepted, len(payload))
+	if err != nil {
+		t.Fatalf("the stream ended after %d of %d bytes: %v", len(read), len(payload), err)
+	}
+	if !bytes.Equal(read, payload) {
+		t.Fatal("the payload changed on the way")
 	}
 }
 
@@ -713,7 +787,7 @@ func checkSendChunkHolds(conn *association) string {
 	references := make(map[*sendChunk]int)
 	count := func(frames []outFrame) {
 		for index := range frames {
-			if chunk := frames[index].stream.chunk; chunk != nil {
+			if chunk := frames[index].streamFrame.chunk; chunk != nil {
 				references[chunk]++
 			}
 		}
