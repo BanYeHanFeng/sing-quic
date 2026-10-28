@@ -494,7 +494,7 @@ func TestStreamCloseKeepsTheLastPacket(t *testing.T) {
 	}, testVerifier{password}, Options{})
 	defer listener.Close()
 	ctx := testContext(t, 30*time.Second)
-	client, err := Dial(ctx, udpConn(t), listenerConn.LocalAddr(), password, Options{})
+	client, err := Dial(ctx, udpConn(t), listenerConn.LocalAddr(), password, Options{MTU: mtuIPv4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,9 +641,9 @@ func TestStreamFinBeforeData(t *testing.T) {
 	conn := newFakeConn()
 	listenerConn := udpConn(t)
 	password := NewPassword("password")
-	listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
 	defer listener.Close()
-	client, err := Dial(testContext(t, 5*time.Second), conn, listenerConn.LocalAddr(), password, Options{})
+	client, err := Dial(testContext(t, 5*time.Second), conn, listenerConn.LocalAddr(), password, Options{MTU: mtuIPv4})
 	if err != nil {
 		// The fake socket answers nothing, so the stream is driven directly below.
 		_ = client
@@ -825,11 +825,11 @@ func checkSendChunkHolds(conn *association) string {
 func TestSendChunksHoldWhatPointsIntoThem(t *testing.T) {
 	password := NewPassword("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: 0.2})
 	ctx := testContext(t, 60*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{})
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
 	if err != nil {
 		t.Fatal(err)
 	}

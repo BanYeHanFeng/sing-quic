@@ -65,7 +65,16 @@ const (
 	// above are already sent by deployed peers, so a new type goes at the end
 	// rather than beside the frames it belongs with.
 	frameTypeMaxStreams
+
+	// frameTypePadding is bytes that carry nothing. It exists so that a packet can
+	// be made as large as a path is being asked to carry: path MTU discovery needs
+	// a packet of the size it is testing, and what is in it is irrelevant as long
+	// as the peer can skip it.
+	frameTypePadding
 )
+
+// Layout of a padding frame: the type byte and how many bytes follow it.
+const paddingFixedLen = 1 + 2
 
 // Layout of the type byte.
 const (
@@ -195,6 +204,15 @@ func nextFrame(payload []byte) (frame, []byte, error) {
 			return frame{}, nil, errShortFrame
 		}
 		return frame{frameType: frameTypeMaxStreams, body: payload[1:5]}, payload[5:], nil
+	case frameTypePadding:
+		if flags != 0 || len(payload) < paddingFixedLen {
+			return frame{}, nil, errShortFrame
+		}
+		length := int(binary.BigEndian.Uint16(payload[1:3]))
+		if len(payload) < paddingFixedLen+length {
+			return frame{}, nil, errShortFrame
+		}
+		return frame{frameType: frameTypePadding}, payload[paddingFixedLen+length:], nil
 	default:
 		return frame{}, nil, E.New("unknown frame type ", int(payload[0]))
 	}
@@ -347,6 +365,13 @@ func closeCodeOf(err error) closeCode {
 
 func appendPing(dst []byte) []byte {
 	return append(dst, byte(frameTypePing))
+}
+
+// appendPadding appends a padding frame carrying length bytes of nothing.
+func appendPadding(dst []byte, length int) []byte {
+	dst = append(dst, byte(frameTypePadding))
+	dst = binary.BigEndian.AppendUint16(dst, uint16(length))
+	return append(dst, make([]byte, length)...)
 }
 
 func appendClose(dst []byte, code closeCode) []byte {

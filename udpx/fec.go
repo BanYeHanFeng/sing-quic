@@ -335,8 +335,8 @@ func (s *fecSender) pad(member []byte) []byte {
 // protects its packets: a parity shard is as long as the longest member and it
 // describes the group in its clear header, so members give up the room that
 // description needs, and the parity packet is never larger than a member.
-func (s *fecSender) payloadBudget() int {
-	return maxPacketSize - 2*(headerLen+tagLen) - fecFixedLen - fecLengthLen*s.dataShards
+func (s *fecSender) payloadBudget(mtu int) int {
+	return mtu - 2*(headerLen+tagLen) - fecFixedLen - fecLengthLen*s.dataShards
 }
 
 // open reports whether a group is waiting for more members.

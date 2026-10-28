@@ -240,12 +240,12 @@ func TestTransferUnderLoss(t *testing.T) {
 		t.Run(testName(loss), func(t *testing.T) {
 			password := NewPassword("password")
 			listenerConn := udpConn(t)
-			listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
+			listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
 			defer listener.Close()
 			link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: loss})
 
 			ctx := testContext(t, 60*time.Second)
-			client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{})
+			client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -313,7 +313,7 @@ func TestStreamOverALossyCapacityPath(t *testing.T) {
 	const capacity = 12.5 * 1024 * 1024
 	password := NewPassword("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
 		loss:   0.05,
@@ -323,7 +323,7 @@ func TestStreamOverALossyCapacityPath(t *testing.T) {
 	})
 
 	ctx := testContext(t, 60*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{})
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
 	if err != nil {
 		t.Fatal(err)
 	}

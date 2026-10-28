@@ -147,6 +147,11 @@ func (a *association) probe() {
 	a.probeCredits++
 	a.sendMu.Unlock()
 	a.wake()
+	// The timer is rearmed here rather than by the send path: a probe that is
+	// waiting behind a batch is still a question that has to be repeated if the
+	// path stays quiet, and the send path only arms it when it finds nothing in
+	// flight.
+	a.armPTO()
 }
 
 // handleAck takes the acknowledged packets out of flight, samples the round trip,
@@ -157,6 +162,7 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	if err != nil {
 		return
 	}
+	a.mtuProbeConfirmed(acknowledgement)
 	a.flightMu.Lock()
 	priorInFlight := a.inFlight.bytes
 	acked := a.inFlight.acked(acknowledgement.ranges[:acknowledgement.count])

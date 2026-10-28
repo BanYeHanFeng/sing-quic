@@ -174,6 +174,7 @@ func (l *Listener) completeHandshake(hello []byte, source net.Addr) {
 		a.shutdown(err, false)
 		return
 	}
+	go a.startMTUProbe()
 	select {
 	case l.accept <- a:
 	default:

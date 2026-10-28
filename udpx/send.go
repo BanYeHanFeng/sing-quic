@@ -235,6 +235,10 @@ type sentPacket struct {
 	// thing it does not carry is a frame to send again: a parity shard that is lost
 	// cost a shard, not a promise.
 	parity bool
+	// mtuProbe says the packet is a path MTU probe. It asks a question, so it is
+	// never retransmitted and never counts against the window: a question that
+	// costs a window is a question the window can refuse to ask.
+	mtuProbe bool
 	// removed says the packet left the flight table. The entry stays in the
 	// ordered slice until the next compaction, because an acknowledgement covers
 	// a range of packet numbers and rewriting the whole table once per range is
@@ -785,6 +789,13 @@ func (a *association) writeBatch() error {
 	a.sendMu.Unlock()
 	err := a.batchIO.WritePackets(current.packets)
 	if err != nil {
+		if a.writingProbe.Load() && isMessageTooLong(err) {
+			// The probe was the one packet larger than the path: the socket said so
+			// before anything else had to be written, and the size it refused is
+			// the size that is not available.
+			a.mtuProbeFailed()
+			return nil
+		}
 		a.writeFailed(written, err)
 		return err
 	}

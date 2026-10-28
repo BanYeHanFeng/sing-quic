@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing-quic/udpio"
 
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 )
 
 // Association is one association between a client and a server.
@@ -102,6 +103,17 @@ type Options struct {
 	// protects one direction only, so an association that should survive a lossy
 	// path in both directions sets it on both ends.
 	FEC FECOptions
+
+	// MTU is the largest packet this end sends, or zero to discover it. A path
+	// whose size is known is a path whose probes are wasted packets, and a path
+	// that is known to be smaller than the address family suggests is one the
+	// discovery would have to walk down to.
+	MTU int
+
+	// Logger receives what the transport says about itself: one line per event at
+	// trace level and one line of numbers per second at debug level. Nil means
+	// nobody is watching, and costs nothing.
+	Logger logger.Logger
 }
 
 // FECOptions is how a sender protects its packets with forward error correction.
@@ -161,6 +173,8 @@ type association struct {
 	keyID       [keyIDLen]byte
 	conn        net.PacketConn
 	options     Options
+	logger      logger.Logger
+	stats       associationStats
 	ctx         context.Context
 	cancel      context.CancelCauseFunc
 
@@ -181,6 +195,15 @@ type association struct {
 	// the window.
 	batchIO udpio.Conn
 	batch   *batch
+	// mtu is the largest packet this end sends: what the path between the two
+	// ends carries, discovered rather than assumed (mtu.go). It bounds the payload
+	// of a packet and, with FEC, the budget a group is encoded with. mtuCandidates
+	// is the list it walks down when a size is not carried, and mtuProbe is the
+	// question about the current one that has not been answered yet.
+	mtu            int
+	mtuCandidates  []int
+	mtuProbe       mtuProbeState
+	writingProbe   atomic.Bool
 	// pumpMu serializes whoever sends: the send loop owns the send path, and flush
 	// borrows it. A pump is one pass over the queue, not one packet, so the lock is
 	// held for a batch and not for a write.
@@ -305,6 +328,7 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		keyID:           result.keyID,
 		conn:            conn,
 		options:         options.withDefaults(),
+		logger:          options.Logger,
 		ctx:             ctx,
 		cancel:          cancel,
 		sendRing:        result.send,
@@ -331,10 +355,14 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 	// The controller comes first: a timer that fires before it exists would send
 	// through a half built association, and the idle timer is armed with the
 	// configured timeout, which may be short enough to win the race.
+	a.mtu, a.mtuCandidates = defaultMTU(peer)
+	if options.MTU > 0 {
+		a.mtu = min(options.MTU, a.mtu)
+	}
+	a.updatePayloadLocked()
 	a.cc = newCongestionController()
 	a.cc.SetRTTStatsProvider(&a.rttStats)
 	if a.fecSender != nil {
-		a.maxPayload = a.fecSender.payloadBudget()
 		a.fecSender.timer = time.AfterFunc(time.Hour, a.flushFECGroup)
 		a.fecSender.timer.Stop()
 	}
@@ -359,7 +387,21 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 	if a.options.KeepAlivePeriod > 0 {
 		go a.keepAliveLoop()
 	}
+	if a.logger != nil {
+		go a.statsLoop()
+	}
+	gso, gro := a.Offload()
+	a.logInfo("association up local=", a.localConnID, " peer=", a.peerConnID, " client=", isClient,
+		" remote=", peer, " gso=", gso, " gro=", gro, " mtu=", a.maxPacketSize())
 	return a
+}
+
+// maxPacketSize is the largest packet this end sends right now. It is a method
+// rather than the constant because the path decides it: what fits is what the
+// smallest link between the two ends carries, and that is a number this end has to
+// discover (see mtu.go).
+func (a *association) maxPacketSize() int {
+	return a.mtu
 }
 
 func (a *association) LocalAddr() net.Addr {
@@ -554,6 +596,9 @@ func (a *association) handlePacket(packet []byte, source net.Addr) error {
 		case frameTypeMaxStreams:
 			ackEliciting = true
 			a.handleMaxStreams(binary.BigEndian.Uint32(f.body))
+		case frameTypePadding:
+			// Nothing to do: padding exists to make a packet the size a path is
+			// being asked to carry.
 		}
 	}
 	if ackEliciting {
@@ -698,6 +743,7 @@ func Dial(ctx context.Context, conn net.PacketConn, remote net.Addr, credential 
 	}
 	a := newAssociation(conn, result, remote, options, true, true)
 	go a.readLoop()
+	go a.startMTUProbe()
 	return a, nil
 }
 

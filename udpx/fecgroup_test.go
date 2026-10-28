@@ -318,11 +318,11 @@ func TestFECOverLossyLink(t *testing.T) {
 func testFECOverLossyLink(t *testing.T, fecOptions FECOptions) {
 	password := NewPassword("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: 0.05, delay: 20 * time.Millisecond})
 	ctx := testContext(t, 120*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{FEC: fecOptions})
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4, FEC: fecOptions})
 	if err != nil {
 		t.Fatal(err)
 	}

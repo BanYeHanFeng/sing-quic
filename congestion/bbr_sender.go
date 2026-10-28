@@ -3,6 +3,7 @@ package congestion
 // src from https://github.com/google/quiche/blob/e7872fc9e12bb1d46a118949c3d4da36de58aa44/quiche/quic/core/congestion_control/bbr_sender.cc
 
 import (
+	"fmt"
 	"math/rand"
 	"time"
 )
@@ -264,6 +265,42 @@ func (b *bbrSender) SetRTTStatsProvider(provider RTTStatsProvider) {
 // PacingWait is how long the send path has to wait before the next batch may leave.
 func (b *bbrSender) PacingWait(now time.Time) time.Duration {
 	return b.pacer.wait(now)
+}
+
+// Describe is what a debug log says about the controller: the phase, the window,
+// the rate, the estimate and how much of the path the model believes it may fill.
+func (b *bbrSender) Describe() string {
+	return fmt.Sprintf("mode=%s cwnd=%d pacing=%d bw=%d minrtt=%s recovery=%d inflight=%d",
+		b.mode, b.GetCongestionWindow(), b.pacingRate(), b.bandwidthEstimate(),
+		b.getMinRtt(), b.recoveryState, b.bytesInFlight)
+}
+
+func (m bbrMode) String() string {
+	switch m {
+	case bbrModeStartup:
+		return "startup"
+	case bbrModeDrain:
+		return "drain"
+	case bbrModeProbeBw:
+		return "probe_bw"
+	case bbrModeProbeRtt:
+		return "probe_rtt"
+	default:
+		return "unknown"
+	}
+}
+
+func (s bbrRecoveryState) String() string {
+	switch s {
+	case bbrRecoveryStateNotInRecovery:
+		return "none"
+	case bbrRecoveryStateConservation:
+		return "conservation"
+	case bbrRecoveryStateGrowth:
+		return "growth"
+	default:
+		return "unknown"
+	}
 }
 
 // OnPacketSent records a packet that left and what was in flight before it, and

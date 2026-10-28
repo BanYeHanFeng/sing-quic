@@ -194,7 +194,7 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	const datagramCount = 32
 	password := NewPassword("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
 		loss:      0.02,
@@ -204,7 +204,7 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	})
 
 	ctx := testContext(t, 240*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{})
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,12 +431,12 @@ func TestStreamBothDirectionsBlocked(t *testing.T) {
 func TestAssociationEndsUnderLoad(t *testing.T) {
 	password := NewPassword("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{delay: 20 * time.Millisecond})
 
 	ctx := testContext(t, 60*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{})
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
 	if err != nil {
 		t.Fatal(err)
 	}

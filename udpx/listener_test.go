@@ -39,6 +39,14 @@ func waitDone(t *testing.T, ctx context.Context, timeout time.Duration) {
 // testSetup starts a listener and dials it once, returning both ends.
 func testSetup(t *testing.T, clientOptions, serverOptions Options) (Association, Association, *Listener) {
 	t.Helper()
+	// The size is known here, so the discovery would only add packets a test has
+	// to account for.
+	if clientOptions.MTU == 0 {
+		clientOptions.MTU = mtuIPv4
+	}
+	if serverOptions.MTU == 0 {
+		serverOptions.MTU = mtuIPv4
+	}
 	password := NewPassword("password")
 	listenerConn := udpConn(t)
 	listener := ListenPacket(listenerConn, testVerifier{password}, serverOptions)
@@ -106,12 +114,12 @@ func TestHandshakeOverSocket(t *testing.T) {
 func TestDemux(t *testing.T) {
 	password := NewPassword("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	ctx := testContext(t, 5*time.Second)
 	var clients []Association
 	for range 2 {
-		client, err := Dial(ctx, udpConn(t), listenerConn.LocalAddr(), password, Options{})
+		client, err := Dial(ctx, udpConn(t), listenerConn.LocalAddr(), password, Options{MTU: mtuIPv4})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -147,7 +155,7 @@ func TestDemux(t *testing.T) {
 func TestUnknownConnectionID(t *testing.T) {
 	password := NewPassword("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{password}, Options{})
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 
 	attacker := udpConn(t)
@@ -190,7 +198,7 @@ func TestUnknownConnectionID(t *testing.T) {
 	}
 
 	// The listener is still there.
-	client, err := Dial(testContext(t, 5*time.Second), udpConn(t), listenerConn.LocalAddr(), password, Options{})
+	client, err := Dial(testContext(t, 5*time.Second), udpConn(t), listenerConn.LocalAddr(), password, Options{MTU: mtuIPv4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,11 +212,11 @@ func TestUnknownConnectionID(t *testing.T) {
 // own: the server has nothing to answer it with.
 func TestWrongPassword(t *testing.T) {
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{NewPassword("password")}, Options{})
+	listener := ListenPacket(listenerConn, testVerifier{NewPassword("password")}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	if _, err := Dial(ctx, udpConn(t), listenerConn.LocalAddr(), NewPassword("wrong password"), Options{}); err == nil {
+	if _, err := Dial(ctx, udpConn(t), listenerConn.LocalAddr(), NewPassword("wrong password"), Options{MTU: mtuIPv4}); err == nil {
 		t.Fatal("dialled with a password the server does not know")
 	}
 	if _, err := listener.Accept(testContext(t, 100*time.Millisecond)); err == nil {
@@ -286,7 +294,12 @@ func TestAcknowledgementOverSocket(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the single packet was never acknowledged")
+			clientAssociation.sendMu.Lock()
+			queued := clientAssociation.queue.len()
+			batched := len(clientAssociation.batch.pending)
+			sent := clientAssociation.sendPacket
+			clientAssociation.sendMu.Unlock()
+			t.Fatalf("the single packet was never acknowledged: queue=%d batch=%d sent=%d", queued, batched, sent)
 		}
 		time.Sleep(time.Millisecond)
 	}

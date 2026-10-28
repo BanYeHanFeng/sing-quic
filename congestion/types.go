@@ -90,6 +90,15 @@ type Controller interface {
 	SetRTTStatsProvider(provider RTTStatsProvider)
 }
 
+// Diagnostics is what a controller says about itself for a log line: the mode it
+// is in, the window it allows, the rate it paces at and what it believes the path
+// carries. It is separate from Controller because a transport only ever reads it
+// when someone asked for a log, and a controller that cannot answer is still a
+// controller.
+type Diagnostics interface {
+	Describe() string
+}
+
 // RTTStatsProvider is what the controller asks about the path. The transport owns
 // the estimate, because it is the one that sees the acknowledgements arrive.
 type RTTStatsProvider interface {
