@@ -451,8 +451,8 @@ func TestFECRecoveredOnce(t *testing.T) {
 // same traffic: it carries a quarter more packets, so its share of the in-flight
 // table, of the receive rings, of the group buffers and of the retransmissions is
 // larger, and now that the send path copies each byte once that per-packet share is
-// most of the difference: 4.8 MB of it without the race detector against an
-// unprotected transfer of 4 MiB that allocates 10.6 MB, and 7.5 MB with it. What the
+// most of the difference: 2.1 MB of it without the race detector against an
+// unprotected transfer of 4 MiB that allocates 11 MB, and 5.6 MB with it. What the
 // bound catches is the per-group allocation, which was 3.9 payloads before the
 // buffers were reused.
 func TestFECReusesBuffers(t *testing.T) {
