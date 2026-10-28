@@ -3,7 +3,6 @@ package udpx
 import (
 	"bytes"
 	"math/rand"
-	"slices"
 	"testing"
 )
 
@@ -24,74 +23,75 @@ func fecTestShards(members, parity, shardLen int, seed int64) ([][]byte, [][]byt
 	return shards, parityShards
 }
 
-// TestGaloisField requires the field arithmetic to be arithmetic: every element
-// has an inverse, and multiplying by it gives one.
-func TestGaloisField(t *testing.T) {
-	for value := 1; value < 256; value++ {
-		inverse := gfInverse(byte(value))
-		if inverse == 0 {
-			t.Fatalf("%d has an inverse of zero", value)
-		}
-		if product := gfMul(byte(value), inverse); product != 1 {
-			t.Fatalf("%d times its inverse is %d", value, product)
-		}
-	}
-	// Multiplication commutes and distributes, which is the part a wrong table
-	// breaks without failing the check above.
-	for first := 0; first < 256; first += 7 {
-		for second := 0; second < 256; second += 11 {
-			if gfMul(byte(first), byte(second)) != gfMul(byte(second), byte(first)) {
-				t.Fatalf("%d times %d does not commute", first, second)
+// TestFECEncodeRecover requires a group to come back from one missing member
+// wherever it is, and from two only when they fall in different subsets: a subset
+// missing two has nothing to give, which is the price of a code whose parity is a
+// xor instead of a matrix row.
+func TestFECEncodeRecover(t *testing.T) {
+	for _, members := range []int{1, 2, 3, 4, 5, 6, 8, 32} {
+		for _, parity := range []int{1, 2, 3} {
+			if parity > members || members+parity > 40 {
+				continue
 			}
-			third := byte(second + 1)
-			distributed := gfMul(byte(first), byte(second)) ^ gfMul(byte(first), third)
-			if gfMul(byte(first), byte(second)^third) != distributed {
-				t.Fatalf("%d does not distribute over %d and %d", first, second, third)
+			for shardLen := 1; shardLen <= 9; shardLen += 4 {
+				original, parityShards := fecTestShards(members, parity, shardLen, int64(members*100+parity*10+shardLen))
+				if err := fecEncode(original, parityShards); err != nil {
+					t.Fatalf("%d/%d: encode: %v", members, parity, err)
+				}
+				for lost := 0; lost < members; lost++ {
+					shards := fecGroup(original, parityShards)
+					shards[lost] = nil
+					filled, err := fecRecover(members, parity, shards)
+					if err != nil {
+						t.Fatalf("%d/%d: recover %d: %v", members, parity, lost, err)
+					}
+					if filled != 1 {
+						t.Fatalf("%d/%d: %d members filled in for the one at %d", members, parity, filled, lost)
+					}
+					fecRequireRecovered(t, members, original, shards)
+				}
+				for first := 0; first < members; first++ {
+					for second := first + 1; second < members; second++ {
+						shards := fecGroup(original, parityShards)
+						shards[first] = nil
+						shards[second] = nil
+						filled, err := fecRecover(members, parity, shards)
+						if err != nil {
+							t.Fatalf("%d/%d: recover %d and %d: %v", members, parity, first, second, err)
+						}
+						want := 0
+						if first%parity != second%parity {
+							want = 2
+						}
+						if filled != want {
+							t.Fatalf("%d/%d: %d members filled in for %d and %d", members, parity, filled, first, second)
+						}
+						if want == 2 {
+							fecRequireRecovered(t, members, original, shards)
+						}
+					}
+				}
 			}
 		}
 	}
 }
 
-// TestFECEncodeRecover requires a group to be recoverable from any k of its k+m
-// shards, which is the one property the receiver relies on: it never chooses
-// which shards it is left with.
-func TestFECEncodeRecover(t *testing.T) {
-	for _, members := range []int{1, 2, 3, 4, 5, 6, 8} {
-		for _, parity := range []int{1, 2, 3} {
-			if members+parity > 10 {
-				continue
-			}
-			for shardLen := 1; shardLen <= 9; shardLen += 4 {
-				original, parityShards := fecTestShards(members, parity, shardLen, int64(members*100+parity*10+shardLen))
-				err := fecEncode(original, parityShards)
-				if err != nil {
-					t.Fatalf("%d/%d: encode: %v", members, parity, err)
-				}
-				// Every subset of shards that loses at most parity shards has to
-				// come back whole: losing one more is beyond what the code
-				// promises, and losing none is the case that has to be free.
-				for missing := 0; missing <= parity; missing++ {
-					indexes := fecCombinations(members+parity, missing)
-					for _, dropped := range indexes {
-						shards := make([][]byte, 0, members+parity)
-						shards = append(shards, original...)
-						shards = append(shards, parityShards...)
-						shards = slices.Clone(shards)
-						for _, index := range dropped {
-							shards[index] = nil
-						}
-						recoverErr := fecRecover(members, parity, shards)
-						if recoverErr != nil {
-							t.Fatalf("%d/%d/%d: recover after losing %v: %v", members, parity, shardLen, dropped, recoverErr)
-						}
-						for index, shard := range original {
-							if !bytes.Equal(shards[index], shard) {
-								t.Fatalf("%d/%d/%d: member %d came back changed after losing %v", members, parity, shardLen, index, dropped)
-							}
-						}
-					}
-				}
-			}
+// fecGroup is the shard slice a receiver works on: the members first and then the
+// parity, as a group describes them.
+func fecGroup(members, parity [][]byte) [][]byte {
+	shards := make([][]byte, 0, len(members)+len(parity))
+	shards = append(shards, members...)
+	shards = append(shards, parity...)
+	return shards
+}
+
+// fecRequireRecovered requires every member of the slice to be the shard that was
+// encoded, including the ones that never left.
+func fecRequireRecovered(t *testing.T, members int, original, shards [][]byte) {
+	t.Helper()
+	for index := 0; index < members; index++ {
+		if !bytes.Equal(shards[index], original[index]) {
+			t.Fatalf("member %d came back changed", index)
 		}
 	}
 }
@@ -133,12 +133,15 @@ func TestFECRecoverByPacketBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Lose two members, which the two parity shards have to replace: four of the
-	// six shards are left, which is exactly k.
+	// Lose two members in different subsets, which is what the two parity shards
+	// replace: members 1 and 2 are one of each.
 	recovered := [][]byte{shards[0], nil, nil, shards[3], parityShards[0], parityShards[1]}
-	err = fecRecover(len(members), 2, recovered)
+	filled, err := fecRecover(len(members), 2, recovered)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if filled != 2 {
+		t.Fatalf("%d members filled in for two missing", filled)
 	}
 	for index, packet := range recovered[:len(members)] {
 		recoveredHeader, _, payload, openErr := ring.open(packet[:len(members[index])])
@@ -179,47 +182,20 @@ func TestFECRejects(t *testing.T) {
 	}
 	// k of k+m is the minimum: one short and nothing is promised.
 	full := [][]byte{make([]byte, 4), make([]byte, 4), make([]byte, 4)}
-	if err := fecRecover(3, 1, full[:2]); err == nil {
+	if _, err := fecRecover(3, 1, full[:2]); err == nil {
 		t.Fatal("a group without enough shards was recovered")
 	}
 	missing := [][]byte{make([]byte, 4), nil, nil}
-	if err := fecRecover(3, 1, missing); err == nil {
+	if _, err := fecRecover(3, 1, missing); err == nil {
 		t.Fatal("a group without enough shards was recovered")
 	}
-	if err := fecRecover(2, 1, [][]byte{make([]byte, 4), make([]byte, 4)}); err == nil {
+	if _, err := fecRecover(2, 1, [][]byte{make([]byte, 4), make([]byte, 4)}); err == nil {
 		t.Fatal("a group of the wrong number of shards was recovered")
 	}
-}
-
-// fecCombinations returns every way of choosing size of count indexes, which is
-// what lets a recovery test cover all the erasure patterns of a shape instead of
-// a few that were thought of.
-func fecCombinations(count, size int) [][]int {
-	if size == 0 {
-		return [][]int{nil}
-	}
-	if size > count {
-		return nil
-	}
-	var combinations [][]int
-	current := make([]int, size)
-	for index := range current {
-		current[index] = index
-	}
-	for {
-		combination := make([]int, size)
-		copy(combination, current)
-		combinations = append(combinations, combination)
-		position := size - 1
-		for position >= 0 && current[position] == count-size+position {
-			position--
-		}
-		if position < 0 {
-			return combinations
-		}
-		current[position]++
-		for index := position + 1; index < size; index++ {
-			current[index] = current[index-1] + 1
-		}
+	// Two members of the same subset cannot be recovered, which is the shape the
+	// code refuses rather than one it gets wrong.
+	together := [][]byte{nil, make([]byte, 4), nil, make([]byte, 4), make([]byte, 4), make([]byte, 4)}
+	if filled, err := fecRecover(4, 2, together); err != nil || filled != 0 {
+		t.Fatalf("%d members filled in for two missing from one subset", filled)
 	}
 }
