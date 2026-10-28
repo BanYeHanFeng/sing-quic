@@ -250,9 +250,11 @@ type association struct {
 
 	// streamsMu guards the streams of the association: the table that turns a stream
 	// id on the wire into a stream, the queue of streams waiting for the application,
-	// and the two numbers that bound how many streams each end may have open.
-	// openCredit is how many streams the peer allows this end, and peerStreamLimit is
-	// how many this end allows the peer.
+	// and the numbers that bound how many streams each end may have open. openCredit
+	// is how many streams the peer allows this end, peerStreamLimit is how many this
+	// end allows the peer, and nextStreamID is how many this end has opened — which is
+	// what says whether a frame for an id that is no longer in the table is a late one
+	// rather than one this end never opened.
 	streamsMu       sync.Mutex
 	streams         map[uint32]*Stream
 	endedStreams    endedStreams
