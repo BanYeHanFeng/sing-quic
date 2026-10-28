@@ -61,6 +61,10 @@ type Association interface {
 // ErrIdleTimeout is the reason of an association both ends fell silent on.
 var ErrIdleTimeout = E.New("udpx: idle timeout")
 
+// ErrProbeTimeout is the reason of an association whose peer stopped answering
+// while this end still had packets in flight to ask about.
+var ErrProbeTimeout = E.New("udpx: probe timeout")
+
 const (
 	// maxPacketSize is the size of the largest packet either end sends. Path MTU
 	// discovery is not on the list of things this transport does, so the value
@@ -264,8 +268,13 @@ type association struct {
 	inFlight sentPackets
 	rtt      rttEstimator
 	// probes counts the probes that went unanswered, which is what the wait
-	// before the next one doubles with.
-	probes int
+	// before the next one doubles with, and probeSince is when the first of them
+	// was sent. A peer that answers nothing for long enough is one that has no
+	// association any more — a server that restarted keeps no state to answer
+	// with — and this end has to end the association for the next connection to
+	// dial a new one instead of probing a session that cannot come back.
+	probes     int
+	probeSince time.Time
 
 	// ccMu is the innermost lock: the congestion controller is called with it held,
 	// after the send lock or the flight lock, never around them.

@@ -43,6 +43,13 @@ const (
 
 	// maxProbeBackoff is how often the wait between probes may double.
 	maxProbeBackoff = 4
+
+	// maxProbeSilence is how long an association may ask a peer that answers
+	// nothing before the peer is declared gone. A path that comes back within it
+	// was interrupted; a peer that restarted has no state for the association and
+	// never answers, and an association that keeps probing it is a session that
+	// cannot be used and is never replaced.
+	maxProbeSilence = 10 * time.Second
 )
 
 // lossDelay is how long a packet must have been in flight before it is lost. The
@@ -135,8 +142,21 @@ func (a *association) probe() {
 	frames := retransmittableFrames([]*sentPacket{oldest})
 	a.inFlight.remove(oldest)
 	a.probes++
+	now := time.Now()
+	if a.probes == 1 {
+		a.probeSince = now
+	}
+	silent := now.Sub(a.probeSince) >= maxProbeSilence
 	a.stats.probes.Add(1)
 	a.flightMu.Unlock()
+	if silent {
+		// Nothing the peer sent arrived for long enough that it is gone rather
+		// than late. The association is ended here instead of being probed
+		// forever: what the caller needs is for the next connection to dial.
+		a.logInfo("probe ", oldest.packetNumber, " unanswered for ", maxProbeSilence, ", closing")
+		a.shutdown(ErrProbeTimeout, false)
+		return
+	}
 	a.logDebug("probe ", oldest.packetNumber, " after ", a.probes, " unanswered")
 
 	a.sendMu.Lock()
@@ -189,6 +209,7 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	if len(acked) > 0 {
 		// An answer arrived, so the path is there and the probes start over.
 		a.probes = 0
+		a.probeSince = time.Time{}
 	}
 	lost := a.inFlight.lost(now, acknowledgement.largest, lossDelay(a.rtt))
 	a.stats.lostPackets.Add(int64(len(lost)))
