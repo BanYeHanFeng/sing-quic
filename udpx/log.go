@@ -128,6 +128,13 @@ func (a *association) logInfo(args ...any) {
 	}
 }
 
+// inFlightBytes is what the flight table holds, in bytes.
+func (a *association) inFlightBytes() int {
+	a.flightMu.Lock()
+	defer a.flightMu.Unlock()
+	return a.inFlight.bytes
+}
+
 // describeState is the controller's own description, or empty when it has none.
 func (a *association) describeState() string {
 	a.ccMu.Lock()

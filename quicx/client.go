@@ -31,7 +31,10 @@ type ClientOptions struct {
 	// travel in: a lost packet that the redundancy replaces does not cost a round
 	// trip of the request it belongs to.
 	FEC udpx.FECOptions
-	// Logger receives the dial diagnostics. A failed dial is otherwise only
+	// MTU is the largest packet the transport may send, or zero to discover it.
+	MTU int
+	// Logger receives the dial diagnostics and, when its own level asks for it,
+	// what the transport says about itself. A failed dial is otherwise only
 	// visible as a generic error to the caller, which cannot tell whether the
 	// address failed to resolve, the handshake timed out, or the server
 	// rejected the authentication.
@@ -58,6 +61,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 	if options.Heartbeat == 0 {
 		options.Heartbeat = 10 * time.Second
 	}
+	transportLogger := options.Logger
 	if options.Logger == nil {
 		options.Logger = logger.NOP()
 	}
@@ -73,6 +77,8 @@ func NewClient(options ClientOptions) (*Client, error) {
 			// a ping the peer acknowledges.
 			KeepAlivePeriod: options.Heartbeat,
 			FEC:             options.FEC,
+			MTU:             options.MTU,
+			Logger:          transportLogger,
 		},
 		logger: options.Logger,
 	}, nil

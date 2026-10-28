@@ -36,6 +36,8 @@ type ServiceOptions struct {
 	// travel in. It is per direction: a client that wants its own requests covered
 	// sets it on the client.
 	FEC udpx.FECOptions
+	// MTU is the largest packet the transport may send, or zero to discover it.
+	MTU int
 }
 
 type ServiceHandler interface {
@@ -66,6 +68,10 @@ type userEntry[U comparable] struct {
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
+	// The transport is given the logger only when there is one: a logger that was
+	// replaced by a no-op is a transport that would build a line per second for
+	// nobody to read.
+	transportLogger := options.Logger
 	if options.Logger == nil {
 		options.Logger = logger.NOP()
 	}
@@ -87,6 +93,8 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 			IdleTimeout:     options.IdleTimeout,
 			KeepAlivePeriod: options.Heartbeat,
 			FEC:             options.FEC,
+			MTU:             options.MTU,
+			Logger:          transportLogger,
 		},
 		userMap: make(map[[8]byte]userEntry[U]),
 	}, nil

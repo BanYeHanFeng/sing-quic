@@ -137,6 +137,7 @@ func (a *association) probe() {
 	a.probes++
 	a.stats.probes.Add(1)
 	a.flightMu.Unlock()
+	a.logDebug("probe ", oldest.packetNumber, " after ", a.probes, " unanswered")
 
 	a.sendMu.Lock()
 	if len(frames) > 0 {
@@ -191,6 +192,10 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	}
 	lost := a.inFlight.lost(now, acknowledgement.largest, lossDelay(a.rtt))
 	a.stats.lostPackets.Add(int64(len(lost)))
+	if len(lost) > 0 || len(fecRecovered) > 0 {
+		a.logDebug("ack ", acknowledgement.largest, " acked=", len(acked), " lost=", len(lost),
+			" recovered=", len(fecRecovered), " inflight=", priorInFlight)
+	}
 	recovered := retransmittableFrames(lost)
 	empty := a.inFlight.len() == 0
 	a.flightMu.Unlock()

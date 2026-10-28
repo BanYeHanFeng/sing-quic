@@ -749,6 +749,7 @@ func (a *association) writeBatch() error {
 	}
 	a.stats.sentPackets.Add(int64(len(current.packets)))
 	a.stats.sentBytes.Add(int64(bytes))
+	a.logTrace("send ", len(current.packets), " packets/", bytes, " bytes", " inflight=", a.inFlightBytes())
 	// The packets are recorded as in flight while the send lock is still held, so
 	// that a frame is reachable from exactly one place at any moment: the queue, the
 	// batch, or the flight table. A reader that took the send lock and then the
