@@ -361,6 +361,9 @@ func TestProbeTimeout(t *testing.T) {
 	a := newTestAssociation(t, conn)
 	queueStream(t, a, 0, 1000)
 	a.flightMu.Lock()
+	// The first probe is what starts the clock, so the association is put past
+	// its first one already: what this test asks is what the next probe does.
+	a.probes = 1
 	a.probeSince = time.Now().Add(-maxProbeSilence)
 	a.flightMu.Unlock()
 	a.probe()
