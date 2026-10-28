@@ -19,7 +19,7 @@ const (
 	BytesPerSecond = 8 * BitsPerSecond
 )
 
-// BandwidthFromDelta calculates the bandwidth from a number of bytes and a time delta
-func BandwidthFromDelta(bytes ByteCount, delta time.Duration) Bandwidth {
+// bandwidthFromDelta calculates the bandwidth from a number of bytes and a time delta
+func bandwidthFromDelta(bytes ByteCount, delta time.Duration) Bandwidth {
 	return Bandwidth(bytes) * Bandwidth(time.Second) / Bandwidth(delta) * BytesPerSecond
 }

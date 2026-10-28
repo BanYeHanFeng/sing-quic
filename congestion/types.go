@@ -16,18 +16,6 @@ type ByteCount uint64
 // PacketNumber is the number the transport gave a packet.
 type PacketNumber int64
 
-const (
-	// PacketsPerConnectionID is only used to size a window; the transport here has
-	// one packet number space per association.
-	PacketsPerConnectionID = 100
-
-	// MaxPacketBufferSize bounds the number of send times kept per association.
-	MaxPacketBufferSize = 1000
-
-	// MaxCongestionWindowPackets bounds the congestion window.
-	MaxCongestionWindowPackets = 20000
-)
-
 // SendState is what the controller has to remember about one packet from the
 // moment it leaves to the moment the answer for it arrives: the two points the
 // delivery rate is sampled between, taken while the packet was being sent.
@@ -114,5 +102,5 @@ type RTTStatsProvider interface {
 // standard gains, and a first window the transport chooses in packets. Zero or
 // less asks for the controller's own default.
 func NewBbrController(initialMaxDatagramSize ByteCount, initialWindowPackets int64) Controller {
-	return NewBbrSender(initialMaxDatagramSize, initialWindowPackets)
+	return newBbrSender(initialMaxDatagramSize, initialWindowPackets)
 }

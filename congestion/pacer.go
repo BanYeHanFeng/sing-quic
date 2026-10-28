@@ -26,7 +26,7 @@ const burstWindow = 200 * time.Microsecond
 // reason to make the first batch wait for it.
 const burstPackets = 16
 
-// Pacer is the token bucket that turns a pacing rate into a time to wait.
+// pacer is the token bucket that turns a pacing rate into a time to wait.
 //
 // Bytes accrue at the rate the controller asked for, and every packet that leaves
 // takes its bytes out. The bucket may go into debt: the transport hands a batch of
@@ -34,7 +34,7 @@ const burstPackets = 16
 // have accrued, and the next batch waits until the debt is paid. That is what makes
 // the rate on the wire the rate the controller asked for at the granularity the
 // socket works in, instead of one packet's worth of tokens buying a whole batch.
-type Pacer struct {
+type pacer struct {
 	// budgetAtLastSent is what the bucket held when the last packet left. A
 	// negative number is the debt of a batch that spent more than it had.
 	budgetAtLastSent int64
@@ -47,24 +47,24 @@ type Pacer struct {
 	getBandwidth func() ByteCount
 }
 
-func NewPacer(initialMaxDatagramSize ByteCount, getBandwidth func() ByteCount) *Pacer {
-	return &Pacer{
+func newPacer(initialMaxDatagramSize ByteCount, getBandwidth func() ByteCount) *pacer {
+	return &pacer{
 		maxDatagramSize: initialMaxDatagramSize,
 		getBandwidth:    getBandwidth,
 	}
 }
 
-// SentPacket records a packet that left at sendTime, taking its bytes out of the
+// sentPacket records a packet that left at sendTime, taking its bytes out of the
 // bucket.
-func (p *Pacer) SentPacket(sendTime time.Time, size ByteCount) {
-	p.budgetAtLastSent = p.Budget(sendTime) - int64(size)
+func (p *pacer) sentPacket(sendTime time.Time, size ByteCount) {
+	p.budgetAtLastSent = p.budget(sendTime) - int64(size)
 	p.lastSentTime = sendTime
 }
 
-// Budget is what the bucket holds at now: what accrued since the last packet left,
+// budget is what the bucket holds at now: what accrued since the last packet left,
 // on top of what was left over, and no more than a sender that was quiet may arrive
 // with. It is negative when the batch that went out last is still owed for.
-func (p *Pacer) Budget(now time.Time) int64 {
+func (p *pacer) budget(now time.Time) int64 {
 	if p.lastSentTime.IsZero() {
 		return p.maxBurstSize()
 	}
@@ -79,10 +79,10 @@ func (p *Pacer) Budget(now time.Time) int64 {
 	return int64(budget)
 }
 
-// Wait is how long the next batch has to wait for the bucket to be out of debt, or
+// wait is how long the next batch has to wait for the bucket to be out of debt, or
 // zero when it may leave now.
-func (p *Pacer) Wait(now time.Time) time.Duration {
-	debt := -p.Budget(now)
+func (p *pacer) wait(now time.Time) time.Duration {
+	debt := -p.budget(now)
 	if debt <= 0 {
 		return 0
 	}
@@ -91,14 +91,14 @@ func (p *Pacer) Wait(now time.Time) time.Duration {
 
 // maxBurstSize is the most the bucket may hold: what accrues while the clock is
 // being late, and at least one write.
-func (p *Pacer) maxBurstSize() int64 {
-	return Max(
+func (p *pacer) maxBurstSize() int64 {
+	return max(
 		int64(p.getBandwidth())*burstWindow.Nanoseconds()/1e9,
 		burstPackets*int64(p.maxDatagramSize),
 	)
 }
 
 // timeFor is how long it takes to accrue bytes at the current rate.
-func (p *Pacer) timeFor(bytes int64) time.Duration {
+func (p *pacer) timeFor(bytes int64) time.Duration {
 	return time.Duration(float64(bytes) * 1e9 / float64(p.getBandwidth()))
 }

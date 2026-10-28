@@ -104,7 +104,7 @@ func TestBbrWindowGrows(t *testing.T) {
 	if window <= testWindow {
 		t.Fatalf("window of %d after twenty round trips of clean acknowledgements", window)
 	}
-	if window > MaxCongestionWindowPackets*testDatagramSize {
+	if window > maxCongestionWindowPackets*testDatagramSize {
 		t.Fatalf("window of %d is larger than the ceiling", window)
 	}
 }
@@ -125,7 +125,7 @@ func TestBbrWindowFallsOnLoss(t *testing.T) {
 	if recovered >= grown {
 		t.Fatalf("window of %d after losing half of a round trip, up from %d", recovered, grown)
 	}
-	if rate := simulation.controller.(*bbrSender).PacingRate(); rate < Bandwidth(minBps) {
+	if rate := simulation.controller.(*bbrSender).pacingRate(); rate < Bandwidth(minBps) {
 		t.Fatalf("pacing rate of %v after losses", rate)
 	}
 	// What was lost grows back: the ceiling is the path, not the loss.
@@ -151,7 +151,7 @@ func TestBbrInitialWindowIsTheCallers(t *testing.T) {
 		{packets: 128, window: 128 * testDatagramSize},
 		{packets: 2, window: minCongestionWindowPackets * testDatagramSize},
 	} {
-		sender := NewBbrSender(testDatagramSize, test.packets)
+		sender := newBbrSender(testDatagramSize, test.packets)
 		window := sender.GetCongestionWindow()
 		if window != test.window {
 			t.Errorf("window of %d for %d packets asked for, want %d", window, test.packets, test.window)

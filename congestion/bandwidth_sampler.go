@@ -49,7 +49,7 @@ func newBandwidthSample() *bandwidthSample {
 type maxAckHeightTracker struct {
 	// Tracks the maximum number of bytes acked faster than the estimated
 	// bandwidth.
-	maxAckHeightFilter *WindowedFilter[extraAckedEvent]
+	maxAckHeightFilter *windowedFilter[extraAckedEvent]
 	// The time this aggregation started and the number of bytes acked during it.
 	aggregationEpochStartTime time.Time
 	aggregationEpochBytes     ByteCount
@@ -63,17 +63,17 @@ type maxAckHeightTracker struct {
 
 func newMaxAckHeightTracker(windowLength roundTripCount) *maxAckHeightTracker {
 	return &maxAckHeightTracker{
-		maxAckHeightFilter:               NewWindowedFilter(windowLength, maxExtraAckedEventFunc),
+		maxAckHeightFilter:               newWindowedFilter(windowLength, maxExtraAckedEventFunc),
 		lastSentPacketNumberBeforeEpoch:  invalidPacketNumber,
 		ackAggregationBandwidthThreshold: 1.0,
 	}
 }
 
-func (m *maxAckHeightTracker) Get() ByteCount {
-	return m.maxAckHeightFilter.GetBest().extraAcked
+func (m *maxAckHeightTracker) get() ByteCount {
+	return m.maxAckHeightFilter.getBest().extraAcked
 }
 
-func (m *maxAckHeightTracker) Update(
+func (m *maxAckHeightTracker) update(
 	bandwidthEstimate Bandwidth,
 	isNewMaxBandwidth bool,
 	roundTripCount roundTripCount,
@@ -86,26 +86,26 @@ func (m *maxAckHeightTracker) Update(
 
 	if isNewMaxBandwidth {
 		// Save and clear existing entries.
-		best := m.maxAckHeightFilter.GetBest()
-		secondBest := m.maxAckHeightFilter.GetSecondBest()
-		thirdBest := m.maxAckHeightFilter.GetThirdBest()
-		m.maxAckHeightFilter.Clear()
+		best := m.maxAckHeightFilter.getBest()
+		secondBest := m.maxAckHeightFilter.getSecondBest()
+		thirdBest := m.maxAckHeightFilter.getThirdBest()
+		m.maxAckHeightFilter.clear()
 
 		// Reinsert the heights into the filter after recalculating.
 		expectedBytesAcked := bytesFromBandwidthAndTimeDelta(bandwidthEstimate, best.timeDelta)
 		if expectedBytesAcked < best.bytesAcked {
 			best.extraAcked = best.bytesAcked - expectedBytesAcked
-			m.maxAckHeightFilter.Update(best, best.round)
+			m.maxAckHeightFilter.update(best, best.round)
 		}
 		expectedBytesAcked = bytesFromBandwidthAndTimeDelta(bandwidthEstimate, secondBest.timeDelta)
 		if expectedBytesAcked < secondBest.bytesAcked {
 			secondBest.extraAcked = secondBest.bytesAcked - expectedBytesAcked
-			m.maxAckHeightFilter.Update(secondBest, secondBest.round)
+			m.maxAckHeightFilter.update(secondBest, secondBest.round)
 		}
 		expectedBytesAcked = bytesFromBandwidthAndTimeDelta(bandwidthEstimate, thirdBest.timeDelta)
 		if expectedBytesAcked < thirdBest.bytesAcked {
 			thirdBest.extraAcked = thirdBest.bytesAcked - expectedBytesAcked
-			m.maxAckHeightFilter.Update(thirdBest, thirdBest.round)
+			m.maxAckHeightFilter.update(thirdBest, thirdBest.round)
 		}
 	}
 
@@ -141,7 +141,7 @@ func (m *maxAckHeightTracker) Update(
 		bytesAcked: m.aggregationEpochBytes,
 		timeDelta:  aggregationDelta,
 	}
-	m.maxAckHeightFilter.Update(newEvent, roundTripCount)
+	m.maxAckHeightFilter.update(newEvent, roundTripCount)
 	return extraBytesAcked
 }
 
@@ -184,7 +184,7 @@ func (m *maxAckHeightTracker) Update(
 // not indicative of the real bandwidth. Hence, we use the send rate as an upper
 // bound, and the sample value is
 //
-//	rate_sample = Min(send_rate, ack_rate)
+//	rate_sample = min(send_rate, ack_rate)
 //
 // An important edge case handled by the sampler is tracking the app-limited
 // samples. There are multiple meaning of "app-limited" used interchangeably,
@@ -195,7 +195,7 @@ func (m *maxAckHeightTracker) Update(
 // there is no outstanding data to send. This means that certain bandwidth
 // samples in the future would not be an accurate indication of the link
 // capacity, and it is important to inform consumer about that. Whenever
-// connection becomes app-limited, the sampler is notified via OnAppLimited()
+// connection becomes app-limited, the sampler is notified via onAppLimited()
 // method.
 //
 // Meaning 2: a phase in the bandwidth sampler. As soon as the bandwidth
@@ -223,8 +223,8 @@ func (m *maxAckHeightTracker) Update(
 // meaning that the bandwidth sample would exclude the quiescence.
 //
 // Based on the analysis of that scenario, we implement the following rule: once
-// OnAppLimited() is called, all sent packets will produce app-limited samples
-// up until an ack for a packet that was sent after OnAppLimited() was called.
+// onAppLimited() is called, all sent packets will produce app-limited samples
+// up until an ack for a packet that was sent after onAppLimited() was called.
 // Note that while the scenario above is not the only scenario when the
 // connection is app-limited, the approach works in other cases too.
 
@@ -298,8 +298,8 @@ func newBandwidthSampler(maxAckHeightTrackerWindowLength roundTripCount) *bandwi
 	return b
 }
 
-func (b *bandwidthSampler) MaxAckHeight() ByteCount {
-	return b.maxAckHeightTracker.Get()
+func (b *bandwidthSampler) maxAckHeight() ByteCount {
+	return b.maxAckHeightTracker.get()
 }
 
 func (b *bandwidthSampler) OnPacketSent(sentTime time.Time, packetNumber PacketNumber, bytes ByteCount, bytesInFlight ByteCount) SendState {
@@ -333,7 +333,7 @@ func (b *bandwidthSampler) OnPacketSent(sentTime time.Time, packetNumber PacketN
 	// rate behind it yields no sample at all.
 	if !b.lastAckedPacketSentTime.IsZero() {
 		if sentTime.After(b.lastAckedPacketSentTime) {
-			state.sendRate = BandwidthFromDelta(
+			state.sendRate = bandwidthFromDelta(
 				b.totalBytesSent-b.totalBytesSentAtLastAckedPacket,
 				sentTime.Sub(b.lastAckedPacketSentTime),
 			)
@@ -367,7 +367,7 @@ func (b *bandwidthSampler) OnCongestionEvent(
 	for _, p := range ackedPackets {
 		sample := b.onPacketAcknowledged(ackTime, p)
 		if sample.rtt != 0 {
-			eventSample.sampleRtt = Min(eventSample.sampleRtt, sample.rtt)
+			eventSample.sampleRtt = min(eventSample.sampleRtt, sample.rtt)
 		}
 		if sample.bandwidth > eventSample.sampleMaxBandwidth {
 			eventSample.sampleMaxBandwidth = sample.bandwidth
@@ -385,32 +385,16 @@ func (b *bandwidthSampler) OnCongestionEvent(
 	}
 
 	isNewMaxBandwidth := eventSample.sampleMaxBandwidth > maxBandwidth
-	maxBandwidth = Max(maxBandwidth, eventSample.sampleMaxBandwidth)
+	maxBandwidth = max(maxBandwidth, eventSample.sampleMaxBandwidth)
 
-	b.onAckEventEnd(Min(estBandwidthUpperBound, maxBandwidth), isNewMaxBandwidth, roundTripCount)
+	b.onAckEventEnd(min(estBandwidthUpperBound, maxBandwidth), isNewMaxBandwidth, roundTripCount)
 
 	return *eventSample
 }
 
-func (b *bandwidthSampler) OnAppLimited() {
+func (b *bandwidthSampler) onAppLimited() {
 	b.isAppLimited = true
 	b.endOfAppLimitedPhase = b.lastSentPacket
-}
-
-func (b *bandwidthSampler) TotalBytesSent() ByteCount {
-	return b.totalBytesSent
-}
-
-func (b *bandwidthSampler) TotalBytesLost() ByteCount {
-	return b.totalBytesLost
-}
-
-func (b *bandwidthSampler) TotalBytesAcked() ByteCount {
-	return b.totalBytesAcked
-}
-
-func (b *bandwidthSampler) IsAppLimited() bool {
-	return b.isAppLimited
 }
 
 func (b *bandwidthSampler) onPacketAcknowledged(ackTime time.Time, packet AckedPacketInfo) bandwidthSample {
@@ -451,9 +435,9 @@ func (b *bandwidthSampler) onPacketAcknowledged(ackTime time.Time, packet AckedP
 		return *sample
 	}
 
-	ackRate := BandwidthFromDelta(b.totalBytesAcked-packet.delivered, ackTime.Sub(packet.priorAckTime))
+	ackRate := bandwidthFromDelta(b.totalBytesAcked-packet.delivered, ackTime.Sub(packet.priorAckTime))
 
-	sample.bandwidth = Min(packet.sendRate, ackRate)
+	sample.bandwidth = min(packet.sendRate, ackRate)
 	// Note: this sample does not account for delayed acknowledgement time.  This
 	// means that the RTT measurements here can be artificially high, especially
 	// on low bandwidth connections.
@@ -472,7 +456,7 @@ func (b *bandwidthSampler) onAckEventEnd(
 		return
 	}
 	b.totalBytesAckedAfterLastAckEvent = b.totalBytesAcked
-	b.maxAckHeightTracker.Update(
+	b.maxAckHeightTracker.update(
 		bandwidthEstimate,
 		isNewMaxBandwidth,
 		roundTripCount,

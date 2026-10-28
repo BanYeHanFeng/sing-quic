@@ -28,7 +28,7 @@ import "cmp"
 // turn is replaced by the third best. The newest sample replaces the third
 // best.
 
-type WindowedFilter[V any] struct {
+type windowedFilter[V any] struct {
 	// Time length of window.
 	windowLength roundTripCount
 	estimates    []entry[V]
@@ -42,7 +42,7 @@ type entry[V any] struct {
 
 // Compares two values and returns true if the first is greater than or equal
 // to the second.
-func MaxFilter[O cmp.Ordered](a, b O) int {
+func maxFilter[O cmp.Ordered](a, b O) int {
 	if a > b {
 		return 1
 	} else if a < b {
@@ -51,35 +51,35 @@ func MaxFilter[O cmp.Ordered](a, b O) int {
 	return 0
 }
 
-func NewWindowedFilter[V any](windowLength roundTripCount, comparator func(V, V) int) *WindowedFilter[V] {
-	return &WindowedFilter[V]{
+func newWindowedFilter[V any](windowLength roundTripCount, comparator func(V, V) int) *windowedFilter[V] {
+	return &windowedFilter[V]{
 		windowLength: windowLength,
 		estimates:    make([]entry[V], 3),
 		comparator:   comparator,
 	}
 }
 
-func (f *WindowedFilter[V]) GetBest() V {
+func (f *windowedFilter[V]) getBest() V {
 	return f.estimates[0].sample
 }
 
-func (f *WindowedFilter[V]) GetSecondBest() V {
+func (f *windowedFilter[V]) getSecondBest() V {
 	return f.estimates[1].sample
 }
 
-func (f *WindowedFilter[V]) GetThirdBest() V {
+func (f *windowedFilter[V]) getThirdBest() V {
 	return f.estimates[2].sample
 }
 
 // Updates best estimates with |sample|, and expires and updates best
 // estimates as necessary.
-func (f *WindowedFilter[V]) Update(newSample V, newTime roundTripCount) {
+func (f *windowedFilter[V]) update(newSample V, newTime roundTripCount) {
 	// Reset all estimates if they have not yet been initialized, if new sample
 	// is a new best, or if the newest recorded estimate is too old.
 	if f.comparator(f.estimates[0].sample, *new(V)) == 0 ||
 		f.comparator(newSample, f.estimates[0].sample) >= 0 ||
 		newTime-f.estimates[2].time > f.windowLength {
-		f.Reset(newSample, newTime)
+		f.reset(newSample, newTime)
 		return
 	}
 
@@ -125,12 +125,12 @@ func (f *WindowedFilter[V]) Update(newSample V, newTime roundTripCount) {
 }
 
 // Resets all estimates to new sample.
-func (f *WindowedFilter[V]) Reset(newSample V, newTime roundTripCount) {
+func (f *windowedFilter[V]) reset(newSample V, newTime roundTripCount) {
 	f.estimates[2] = entry[V]{newSample, newTime}
 	f.estimates[1] = f.estimates[2]
 	f.estimates[0] = f.estimates[1]
 }
 
-func (f *WindowedFilter[V]) Clear() {
+func (f *windowedFilter[V]) clear() {
 	f.estimates = make([]entry[V], 3)
 }
