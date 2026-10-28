@@ -381,12 +381,13 @@ func appendSegmentSize(oob []byte, size uint16) []byte {
 }
 
 // isGSOError reports whether a send failed because the path cannot segment.
-// EIO means the driver has not enabled the checksums UDP_SEGMENT requires, and
-// EINVAL means this particular size or socket cannot be segmented at all.
+// EIO means the driver has not enabled the checksums UDP_SEGMENT requires,
+// EINVAL means this particular size or socket cannot be segmented at all, and
+// EMSGSIZE means the run is larger than what the device takes as one datagram.
 func isGSOError(err error) bool {
 	var syscallErr *os.SyscallError
 	if errors.As(err, &syscallErr) {
-		return syscallErr.Err == unix.EIO || syscallErr.Err == unix.EINVAL
+		return syscallErr.Err == unix.EIO || syscallErr.Err == unix.EINVAL || syscallErr.Err == unix.EMSGSIZE
 	}
 	return false
 }
