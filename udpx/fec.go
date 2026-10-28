@@ -203,13 +203,19 @@ const (
 	// so a handful covers everything a sender can have in flight.
 	fecReceiveGroups = 8
 
-	// fecReceiveCache is how many packets a receiver keeps for the group whose
+	// fecReceiveCache is how many packets a receiver keeps for the groups whose
 	// parity has not arrived yet. A group is described by a parity packet that
 	// comes after its members, so the members have to be remembered to be
 	// recoverable, and a group whose members were dropped from here is not
 	// recoverable at all: what was forgotten is delivered twice at worst, and the
 	// frame that carries it is the same frame.
-	fecReceiveCache = 64
+	//
+	// It has to hold every group that can be assembling at once, or the ring
+	// overwrites the members of a group whose parity is still on the way: eight
+	// groups of thirty-two members is what the two constants above allow, and a
+	// ring of sixty-four was overwriting the older half of it. What the ring costs
+	// is one packet each, so the bound is a quarter of a megabyte.
+	fecReceiveCache = fecReceiveGroups * fecMaxDataShards
 )
 
 // fecSender assembles the groups this end sends. It is driven by the goroutine
@@ -735,10 +741,32 @@ func (r *fecReceiver) parity(description *fecHeader, shard []byte) [][]byte {
 		r.drop(group.groupID)
 		return nil
 	}
+	// Every shard of a group is as long as the longest member, so a member that
+	// arrived at its own length is padded here before the code sees it: the
+	// members of a group are not the same size — an acknowledgement rides beside a
+	// data packet — and the code is written over shards of one length.
 	shards := make([][]byte, 0, len(group.members)+len(group.parity))
-	shards = append(shards, group.members...)
+	var padded [][]byte
+	for _, member := range group.members {
+		if member == nil || len(member) == longest {
+			shards = append(shards, member)
+			continue
+		}
+		buffer := r.buffer()
+		if cap(buffer) < longest {
+			buffer = make([]byte, longest)
+		}
+		buffer = buffer[:longest]
+		copy(buffer, member)
+		clear(buffer[len(member):])
+		padded = append(padded, buffer)
+		shards = append(shards, buffer)
+	}
 	shards = append(shards, group.parity...)
 	filled, err := r.codec.recover(len(group.members), len(group.parity), shards)
+	for _, buffer := range padded {
+		r.release(buffer)
+	}
 	if err != nil {
 		r.drop(group.groupID)
 		return nil

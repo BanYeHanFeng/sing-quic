@@ -711,9 +711,11 @@ func (a *association) sealPendingLocked() {
 		return
 	}
 	for index := range unsealed {
-		if unsealed[index].sent.parity {
+		if unsealed[index].sent.parity || unsealed[index].sent.mtuProbe {
 			// A parity shard covers the group that is already closed rather than
-			// being a member of the one being assembled.
+			// being a member of the one being assembled, and a path MTU probe is
+			// not data: it is as large as the path is being asked to carry, which
+			// is exactly the size a group must not be padded to.
 			continue
 		}
 		a.fecSender.add(unsealed[index].packet, unsealed[index].sent.packetNumber)
@@ -797,7 +799,10 @@ func (a *association) writeBatch() error {
 		if a.writingProbe.Load() && isMessageTooLong(err) {
 			// The probe was the one packet larger than the path: the socket said so
 			// before anything else had to be written, and the size it refused is
-			// the size that is not available.
+			// the size that is not available. The batch is emptied like any other,
+			// or the room the refused packet took would be held until the next
+			// probe.
+			current.reset()
 			a.mtuProbeFailed()
 			return nil
 		}
@@ -813,6 +818,11 @@ func (a *association) writeBatch() error {
 // else on this association is going to work on. The close is announced to nobody,
 // because what would carry the announcement is the same socket.
 func (a *association) writeFailed(failed []pendingPacket, err error) {
+	sizes := make([]int, 0, len(failed))
+	for index := range failed {
+		sizes = append(sizes, failed[index].sent.size)
+	}
+	a.logDebug("write failed: ", err, " packets=", sizes, " probe=", a.writingProbe.Load())
 	a.flightMu.Lock()
 	for index := range failed {
 		if failed[index].sent.ackEliciting {

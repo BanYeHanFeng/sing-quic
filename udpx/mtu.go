@@ -22,6 +22,7 @@ package udpx
 import (
 	"errors"
 	"net"
+	"slices"
 	"syscall"
 	"time"
 
@@ -48,42 +49,33 @@ const (
 // first. The steps are where paths actually are: a tunnel takes an IPv4 path to
 // 1400, a VPN to 1280, and everything carries 1200.
 var (
-	mtuCandidatesIPv4 = []int{mtuIPv4, 1400, 1280, mtuMin}
+	// The steps are what a path is: 1500 bytes of IP is the ordinary Ethernet
+	// path, 1400 is what an overlay hands out, 1280 is the IPv6 minimum, and 1200
+	// is what everything carries. Each is the UDP payload that fits, so each is
+	// the path size minus the IP and UDP headers rather than the path size itself:
+	// a candidate that is 1400 bytes of payload does not fit a 1400 byte path.
+	mtuCandidatesIPv4 = []int{mtuIPv4, 1352, 1232, mtuMin}
 	mtuCandidatesIPv6 = []int{mtuIPv6, mtuMin}
 )
 
 // defaultMTU is the size the association starts with, and the list it walks down.
-func defaultMTU(remote net.Addr) (int, []int) {
+func mtuCandidatesFor(remote net.Addr) []int {
+	// The list is a copy: a probe that a path refuses is taken out of this end's
+	// list, and the list it came from is shared by every association.
 	if udpAddr, isUDPAddr := remote.(*net.UDPAddr); isUDPAddr && udpAddr.IP.To4() == nil {
-		return mtuCandidatesIPv6[0], mtuCandidatesIPv6
+		return slices.Clone(mtuCandidatesIPv6)
 	}
-	return mtuCandidatesIPv4[0], mtuCandidatesIPv4
+	return slices.Clone(mtuCandidatesIPv4)
 }
 
-// nextMTU is the size below current, or current itself when there is none.
-func nextMTU(candidates []int, current int) int {
-	for index, candidate := range candidates {
-		if candidate != current {
-			continue
-		}
-		if index+1 < len(candidates) {
-			return candidates[index+1]
-		}
-		return current
-	}
-	// A size that is not on the list came from a path that reported it: walk down
-	// to the largest candidate below it.
-	for _, candidate := range candidates {
-		if candidate < current {
-			return candidate
-		}
-	}
-	return current
-}
-
-// mtuProbeState is the probe in flight, if any.
+// mtuProbeState is the probe in flight, if any, and the size it is asking about.
+// The size the association sends with is not the size being probed: it is the
+// smallest one that is known to work, and a probe that is answered raises it. A
+// probe that is not answered costs a packet, not the data that was sent at a size
+// the path does not carry.
 type mtuProbeState struct {
 	packetNumber uint32
+	candidate    int
 	active       bool
 }
 
@@ -94,44 +86,84 @@ func (a *association) startMTUProbe() {
 	if a.options.MTU > 0 {
 		return
 	}
-	a.pumpMu.Lock()
-	defer a.pumpMu.Unlock()
-	if err := a.pump(); err != nil {
-		return
-	}
-	a.sendMu.Lock()
-	if a.mtuProbe.active || a.mtu <= mtuMin {
+	for {
+		a.pumpMu.Lock()
+		if err := a.pump(); err != nil {
+			a.pumpMu.Unlock()
+			return
+		}
+		a.sendMu.Lock()
+		if a.mtuProbe.active {
+			a.sendMu.Unlock()
+			a.pumpMu.Unlock()
+			return
+		}
+		candidate := a.nextMTUCandidateLocked()
+		if candidate <= a.mtu {
+			a.sendMu.Unlock()
+			a.pumpMu.Unlock()
+			return
+		}
+		// A group that is open is closed before the probe is numbered: a group is a
+		// run of consecutive packet numbers, and a probe is not one of its members.
+		if a.fecSender != nil && a.fecSender.open() {
+			if err := a.closeGroupLocked(); err != nil {
+				a.sendMu.Unlock()
+				a.pumpMu.Unlock()
+				return
+			}
+		}
+		packetNumber, err := a.planProbeLocked(candidate)
+		if err != nil {
+			a.sendMu.Unlock()
+			a.pumpMu.Unlock()
+			a.logDebug("mtu probe of ", a.mtu, " not sent: ", err)
+			return
+		}
+		a.mtuProbe = mtuProbeState{packetNumber: packetNumber, candidate: candidate, active: true}
 		a.sendMu.Unlock()
+		a.writingProbe.Store(true)
+		writeErr := a.writeBatch()
+		a.writingProbe.Store(false)
+		a.pumpMu.Unlock()
+		if writeErr != nil {
+			return
+		}
+		if a.probeRefused.Swap(false) {
+			// The socket refused the size, so the next one down is what to ask
+			// about. The probe is retried here rather than from the write: the
+			// write happens under the pump lock, and a probe started from there
+			// would wait for the lock it is already holding.
+			continue
+		}
+		time.AfterFunc(mtuProbeTimeout, func() {
+			a.mtuProbeTimeout(packetNumber)
+		})
 		return
 	}
-	packetNumber, err := a.planProbeLocked()
-	if err != nil {
-		a.sendMu.Unlock()
-		a.logDebug("mtu probe of ", a.mtu, " not sent: ", err)
-		return
-	}
-	a.mtuProbe = mtuProbeState{packetNumber: packetNumber, active: true}
-	a.sendMu.Unlock()
-	a.writingProbe.Store(true)
-	writeErr := a.writeBatch()
-	a.writingProbe.Store(false)
-	if writeErr != nil {
-		return
-	}
-	time.AfterFunc(mtuProbeTimeout, func() {
-		a.mtuProbeTimeout(packetNumber)
-	})
 }
 
-// planProbeLocked puts one packet of exactly the current size into the batch. It
-// carries a ping and padding, because what is in it does not matter: what matters
-// is that the peer answers it, and that the path carried it.
-func (a *association) planProbeLocked() (uint32, error) {
-	payloadLen := a.mtu - headerLen - tagLen
+// nextMTUCandidateLocked is the largest size that has not been ruled out, or the
+// size the association already uses when nothing larger is left. The caller holds
+// sendMu.
+func (a *association) nextMTUCandidateLocked() int {
+	for _, candidate := range a.mtuCandidates {
+		if candidate > a.mtu {
+			return candidate
+		}
+	}
+	return a.mtu
+}
+
+// planProbeLocked puts one packet of exactly the size being asked about into the
+// batch. It carries a ping and padding, because what is in it does not matter: what
+// matters is that the peer answers it, and that the path carried it.
+func (a *association) planProbeLocked(candidate int) (uint32, error) {
+	payloadLen := candidate - headerLen - tagLen
 	frame := appendPing(nil)
 	paddingLen := payloadLen - len(frame) - paddingFixedLen
 	if paddingLen < 0 {
-		return 0, E.New("mtu of ", a.mtu, " leaves no room for a probe")
+		return 0, E.New("mtu of ", candidate, " leaves no room for a probe")
 	}
 	frame = appendPadding(frame, paddingLen)
 	h := header{
@@ -168,9 +200,14 @@ func (a *association) mtuProbeConfirmed(acknowledgement ack) bool {
 		return false
 	}
 	packetNumber := a.mtuProbe.packetNumber
+	candidate := a.mtuProbe.candidate
 	a.mtuProbe.active = false
+	if candidate > a.mtu {
+		a.mtu = candidate
+		a.updatePayloadLocked()
+	}
 	a.sendMu.Unlock()
-	a.logInfo("mtu confirmed ", a.mtu, " by packet ", packetNumber)
+	a.logInfo("mtu confirmed ", candidate, " by packet ", packetNumber)
 	return true
 }
 
@@ -182,38 +219,42 @@ func (a *association) mtuProbeTimeout(packetNumber uint32) {
 		a.sendMu.Unlock()
 		return
 	}
+	candidate := a.mtuProbe.candidate
 	a.mtuProbe.active = false
-	next := nextMTU(a.mtuCandidates, a.mtu)
-	if next >= a.mtu {
-		a.sendMu.Unlock()
-		return
+	// The size is ruled out for the rest of the association: a path that did not
+	// carry it once is not a path to keep asking about.
+	for index, known := range a.mtuCandidates {
+		if known == candidate {
+			a.mtuCandidates = append(a.mtuCandidates[:index], a.mtuCandidates[index+1:]...)
+			break
+		}
 	}
-	a.mtu = next
-	a.updatePayloadLocked()
 	a.sendMu.Unlock()
-	a.logInfo("mtu probe of ", packetNumber, " unanswered, mtu now ", a.mtu)
+	a.logInfo("mtu probe of ", candidate, " unanswered, mtu stays ", a.mtu)
 	a.startMTUProbe()
 }
 
 // mtuProbeFailed is what a write that the socket refused for being too long means.
-// The probe is not going to arrive, so the next size down is tried.
+// The probe is not going to arrive, so the next size down is what the next probe
+// asks about. It does not start that probe: it runs under the pump lock, and a
+// probe started from there would wait for the lock it is already holding.
 func (a *association) mtuProbeFailed() {
 	a.sendMu.Lock()
 	if !a.mtuProbe.active {
 		a.sendMu.Unlock()
 		return
 	}
+	candidate := a.mtuProbe.candidate
 	a.mtuProbe.active = false
-	next := nextMTU(a.mtuCandidates, a.mtu)
-	if next >= a.mtu {
-		a.sendMu.Unlock()
-		return
+	for index, known := range a.mtuCandidates {
+		if known == candidate {
+			a.mtuCandidates = append(a.mtuCandidates[:index], a.mtuCandidates[index+1:]...)
+			break
+		}
 	}
-	a.mtu = next
-	a.updatePayloadLocked()
 	a.sendMu.Unlock()
-	a.logInfo("mtu too large for the path, mtu now ", a.mtu)
-	a.startMTUProbe()
+	a.probeRefused.Store(true)
+	a.logInfo("mtu ", candidate, " too large for the path")
 }
 
 // updatePayloadLocked recomputes how many payload bytes a packet may carry. The

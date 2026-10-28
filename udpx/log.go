@@ -34,6 +34,9 @@ type associationStats struct {
 	recovered    atomic.Int64
 	probes       atomic.Int64
 	spuriousLoss atomic.Int64
+	// droppedDatagrams counts what the application did not keep up with, which is
+	// the one kind of loss this end caused itself.
+	droppedDatagrams atomic.Int64
 }
 
 // statsSnapshot is one reading of the counters and the state they belong to.
@@ -47,6 +50,7 @@ type statsSnapshot struct {
 	recovered    int64
 	probes       int64
 	spuriousLoss int64
+	dropped      int64
 	cwnd         int64
 	inFlight     int
 	queued       int
@@ -64,6 +68,7 @@ func (a *association) snapshot() statsSnapshot {
 		recovered:    a.stats.recovered.Load(),
 		probes:       a.stats.probes.Load(),
 		spuriousLoss: a.stats.spuriousLoss.Load(),
+		dropped:      a.stats.droppedDatagrams.Load(),
 		queued:       a.queueLength(),
 	}
 	a.flightMu.Lock()
@@ -99,6 +104,7 @@ func (a *association) statsLoop() {
 			" retx=", current.retransmits-last.retransmits,
 			" spurious=", current.spuriousLoss-last.spuriousLoss,
 			" fec=", current.recovered-last.recovered,
+			" drop=", current.dropped-last.dropped,
 			" probes=", current.probes-last.probes,
 			" inflight=", current.inFlight,
 			" queued=", current.queued,

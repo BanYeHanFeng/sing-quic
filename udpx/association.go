@@ -3,6 +3,7 @@ package udpx
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"net"
 	"sync"
@@ -200,10 +201,11 @@ type association struct {
 	// of a packet and, with FEC, the budget a group is encoded with. mtuCandidates
 	// is the list it walks down when a size is not carried, and mtuProbe is the
 	// question about the current one that has not been answered yet.
-	mtu            int
-	mtuCandidates  []int
-	mtuProbe       mtuProbeState
-	writingProbe   atomic.Bool
+	mtu           int
+	mtuCandidates []int
+	mtuProbe      mtuProbeState
+	writingProbe  atomic.Bool
+	probeRefused  atomic.Bool
 	// pumpMu serializes whoever sends: the send loop owns the send path, and flush
 	// borrows it. A pump is one pass over the queue, not one packet, so the lock is
 	// held for a batch and not for a write.
@@ -358,9 +360,13 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 	// The controller comes first: a timer that fires before it exists would send
 	// through a half built association, and the idle timer is armed with the
 	// configured timeout, which may be short enough to win the race.
-	a.mtu, a.mtuCandidates = defaultMTU(peer)
+	// The size data is sent with is the one every path carries, and the probe
+	// raises it: a size that has not been confirmed is not a size to send data
+	// with, because a path that drops it says nothing and the data is gone.
+	a.mtuCandidates = mtuCandidatesFor(peer)
+	a.mtu = mtuMin
 	if options.MTU > 0 {
-		a.mtu = min(options.MTU, a.mtu)
+		a.mtu = max(mtuMin, min(options.MTU, a.mtuCandidates[0]))
 	}
 	a.updatePayloadLocked()
 	a.cc = newCongestionController()
@@ -394,7 +400,8 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 		go a.statsLoop()
 	}
 	gso, gro := a.Offload()
-	a.logInfo("association up local=", a.localConnID, " peer=", a.peerConnID, " client=", isClient,
+	a.logInfo("association up local=", hex.EncodeToString(a.localConnID[:]),
+		" peer=", hex.EncodeToString(a.peerConnID[:]), " client=", isClient,
 		" remote=", peer, " gso=", gso, " gro=", gro, " mtu=", a.maxPacketSize())
 	return a
 }

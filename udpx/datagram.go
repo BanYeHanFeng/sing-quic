@@ -33,7 +33,14 @@ const (
 	// application. A full backlog drops what arrives instead of making the
 	// receive loop wait: a datagram that has to be dropped is dropped, and the
 	// streams of the same association keep moving while it happens.
-	datagramBacklog = 64
+	//
+	// The depth is what a proxy needs rather than what a protocol needs: the
+	// application on the other side of this queue is a router that reads a packet,
+	// routes it and writes it to a socket, and a hundred forwarded packets of a
+	// burst are ordinary. Sixty-four was shallow enough that a path losing five
+	// percent of its packets reported twenty-six: the queue was what was dropping
+	// them, not the path.
+	datagramBacklog = 1024
 
 	// maxDatagramReassemblyCount and maxDatagramReassemblyBytes bound the state
 	// of the reassemblies in progress. Both are the sender's side of the deal
@@ -264,6 +271,7 @@ func (a *association) handleDatagram(data datagramData) error {
 		// Nobody is keeping up. The message is dropped rather than the receive
 		// loop waiting for room: an unreliable message that waited is still
 		// unreliable, and the streams of this association are not.
+		a.stats.droppedDatagrams.Add(1)
 	}
 	return nil
 }

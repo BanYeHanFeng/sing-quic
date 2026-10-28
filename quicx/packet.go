@@ -109,7 +109,7 @@ func newUDPPacketConn(ctx context.Context, association udpx.Association, session
 		cancel:       cancel,
 		sessionID:    sessionID,
 		association:  association,
-		data:         make(chan udpMessage, 64),
+		data:         make(chan udpMessage, 1024),
 		isServer:     isServer,
 		onDestroy:    onDestroy,
 		readDeadline: pipe.MakeDeadline(),
