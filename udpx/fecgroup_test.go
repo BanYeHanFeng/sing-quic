@@ -224,13 +224,17 @@ func TestFECGroupRecovery(t *testing.T) {
 	if !bytes.Equal(received, expected) {
 		t.Fatal("what the stream delivered is not what was written")
 	}
-	// The recovered packet is acknowledged like one that arrived: the sender has to
-	// stop waiting for it, or the recovery saved nothing.
+	// The recovered packet is reported like one that was lost: the sender has to
+	// stop waiting for it, and the path is still charged for dropping it.
 	receiver.ackMu.Lock()
-	recovered := receiver.ack.ranges.contains(8)
+	recovered := receiver.ack.recovered.contains(8)
+	acknowledged := receiver.ack.ranges.contains(8)
 	receiver.ackMu.Unlock()
 	if !recovered {
-		t.Fatal("the recovered packet was not acknowledged")
+		t.Fatal("the recovered packet was not reported as lost")
+	}
+	if acknowledged {
+		t.Fatal("the recovered packet was acknowledged as received")
 	}
 }
 
@@ -540,5 +544,91 @@ func TestFECRingDropsStaleGroup(t *testing.T) {
 	description.Index = 1
 	if recovered := receiver.parity(&description, parity[1]); len(recovered) != 0 {
 		t.Fatalf("%d packets recovered out of bytes the ring had given to another packet", len(recovered))
+	}
+}
+
+// TestFECRecoveryReportedAsLoss requires a packet that parity rebuilt to be
+// reported to the sender as lost: it is taken out of flight, it is not sent again,
+// and the congestion controller is told the path dropped it. The data arrived, and
+// the path still has to be charged for it.
+func TestFECRecoveryReportedAsLoss(t *testing.T) {
+	senderConn := newFakeConn()
+	receiverConn := newFakeConn()
+	senderKey := mustAEAD(t, testKey(0x11))
+	receiverKey := mustAEAD(t, testKey(0x22))
+	sender := newAssociation(senderConn, handshakeResult{
+		send: newKeyRing(0, senderKey),
+		recv: newKeyRing(0, receiverKey),
+	}, senderConn.LocalAddr(), Options{IdleTimeout: time.Minute, MTU: mtuIPv4, FEC: FECOptions{DataShards: 4, ParityShards: 2}}, true, false)
+	t.Cleanup(func() {
+		sender.shutdown(net.ErrClosed, false)
+	})
+	receiver := newAssociation(receiverConn, handshakeResult{
+		send: newKeyRing(0, receiverKey),
+		recv: newKeyRing(0, senderKey),
+	}, senderConn.LocalAddr(), Options{IdleTimeout: time.Minute, MTU: mtuIPv4}, false, false)
+	t.Cleanup(func() {
+		receiver.shutdown(net.ErrClosed, false)
+	})
+
+	for index := range 4 {
+		if err := sender.SendDatagram(uint32(index), []byte{byte(index)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := sender.flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	packets := fecTestPackets(t, senderConn, &sender.sendRing)
+	if len(packets) != 6 {
+		t.Fatalf("%d packets written for one group", len(packets))
+	}
+	written := senderConn.len()
+
+	// The first member never arrives; the parity that follows rebuilds it. The
+	// first parity packet comes first, which is when a receiver learns that the
+	// peer protects what it sends: until then there is nothing to keep members for.
+	order := []uint32{4, 1, 2, 3, 5}
+	for _, packetNumber := range order {
+		packet := packets[packetNumber]
+		if err := receiver.handlePacket(bytes.Clone(packet.raw), receiver.RemoteAddr()); err != nil {
+			t.Fatalf("packet %d: %v", packet.header.PacketNumber, err)
+		}
+	}
+	receiver.flushAck()
+	if err := receiver.flush(); err != nil {
+		t.Fatal(err)
+	}
+	answers := fecTestPackets(t, receiverConn, &receiver.sendRing)
+	if len(answers) != 1 {
+		t.Fatalf("%d packets written by the receiver", len(answers))
+	}
+	parsed, _, err := nextFrame(answers[0].payload)
+	if err != nil || parsed.frameType != frameTypeAck {
+		t.Fatalf("the receiver wrote %v: %v", parsed.frameType, err)
+	}
+	acknowledgement, err := parseAck(parsed.body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acknowledgement.recoveredCount != 1 || acknowledgement.recovered[0].start != 0 {
+		t.Fatalf("%d recovered ranges, the first at %d", acknowledgement.recoveredCount, acknowledgement.recovered[0].start)
+	}
+	if acknowledgement.covers(0) {
+		t.Fatal("the recovered packet was acknowledged as received")
+	}
+
+	sender.handleAck(parsed.body, time.Now())
+	if reported := sender.stats.spuriousLoss.Load(); reported != 1 {
+		t.Fatalf("%d recovered packets reported as lost", reported)
+	}
+	if senderConn.len() != written {
+		t.Fatalf("%d packets written after the report, %d before", senderConn.len(), written)
+	}
+	sender.flightMu.Lock()
+	inFlight := sender.inFlight.len()
+	sender.flightMu.Unlock()
+	if inFlight != 0 {
+		t.Fatalf("%d packets still in flight", inFlight)
 	}
 }

@@ -175,6 +175,14 @@ func (a *association) handleAck(body []byte, now time.Time) {
 		}
 		a.rtt.sample(now.Sub(packet.sentAt) - acknowledgement.delay)
 	}
+	// What parity rebuilt is out of flight and out of the send buffer, and it is
+	// reported to the controller as lost: the data arrived, the path did not carry
+	// it, and the difference matters to a controller that would otherwise keep
+	// sending into a path that is dropping what it sends.
+	fecRecovered := a.inFlight.acked(acknowledgement.recovered[:acknowledgement.recoveredCount])
+	for _, packet := range fecRecovered {
+		releaseFrames(packet.frames)
+	}
 	if len(acked) > 0 {
 		// An answer arrived, so the path is there and the probes start over.
 		a.probes = 0
@@ -184,8 +192,9 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	empty := a.inFlight.len() == 0
 	a.flightMu.Unlock()
 
+	a.stats.spuriousLoss.Add(int64(len(fecRecovered)))
 	a.rttStats.update(a.rttEstimate())
-	a.congestionAcked(acked, lost, priorInFlight, now)
+	a.congestionAcked(acked, append(lost, fecRecovered...), priorInFlight, now)
 	if empty {
 		a.disarmPTO()
 	} else {

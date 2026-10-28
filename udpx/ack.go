@@ -165,11 +165,23 @@ func (r *pnRanges) ack() ack {
 // packet was sent to the moment its acknowledgement arrived includes the time
 // the peer waited before sending it, and a sender that does not subtract it
 // overestimates every round trip it measures.
+//
+// The recovered ranges are the other half of a forward error correction group:
+// packets that never arrived but were rebuilt from parity. They are not
+// acknowledgements of arrival and they are not losses either — the data is here,
+// and the path still dropped it. The sender takes them out of flight without
+// sending anything again and tells the congestion controller they were lost,
+// which is the one place the difference between "the path lost this" and "the
+// data is missing" is worth keeping.
 type ack struct {
 	ranges  [maxAckRanges]pnRange
 	delay   time.Duration
 	largest uint32
 	count   int
+
+	recovered      [maxAckRanges]pnRange
+	recoveredLargest uint32
+	recoveredCount int
 }
 
 // ackBodyLen is the size of the body of an acknowledgement frame.
@@ -182,6 +194,17 @@ func ackBodyLen(body []byte) (int, error) {
 		return 0, E.New("acknowledgement of ", count, " ranges")
 	}
 	length := 1 + 2 + 4 + 4 + (count-1)*(4+4)
+	if len(body) < length+1+4 {
+		return 0, errShortFrame
+	}
+	recoveredCount := int(body[length+4])
+	if recoveredCount > maxAckRanges {
+		return 0, E.New("acknowledgement of ", recoveredCount, " recovered ranges")
+	}
+	length += 1 + 4
+	if recoveredCount > 0 {
+		length += 4 + (recoveredCount-1)*(4+4)
+	}
 	if len(body) < length {
 		return 0, errShortFrame
 	}
@@ -224,6 +247,31 @@ func parseAck(body []byte) (ack, error) {
 		}
 		result.ranges[index] = pnRange{start: end - length, end: end}
 	}
+	result.recoveredLargest = binary.BigEndian.Uint32(body[offset:])
+	result.recoveredCount = int(body[offset+4])
+	offset += 5
+	if result.recoveredCount == 0 {
+		return result, nil
+	}
+	firstRecovered := binary.BigEndian.Uint32(body[offset:])
+	offset += 4
+	if firstRecovered > result.recoveredLargest {
+		return ack{}, E.New("first recovered range of ", firstRecovered, " below packet number ", result.recoveredLargest)
+	}
+	result.recovered[0] = pnRange{start: result.recoveredLargest - firstRecovered, end: result.recoveredLargest}
+	for index := 1; index < result.recoveredCount; index++ {
+		gap := binary.BigEndian.Uint32(body[offset:])
+		length := binary.BigEndian.Uint32(body[offset+4:])
+		offset += 8
+		if gap >= result.recovered[index-1].start {
+			return ack{}, E.New("gap of ", gap, " below packet number ", result.recovered[index-1].start)
+		}
+		end = result.recovered[index-1].start - gap - 1
+		if length > end {
+			return ack{}, E.New("recovered range of ", length, " below packet number ", end)
+		}
+		result.recovered[index] = pnRange{start: end - length, end: end}
+	}
 	return result, nil
 }
 
@@ -244,6 +292,18 @@ func (a ack) appendTo(dst []byte) []byte {
 		dst = binary.BigEndian.AppendUint32(dst, previous.start-current.end-1)
 		dst = binary.BigEndian.AppendUint32(dst, current.end-current.start)
 	}
+	dst = binary.BigEndian.AppendUint32(dst, a.recoveredLargest)
+	dst = append(dst, byte(a.recoveredCount))
+	if a.recoveredCount == 0 {
+		return dst
+	}
+	dst = binary.BigEndian.AppendUint32(dst, a.recovered[0].end-a.recovered[0].start)
+	for index := 1; index < a.recoveredCount; index++ {
+		previous := a.recovered[index-1]
+		current := a.recovered[index]
+		dst = binary.BigEndian.AppendUint32(dst, previous.start-current.end-1)
+		dst = binary.BigEndian.AppendUint32(dst, current.end-current.start)
+	}
 	return dst
 }
 
@@ -253,6 +313,13 @@ type ackScheduler struct {
 	largestAt time.Time
 	elicited  int
 	pending   bool
+	// recovered is what forward error correction rebuilt and the peer has not
+	// been told about: packets that never arrived, reported once so the sender can
+	// stop counting them and charge the path for them. recoveredSeen is the same
+	// set kept for longer, because a group can be rebuilt twice and the second copy
+	// is not a second delivery.
+	recovered     pnRanges
+	recoveredSeen pnRanges
 }
 
 // received records an ack-eliciting packet and reports whether it has to be
@@ -286,17 +353,39 @@ func (s *ackScheduler) received(pn uint32, now time.Time) bool {
 func (a *association) wasReceived(packetNumber uint32) bool {
 	a.ackMu.Lock()
 	defer a.ackMu.Unlock()
-	return a.ack.ranges.contains(packetNumber)
+	return a.ack.ranges.contains(packetNumber) || a.ack.recoveredSeen.contains(packetNumber)
+}
+
+// markRecovered records a packet that parity rebuilt rather than the path
+// delivered, so that the next acknowledgement tells the sender it was lost. It is
+// not an acknowledgement of arrival: the packet is left out of the ranges for the
+// same reason.
+func (a *association) markRecovered(packetNumber uint32) {
+	a.ackMu.Lock()
+	a.ack.recovered.add(packetNumber)
+	a.ack.recoveredSeen.add(packetNumber)
+	a.ack.pending = true
+	a.ackMu.Unlock()
+	a.timers.Load().ack.Reset(a.ackDelay())
 }
 
 // pack builds the acknowledgement of everything received so far, or nil when
 // there is nothing to acknowledge.
 func (s *ackScheduler) pack(now time.Time) []byte {
-	if !s.pending {
+	// An acknowledgement has to name at least one range it received: a recovered
+	// packet is not one of them, so it waits for the next packet that was.
+	if !s.pending || len(s.ranges.ranges) == 0 {
+		s.pending = false
 		return nil
 	}
 	built := s.ranges.ack()
 	built.delay = now.Sub(s.largestAt)
+	if len(s.recovered.ranges) > 0 {
+		built.recoveredLargest = s.recovered.ranges[0].end
+		built.recoveredCount = min(len(s.recovered.ranges), maxAckRanges)
+		copy(built.recovered[:], s.recovered.ranges[:built.recoveredCount])
+		s.recovered.ranges = s.recovered.ranges[:0]
+	}
 	s.pending = false
 	s.elicited = 0
 	return built.appendTo(nil)

@@ -38,14 +38,14 @@ const (
 	// answer, which is what lets an old and a new implementation share a port:
 	// a prober sees a port that answers nothing.
 	//
-	// It is 4 since the parity shards of a group became Reed-Solomon instead of
-	// interleaved xors: a receiver computing the other code out of the same
-	// description produces packets that fail authentication, and nothing in a
-	// parity packet says which code the sender used. The version is also what
-	// keeps an old peer from reaching a frame it cannot parse — an unknown frame
-	// type ends the association — so it is bumped for every addition to the wire
-	// as well: 3 was the stream count.
-	version = 4
+	// It is 5 since an acknowledgement also reports what parity rebuilt: a peer
+	// that does not know the field would read the recovered ranges as another
+	// frame and end the association on a type it does not have. The same bump
+	// covers the padding frame path MTU discovery sends, and the rule is the same
+	// one that made 3 the stream count and 4 the Reed-Solomon parity: an addition
+	// to the wire is a new version, because the version is what keeps an old peer
+	// from reaching something it cannot parse.
+	version = 5
 
 	// randomLen is the size of the random value each side contributes. It makes
 	// every handshake unique, so a repeated hello never produces the keys of an

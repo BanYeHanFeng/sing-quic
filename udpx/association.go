@@ -235,8 +235,11 @@ type association struct {
 
 	recvRing keyRing
 	// fec assembles the groups the peer sends. It belongs to the receive side and
-	// needs no lock of its own.
-	fec fecReceiver
+	// needs no lock of its own. recovering says the packet being handled was
+	// rebuilt from parity rather than delivered, which is the one thing the
+	// receive path has to know about it.
+	fec        fecReceiver
+	recovering bool
 
 	// timers are the timers of an association, in one place because a timer that
 	// fires reads them: they are built with the association and never change, so
@@ -602,7 +605,14 @@ func (a *association) handlePacket(packet []byte, source net.Addr) error {
 		}
 	}
 	if ackEliciting {
-		a.scheduleAck(packetHeader.PacketNumber, time.Now())
+		if a.recovering {
+			// The packet was rebuilt from parity, not delivered: it is reported to
+			// the sender as lost, and left out of what is acknowledged.
+			a.markRecovered(packetHeader.PacketNumber)
+			a.stats.recovered.Add(1)
+		} else {
+			a.scheduleAck(packetHeader.PacketNumber, time.Now())
+		}
 	}
 	return nil
 }
@@ -696,7 +706,15 @@ func (a *association) handleParity(packet []byte, packetHeader header, source ne
 			// would deliver the same frames a second time.
 			continue
 		}
+		// The packet is reported to the sender as lost even though its bytes are
+		// here: the path dropped it, the redundancy is what made the data arrive,
+		// and a congestion controller that was told nothing would keep filling a
+		// path that is already dropping what it carries. What tells the receive
+		// path apart is this flag: the recovered packet takes the same parsing and
+		// authentication, and only its acknowledgement differs.
+		a.recovering = true
 		_ = a.handlePacket(member, source)
+		a.recovering = false
 	}
 	// Parity is ack-eliciting like anything else: it takes room in flight, and a
 	// packet in flight that nothing acknowledges is a packet that keeps the window
