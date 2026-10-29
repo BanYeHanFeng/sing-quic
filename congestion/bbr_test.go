@@ -68,22 +68,28 @@ func (s *bbrSimulation) acknowledge() {
 	s.sent = s.sent[:0]
 }
 
-// lose settles everything in flight with half of it lost, which is the shape of an
-// answer that arrives despite the loss of what came before it.
-func (s *bbrSimulation) lose() {
+// lose settles everything in flight with one packet in share lost, which is the
+// shape of a path that drops a packet now and then and delivers the rest: what
+// arrived is acknowledged, what did not is lost, and the delivery rate is the
+// difference between the two.
+func (s *bbrSimulation) lose(share int) {
 	priorInFlight := s.inFlight
 	s.now = s.now.Add(testRoundTrip)
-	lost := make([]LostPacketInfo, 0, len(s.sent)/2)
-	for index := 0; index < len(s.sent); index += 2 {
-		acked := s.sent[index]
-		lost = append(lost, LostPacketInfo{
-			SendState:    acked.SendState,
-			TimeSent:     acked.TimeSent,
-			BytesLost:    acked.BytesAcked,
-			PacketNumber: acked.PacketNumber,
-		})
+	acked := make([]AckedPacketInfo, 0, len(s.sent))
+	lost := make([]LostPacketInfo, 0, len(s.sent)/share)
+	for index, packet := range s.sent {
+		if index%share == 0 {
+			lost = append(lost, LostPacketInfo{
+				SendState:    packet.SendState,
+				TimeSent:     packet.TimeSent,
+				BytesLost:    packet.BytesAcked,
+				PacketNumber: packet.PacketNumber,
+			})
+			continue
+		}
+		acked = append(acked, packet)
 	}
-	s.controller.OnCongestionEvent(priorInFlight, s.now, s.sent, lost)
+	s.controller.OnCongestionEvent(priorInFlight, s.now, acked, lost)
 	s.inFlight = 0
 	s.sent = s.sent[:0]
 }
@@ -109,32 +115,49 @@ func TestBbrWindowGrows(t *testing.T) {
 	}
 }
 
-// TestBbrWindowFallsOnLoss requires the window to come back down when a round trip
-// loses half of it, and the pacing rate to follow: a path that is dropping what is
-// sent is not one to answer by sending more.
-func TestBbrWindowFallsOnLoss(t *testing.T) {
+// TestBbrWindowSurvivesRandomLoss requires a path that drops one packet in ten to
+// leave the window near where the model put it. The window is the delivery rate
+// multiplied by the round trip, and a path dropping a tenth still delivers nine
+// tenths: a window that falls for the loss itself reads the path as a queue, and
+// on a path that always drops something it never leaves the floor.
+func TestBbrWindowSurvivesRandomLoss(t *testing.T) {
 	simulation := newBBRSimulation()
 	for round := 0; round < 20; round++ {
 		simulation.send(32)
 		simulation.acknowledge()
 	}
 	grown := simulation.controller.GetCongestionWindow()
-	simulation.send(32)
-	simulation.lose()
-	recovered := simulation.controller.GetCongestionWindow()
-	if recovered >= grown {
-		t.Fatalf("window of %d after losing half of a round trip, up from %d", recovered, grown)
+	for round := 0; round < 20; round++ {
+		simulation.send(32)
+		simulation.lose(10)
 	}
-	if rate := simulation.controller.(*bbrSender).pacingRate(); rate < Bandwidth(minBps) {
-		t.Fatalf("pacing rate of %v after losses", rate)
+	after := simulation.controller.GetCongestionWindow()
+	if after < grown*3/4 {
+		t.Fatalf("window of %d after twenty round trips losing a tenth of each, down from %d", after, grown)
 	}
-	// What was lost grows back: the ceiling is the path, not the loss.
+}
+
+// TestBbrWindowFallsOnCongestion requires the window to come back down when the
+// path itself narrows: the loss rate is not what shrinks it, but the delivery rate
+// behind the loss is, and a round trip that answers half of what was sent is half
+// the path.
+func TestBbrWindowFallsOnCongestion(t *testing.T) {
+	simulation := newBBRSimulation()
 	for round := 0; round < 20; round++ {
 		simulation.send(32)
 		simulation.acknowledge()
 	}
-	if window := simulation.controller.GetCongestionWindow(); window <= recovered {
-		t.Fatalf("window of %d after the path recovered from %d", window, recovered)
+	grown := simulation.controller.GetCongestionWindow()
+	for round := 0; round < 20; round++ {
+		simulation.send(32)
+		simulation.lose(2)
+	}
+	after := simulation.controller.GetCongestionWindow()
+	if after >= grown {
+		t.Fatalf("window of %d after twenty round trips losing half of each, up from %d", after, grown)
+	}
+	if after < simulation.controller.(*bbrSender).minCongestionWindow {
+		t.Fatalf("window of %d under the floor", after)
 	}
 }
 

@@ -87,19 +87,6 @@ const (
 	bbrModeProbeRtt
 )
 
-// Indicates how the congestion control limits the amount of bytes in flight.
-type bbrRecoveryState int
-
-const (
-	// Do not limit.
-	bbrRecoveryStateNotInRecovery = iota
-	// Allow an extra outstanding byte for each byte acknowledged.
-	bbrRecoveryStateConservation
-	// Allow two extra outstanding bytes for each byte acknowledged (slow
-	// start).
-	bbrRecoveryStateGrowth
-)
-
 type bbrSender struct {
 	rttStats RTTStatsProvider
 	pacer    *pacer
@@ -191,17 +178,7 @@ type bbrSender struct {
 	// Indicates whether the most recent bandwidth sample was marked as
 	// app-limited.
 	lastSampleIsAppLimited bool
-	// Current state of recovery.
-	recoveryState bbrRecoveryState
-	// Receiving acknowledgement of a packet after |end_recovery_at_| will cause
-	// BBR to exit the recovery mode.  A value above zero indicates at least one
-	// loss has been detected, so it must not be set back to zero.
-	endRecoveryAt PacketNumber
-	// A window used to limit the number of bytes in flight during loss recovery.
-	recoveryWindow ByteCount
 
-	// Params.
-	maxDatagramSize ByteCount
 	// Recorded on packet sent. equivalent |unacked_packets_->bytes_in_flight()|
 	bytesInFlight ByteCount
 }
@@ -242,10 +219,6 @@ func newBbrSender(initialMaxDatagramSize ByteCount, initialWindowPackets int64) 
 		congestionWindowGain:         1.0,
 		congestionWindowGainConstant: 2.0,
 		numStartupRtts:               roundTripsWithoutGrowthBeforeExitingStartup,
-		recoveryState:                bbrRecoveryStateNotInRecovery,
-		endRecoveryAt:                invalidPacketNumber,
-		recoveryWindow:               initialMaxCongestionWindow,
-		maxDatagramSize:              initialMaxDatagramSize,
 	}
 	b.pacer = newPacer(initialMaxDatagramSize, b.bandwidthForPacer)
 
@@ -270,9 +243,9 @@ func (b *bbrSender) PacingWait(now time.Time) time.Duration {
 // Describe is what a debug log says about the controller: the phase, the window,
 // the rate, the estimate and how much of the path the model believes it may fill.
 func (b *bbrSender) Describe() string {
-	return fmt.Sprintf("mode=%s cwnd=%d pacing=%d bw=%d minrtt=%s recovery=%d inflight=%d",
+	return fmt.Sprintf("mode=%s cwnd=%d pacing=%d bw=%d minrtt=%s inflight=%d",
 		b.mode, b.GetCongestionWindow(), b.pacingRate(), b.bandwidthEstimate(),
-		b.getMinRtt(), b.recoveryState, b.bytesInFlight)
+		b.getMinRtt(), b.bytesInFlight)
 }
 
 func (m bbrMode) String() string {
@@ -285,19 +258,6 @@ func (m bbrMode) String() string {
 		return "probe_bw"
 	case bbrModeProbeRtt:
 		return "probe_rtt"
-	default:
-		return "unknown"
-	}
-}
-
-func (s bbrRecoveryState) String() string {
-	switch s {
-	case bbrRecoveryStateNotInRecovery:
-		return "none"
-	case bbrRecoveryStateConservation:
-		return "conservation"
-	case bbrRecoveryStateGrowth:
-		return "growth"
 	default:
 		return "unknown"
 	}
@@ -323,19 +283,13 @@ func (b *bbrSender) CanSend(bytesInFlight ByteCount) bool {
 	return bytesInFlight < b.GetCongestionWindow()
 }
 
-// inRecovery reports whether the controller is still recovering from loss.
-func (b *bbrSender) inRecovery() bool {
-	return b.recoveryState != bbrRecoveryStateNotInRecovery
-}
-
-// GetCongestionWindow is the window the transport may fill.
+// GetCongestionWindow is the window the transport may fill. It is the model's
+// window and nothing else: a loss does not shrink it, because a loss is not what
+// the window is built from. What a loss does is lower the estimate of the path
+// the window is derived from, and that estimate is already the answer.
 func (b *bbrSender) GetCongestionWindow() ByteCount {
 	if b.mode == bbrModeProbeRtt {
 		return b.probeRttCongestionWindow()
-	}
-
-	if b.inRecovery() {
-		return min(b.congestionWindow, b.recoveryWindow)
 	}
 
 	return b.congestionWindow
@@ -345,12 +299,17 @@ func (b *bbrSender) GetCongestionWindow() ByteCount {
 // with an answer happens here: the window, the pacing rate and the round trip
 // counter only move when an acknowledgement and the losses it implies arrive
 // together, which is why the event is one call and not one call per packet.
+//
+// What is lost is not what the window is derived from. The window is the model's
+// estimate of the path multiplied by a gain, and a path that drops a packet does
+// not become a narrower path because of it: a loss lowers the estimate only when
+// the loss was the model's own doing, which is what the delivery rate says and a
+// loss count does not. This is the difference between a controller that survives a
+// path dropping one packet in ten and one that crawls on it.
 func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Time, ackedPackets []AckedPacketInfo, lostPackets []LostPacketInfo) {
 	totalBytesAckedBefore := b.sampler.totalBytesAcked
-	totalBytesLostBefore := b.sampler.totalBytesLost
 
 	var isRoundStart, minRttExpired bool
-	var bytesLost ByteCount
 
 	// Update bytesInFlight
 	b.bytesInFlight = priorInFlight
@@ -364,7 +323,6 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 	if len(ackedPackets) != 0 {
 		lastAckedPacket := ackedPackets[len(ackedPackets)-1].PacketNumber
 		isRoundStart = b.updateRoundTripCounter(lastAckedPacket)
-		b.updateRecoveryState(lastAckedPacket, len(lostPackets) != 0, isRoundStart)
 	}
 
 	sample := b.sampler.OnCongestionEvent(eventTime,
@@ -383,7 +341,6 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 	if sample.sampleRtt != infRTT {
 		minRttExpired = b.maybeUpdateMinRtt(eventTime, sample.sampleRtt)
 	}
-	bytesLost = b.sampler.totalBytesLost - totalBytesLostBefore
 
 	// Handle logic specific to PROBE_BW mode.
 	if b.mode == bbrModeProbeBw {
@@ -400,14 +357,13 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 	// Handle logic specific to PROBE_RTT.
 	b.maybeEnterOrExitProbeRtt(eventTime, isRoundStart, minRttExpired)
 
-	// Calculate number of packets acked and lost.
+	// Calculate number of packets acked.
 	bytesAcked := b.sampler.totalBytesAcked - totalBytesAckedBefore
 
 	// After the model is updated, recalculate the pacing rate and congestion
 	// window.
 	b.calculatePacingRate()
 	b.calculateCongestionWindow(bytesAcked)
-	b.calculateRecoveryWindow(bytesAcked, bytesLost)
 }
 
 func (b *bbrSender) pacingRate() Bandwidth {
@@ -621,43 +577,6 @@ func (b *bbrSender) maybeEnterOrExitProbeRtt(now time.Time, isRoundStart, minRtt
 	b.exitingQuiescence = false
 }
 
-// Determines whether BBR needs to enter, exit or advance state of the
-// recovery.
-func (b *bbrSender) updateRecoveryState(lastAckedPacket PacketNumber, hasLosses, isRoundStart bool) {
-	// Disable recovery in startup, if loss-based exit is enabled.
-	if !b.isAtFullBandwidth {
-		return
-	}
-
-	// Exit recovery when there are no losses for a round.
-	if hasLosses {
-		b.endRecoveryAt = b.lastSentPacket
-	}
-
-	switch b.recoveryState {
-	case bbrRecoveryStateNotInRecovery:
-		if hasLosses {
-			b.recoveryState = bbrRecoveryStateConservation
-			// This will cause the |recovery_window_| to be set to the correct
-			// value in CalculateRecoveryWindow().
-			b.recoveryWindow = 0
-			// Since the conservation phase is meant to be lasting for a whole
-			// round, extend the current round as if it were started right now.
-			b.currentRoundTripEnd = b.lastSentPacket
-		}
-	case bbrRecoveryStateConservation:
-		if isRoundStart {
-			b.recoveryState = bbrRecoveryStateGrowth
-		}
-		fallthrough
-	case bbrRecoveryStateGrowth:
-		// Exit recovery if appropriate.
-		if !hasLosses && lastAckedPacket > b.endRecoveryAt {
-			b.recoveryState = bbrRecoveryStateNotInRecovery
-		}
-	}
-}
-
 // Determines the appropriate pacing rate for the connection: the gain the mode
 // asks for times the bandwidth estimate.
 //
@@ -701,38 +620,6 @@ func (b *bbrSender) calculateCongestionWindow(bytesAcked ByteCount) {
 	// Enforce the limits on the congestion window.
 	b.congestionWindow = max(b.congestionWindow, b.minCongestionWindow)
 	b.congestionWindow = min(b.congestionWindow, b.maxCongestionWindow)
-}
-
-// Determines the appropriate window that constrains the in-flight during recovery.
-func (b *bbrSender) calculateRecoveryWindow(bytesAcked, bytesLost ByteCount) {
-	if b.recoveryState == bbrRecoveryStateNotInRecovery {
-		return
-	}
-
-	// Set up the initial recovery window.
-	if b.recoveryWindow == 0 {
-		b.recoveryWindow = b.bytesInFlight + bytesAcked
-		b.recoveryWindow = max(b.minCongestionWindow, b.recoveryWindow)
-		return
-	}
-
-	// Remove losses from the recovery window, while accounting for a potential
-	// integer underflow.
-	if b.recoveryWindow >= bytesLost {
-		b.recoveryWindow = b.recoveryWindow - bytesLost
-	} else {
-		b.recoveryWindow = b.maxDatagramSize
-	}
-
-	// In CONSERVATION mode, just subtracting losses is sufficient.  In GROWTH,
-	// release additional |bytes_acked| to achieve a slow-start-like behavior.
-	if b.recoveryState == bbrRecoveryStateGrowth {
-		b.recoveryWindow += bytesAcked
-	}
-
-	// Always allow sending at least |bytes_acked| in response.
-	b.recoveryWindow = max(b.recoveryWindow, b.bytesInFlight+bytesAcked)
-	b.recoveryWindow = max(b.minCongestionWindow, b.recoveryWindow)
 }
 
 func bdpFromRttAndBandwidth(rtt time.Duration, bandwidth Bandwidth) ByteCount {
