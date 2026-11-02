@@ -49,6 +49,12 @@ const (
 	minRttExpiry = 10 * time.Second
 	// The minimum time the connection can spend in PROBE_RTT mode.
 	probeRttTime = 200 * time.Millisecond
+	// probeRttMaxStay is how long PROBE_RTT may last without a round trip to end
+	// it. A probe measures the round trip of a path, and a path whose peer answers
+	// nothing does not have one: staying there holds the window at the minimum and
+	// the estimate decays with it, so the probe ends on its own clock and the
+	// window goes back to probing for bandwidth.
+	probeRttMaxStay = time.Second
 	// probeRTTWindowSlack is how much room a PROBE_RTT window is allowed over the
 	// minimum: the window is checked before a packet leaves, so one more packet is
 	// already in flight by the time it looks full.
@@ -174,6 +180,15 @@ type bbrSender struct {
 	exitProbeRttAt time.Time
 	// Indicates whether a round-trip has passed since PROBE_RTT became active.
 	probeRttRoundPassed bool
+	// enteredProbeRttAt is when this round of PROBE_RTT began. Leaving it needs a
+	// round trip to have passed, and a round trip is only counted when an
+	// acknowledgement arrives: an association whose peer has nothing to send never
+	// gets one, and a PROBE_RTT that waits for it holds the window at four packets
+	// for as long as the stall lasts. The bandwidth estimate then decays with the
+	// delivery it measures, which is the rate the window is derived from, so the
+	// stall feeds itself. What ends it is this timestamp: a probe that lasted long
+	// enough to have measured the round trip it was there for has measured it.
+	enteredProbeRttAt time.Time
 
 	// Indicates whether the most recent bandwidth sample was marked as
 	// app-limited.
@@ -540,6 +555,7 @@ func (b *bbrSender) maybeEnterOrExitProbeRtt(now time.Time, isRoundStart, minRtt
 		// Do not decide on the time to exit PROBE_RTT until the |bytes_in_flight|
 		// is at the target small value.
 		b.exitProbeRttAt = time.Time{}
+		b.enteredProbeRttAt = now
 	}
 
 	if b.mode == bbrModeProbeRtt {
@@ -563,7 +579,13 @@ func (b *bbrSender) maybeEnterOrExitProbeRtt(now time.Time, isRoundStart, minRtt
 			if isRoundStart {
 				b.probeRttRoundPassed = true
 			}
-			if now.Sub(b.exitProbeRttAt) >= 0 && b.probeRttRoundPassed {
+			// A probe that has been in this mode for longer than the round trip it
+			// came to measure is done with it whether or not an acknowledgement
+			// came back: the alternative is a window held at four packets until
+			// the peer sends something, which is what a peer waiting for credit
+			// never does.
+			probeRttDone := b.probeRttRoundPassed || now.Sub(b.enteredProbeRttAt) >= probeRttMaxStay
+			if now.Sub(b.exitProbeRttAt) >= 0 && probeRttDone {
 				b.minRttTimestamp = now
 				if !b.isAtFullBandwidth {
 					b.enterStartupMode(now)
@@ -590,7 +612,17 @@ func (b *bbrSender) calculatePacingRate() {
 	if b.bandwidthEstimate() == 0 {
 		return
 	}
-	b.measuredPacingRate = Bandwidth(b.pacingGain * float64(b.bandwidthEstimate()))
+	rate := Bandwidth(b.pacingGain * float64(b.bandwidthEstimate()))
+	// What the window allows is the floor. A rate is only as good as the estimate
+	// behind it, and the estimate is built from the delivery that rate causes: a
+	// rate that collapsed with the estimate keeps the delivery it is measured from
+	// collapsed, and the window — which is the thing that was measured to fit the
+	// path — is never asked to prove otherwise. Pacing below what the window allows
+	// is the one state the estimate cannot leave on its own.
+	if windowRate := Bandwidth(bandwidthFromDelta(b.GetCongestionWindow(), b.getMinRtt())); rate < windowRate {
+		rate = windowRate
+	}
+	b.measuredPacingRate = rate
 }
 
 // Determines the appropriate congestion window for the connection.
