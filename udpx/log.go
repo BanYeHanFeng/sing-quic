@@ -55,6 +55,14 @@ type statsSnapshot struct {
 	inFlight     int
 	queued       int
 	state        string
+	// The credit this end granted the peer and what it has used, and the credit
+	// the peer granted this end. A transfer that stops with an empty queue is one
+	// waiting for a window, and which window it is waiting for is the first thing
+	// to look at.
+	sendLimit    uint64
+	sendUsed     uint64
+	recvLimit    uint64
+	recvReceived uint64
 }
 
 func (a *association) snapshot() statsSnapshot {
@@ -74,6 +82,12 @@ func (a *association) snapshot() statsSnapshot {
 	a.flightMu.Lock()
 	snapshot.inFlight = a.inFlight.len()
 	a.flightMu.Unlock()
+	a.fcMu.Lock()
+	snapshot.sendLimit = a.sendCredit.limit
+	snapshot.sendUsed = a.sendCredit.used
+	snapshot.recvLimit = a.recvLimit
+	snapshot.recvReceived = a.recvReceived
+	a.fcMu.Unlock()
 	a.ccMu.Lock()
 	snapshot.cwnd = int64(a.cc.GetCongestionWindow())
 	if diagnostics, isDiagnostics := a.cc.(congestion.Diagnostics); isDiagnostics {
@@ -108,6 +122,8 @@ func (a *association) statsLoop() {
 			" probes=", current.probes-last.probes,
 			" inflight=", current.inFlight,
 			" queued=", current.queued,
+			" sendcredit=", current.sendUsed, "/", current.sendLimit,
+			" recvcredit=", current.recvReceived, "/", current.recvLimit,
 			" ", current.state)
 		last = current
 	}

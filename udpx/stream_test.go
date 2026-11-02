@@ -827,7 +827,7 @@ func TestSendChunksHoldWhatPointsIntoThem(t *testing.T) {
 	listenerConn := udpConn(t)
 	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
 	defer listener.Close()
-	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: 0.2})
+	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: 0.2, lossReturn: 0.2})
 	ctx := testContext(t, 60*time.Second)
 	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
 	if err != nil {

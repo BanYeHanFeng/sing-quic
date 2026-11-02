@@ -162,6 +162,7 @@ func (l *Listener) completeHandshake(hello []byte, source net.Addr) {
 		return
 	}
 	a := newAssociation(l.conn, result, source, l.options, false, false)
+	a.start()
 	a.onClose = func() {
 		l.remove(a.localConnID)
 	}

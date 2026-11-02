@@ -271,6 +271,9 @@ func TestFECGroupNotEnoughShards(t *testing.T) {
 // closed anyway, and a group of one packet to be closed without redundancy.
 func TestFECGroupTimer(t *testing.T) {
 	sender, _, conn := newTestFECPair(t, Options{IdleTimeout: time.Minute, FEC: FECOptions{DataShards: 8, ParityShards: 2}})
+	// What the timer closes is written by the send loop, which is what the waits
+	// below are for.
+	sender.start()
 	// One member on its own is not worth protecting, and the timer is what says
 	// that nothing more is coming.
 	fecQueueFrame(t, sender, 0, 1000, 0)
@@ -324,7 +327,7 @@ func testFECOverLossyLink(t *testing.T, fecOptions FECOptions) {
 	listenerConn := udpConn(t)
 	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
 	defer listener.Close()
-	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: 0.05, delay: 20 * time.Millisecond})
+	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: 0.05, lossReturn: 0.05, delay: 20 * time.Millisecond})
 	ctx := testContext(t, 120*time.Second)
 	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4, FEC: fecOptions})
 	if err != nil {

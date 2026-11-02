@@ -72,8 +72,7 @@ const (
 	// opens its first stream.
 	initialStreams = 256
 
-	// streamBudget is how many streams of the peer one association may have open at
-	// once, which is what this end is willing to remember: an open stream costs an
+	// streamBudget is how many streams of the peer one association may have open at	// once, which is what this end is willing to remember: an open stream costs an
 	// entry in the table (about 1 KB, measured at this many of them) and, until the
 	// application takes it, a place in the accept queue, which is a channel of that
 	// many pointers. Both are bounded by this number, so the memory an association
@@ -86,6 +85,13 @@ const (
 	// connection of a machine is a stream on one session, and a browser alone keeps
 	// hundreds.
 	streamBudget = 4096
+
+	// maxWindowUpdatesPerAck is how many streams may repeat their window in one
+	// acknowledgement. The frame is thirteen bytes, so this bounds what rides along
+	// to a couple of hundred bytes: an association with thousands of streams answers
+	// with a packet of window frames otherwise, and one packet is what the
+	// acknowledgement is worth.
+	maxWindowUpdatesPerAck = 16
 )
 
 // credit is a send-side window: how much data may still be sent.

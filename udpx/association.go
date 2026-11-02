@@ -66,6 +66,12 @@ var ErrIdleTimeout = E.New("udpx: idle timeout")
 var ErrProbeTimeout = E.New("udpx: probe timeout")
 
 const (
+	// windowUpdateInterval is how often a window that moved is repeated while a
+	// transfer is running. It is short enough that a lost window update costs a
+	// second of a transfer rather than a stall, and long enough that the repetition
+	// is a packet a second and not a second transfer.
+	windowUpdateInterval = time.Second
+
 	// maxPacketSize is the size of the largest packet either end sends. Path MTU
 	// discovery is not on the list of things this transport does, so the value
 	// is a constant with a hard ceiling.
@@ -401,18 +407,86 @@ func newAssociation(conn net.PacketConn, result handshakeResult, peer net.Addr, 
 	timers.pto.Stop()
 	a.timers.Store(timers)
 	timers.idle.Reset(a.options.IdleTimeout)
+	gso, gro := a.Offload()
+	a.logInfo("association up local=", hex.EncodeToString(a.localConnID[:]),
+		" peer=", hex.EncodeToString(a.peerConnID[:]), " client=", isClient,
+		" remote=", peer, " gso=", gso, " gro=", gro, " mtu=", a.maxPacketSize())
+	return a
+}
+
+// start runs the loops an association needs to work on its own: the send loop,
+// the keep alive loop and the statistics loop. It is separate from the constructor
+// because those loops write what the send path plans, and a test that drives the
+// send path itself has to be the only one doing it: a second writer is a packet
+// written twice, which is a race in the test rather than in the transport.
+func (a *association) start() {
 	go a.sendLoop()
+	go a.windowLoop()
 	if a.options.KeepAlivePeriod > 0 {
 		go a.keepAliveLoop()
 	}
 	if a.logger != nil {
 		go a.statsLoop()
 	}
-	gso, gro := a.Offload()
-	a.logInfo("association up local=", hex.EncodeToString(a.localConnID[:]),
-		" peer=", hex.EncodeToString(a.peerConnID[:]), " client=", isClient,
-		" remote=", peer, " gso=", gso, " gro=", gro, " mtu=", a.maxPacketSize())
-	return a
+}
+
+// windowLoop repeats the credit this end allows for every stream that has moved
+// its window, once a second, whether or not there is anything to acknowledge.
+//
+// An acknowledgement is the natural place for a window to ride along, but it is
+// also the one thing an association with nothing to say does not send: a peer whose
+// window was spent waits for a frame that is only sent in answer to a packet it
+// cannot send, and both ends sit in a stall that no timer ends. The frame is a
+// ceiling, so repeating it is harmless and the cost is a packet a second while a
+// transfer is running.
+func (a *association) windowLoop() {
+	ticker := time.NewTicker(windowUpdateInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-ticker.C:
+			a.sendWindowUpdates()
+		}
+	}
+}
+
+// sendWindowUpdates sends the windows that moved, for the loop above.
+//
+// The window is moved here whether or not the threshold that an arrival uses says
+// it should be: a sender spends its credit when the application writes, which is
+// before the bytes are on the path, while this end counts what arrived. A path that
+// loses a third of what it carries has a third of the credit spent on bytes the peer
+// is still holding, so the two counts drift apart by exactly the loss, and the
+// window that is half spent by the count that arrived is all spent by the count that
+// was written. What the read allows is therefore asked for once a second regardless.
+func (a *association) sendWindowUpdates() {
+	moved := a.extendWindow()
+	a.streamsMu.Lock()
+	for _, stream := range a.streams {
+		if stream.extendWindow() {
+			moved = true
+		}
+	}
+	a.streamsMu.Unlock()
+	if !moved {
+		return
+	}
+	_ = a.send(a.appendWindowUpdates(nil))
+}
+
+// extendWindow moves the association window forward to what the read allows, and
+// reports whether it moved.
+func (a *association) extendWindow() bool {
+	a.fcMu.Lock()
+	defer a.fcMu.Unlock()
+	limit := min(a.recvReceived+a.recvWindow, a.recvRead+2*a.recvWindow)
+	if limit <= a.recvLimit {
+		return false
+	}
+	a.recvLimit = limit
+	return true
 }
 
 // maxPacketSize is the largest packet this end sends right now. It is a method
@@ -647,7 +721,7 @@ func (a *association) scheduleAck(packetNumber uint32, now time.Time) {
 	a.ackMu.Unlock()
 	if immediate {
 		if len(acknowledgement) > 0 {
-			_ = a.send(acknowledgement)
+			_ = a.send(a.appendWindowUpdates(acknowledgement))
 		}
 		return
 	}
@@ -681,7 +755,43 @@ func (a *association) flushAck() {
 	if len(acknowledgement) == 0 {
 		return
 	}
-	_ = a.send(acknowledgement)
+	_ = a.send(a.appendWindowUpdates(acknowledgement))
+}
+
+// appendWindowUpdates appends the credit this end allows now to an acknowledgement
+// that is about to leave.
+//
+// A window that moved in a packet the path dropped is a peer that stops sending
+// until something else makes it ask again, and on a path that loses a third of what
+// it carries that is a stall of the whole transfer: the peer has data to write, the
+// window it was given is spent, and the only frame that could unblock it is one that
+// was already sent. The frames are ceilings rather than increments, so repeating one
+// costs a few bytes and says nothing new: they ride along with every acknowledgement
+// instead of being sent once and hoped for.
+func (a *association) appendWindowUpdates(dst []byte) []byte {
+	a.fcMu.Lock()
+	limit := a.recvLimit
+	a.fcMu.Unlock()
+	dst = appendMaxData(dst, limit)
+	// A busy association has as many streams as the peer opened, and one frame for
+	// each of them does not fit in a packet: what rides along is the streams whose
+	// window moved, and only as many of those as a packet holds. A stream that is
+	// left out is one whose window is still the one both ends started with, or one
+	// whose next arrival moves it again.
+	a.streamsMu.Lock()
+	appended := 0
+	for _, stream := range a.streams {
+		if appended >= maxWindowUpdatesPerAck {
+			break
+		}
+		before := len(dst)
+		dst = stream.appendWindowUpdate(dst)
+		if len(dst) > before {
+			appended++
+		}
+	}
+	a.streamsMu.Unlock()
+	return dst
 }
 
 // roundTrip returns the current round trip estimate.
@@ -778,6 +888,7 @@ func Dial(ctx context.Context, conn net.PacketConn, remote net.Addr, credential 
 		return nil, err
 	}
 	a := newAssociation(conn, result, remote, options, true, true)
+	a.start()
 	go a.readLoop()
 	go a.startMTUProbe()
 	return a, nil

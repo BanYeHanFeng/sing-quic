@@ -36,8 +36,15 @@ type simulatedLink struct {
 
 // linkOptions is what the path between the two ends does to a datagram.
 type linkOptions struct {
-	// loss is the fraction of datagrams that never arrive.
-	loss float64
+	// loss is the fraction of datagrams that never arrive on the way to the
+	// server, and lossReturn the fraction that never arrive on the way back. The
+	// two are separate because a path that drops one direction and not the other
+	// is what a mobile uplink looks like, and what it costs the transport differs
+	// by direction: a data packet that never arrives is data the peer has to be
+	// sent again, while an acknowledgement that never arrives is one the sender
+	// mistakes for a loss it has to recover from.
+	loss       float64
+	lossReturn float64
 	// duplicate is the fraction of datagrams that arrive twice.
 	duplicate float64
 	// delay is how long a datagram spends on the way, each direction.
@@ -98,9 +105,13 @@ func (l *simulatedLink) forward(from, to net.PacketConn, destination func() net.
 		// The buffer is reused for the next datagram, so what the path decided to
 		// keep has to be its own copy.
 		packet := append([]byte(nil), buffer[:n]...)
-		l.send(queue, packet, to, destination, &free)
+		loss := l.options.loss
+		if from == l.back {
+			loss = l.options.lossReturn
+		}
+		l.send(queue, packet, to, destination, &free, loss)
 		if l.roll(l.options.duplicate) {
-			l.send(queue, packet, to, destination, &free)
+			l.send(queue, packet, to, destination, &free, loss)
 		}
 	}
 }
@@ -108,8 +119,8 @@ func (l *simulatedLink) forward(from, to net.PacketConn, destination func() net.
 // send puts one datagram on the path, which either drops it or arrives after the
 // delay the path picked for it. A path with a capacity takes its time carrying one
 // datagram, and the next one waits for it.
-func (l *simulatedLink) send(queue chan<- simulatedPacket, packet []byte, to net.PacketConn, destination func() net.Addr, free *time.Time) {
-	if l.roll(l.options.loss) {
+func (l *simulatedLink) send(queue chan<- simulatedPacket, packet []byte, to net.PacketConn, destination func() net.Addr, free *time.Time, loss float64) {
+	if l.roll(loss) {
 		return
 	}
 	arrival := time.Now()
@@ -242,7 +253,7 @@ func TestTransferUnderLoss(t *testing.T) {
 			listenerConn := udpConn(t)
 			listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
 			defer listener.Close()
-			link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: loss})
+			link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: loss, lossReturn: loss})
 
 			ctx := testContext(t, 60*time.Second)
 			client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
@@ -316,10 +327,11 @@ func TestStreamOverALossyCapacityPath(t *testing.T) {
 	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
-		loss:   0.05,
-		delay:  100 * time.Millisecond,
-		jitter: 2 * time.Millisecond,
-		rate:   capacity,
+		loss:       0.05,
+		lossReturn: 0.05,
+		delay:      100 * time.Millisecond,
+		jitter:     2 * time.Millisecond,
+		rate:       capacity,
 	})
 
 	ctx := testContext(t, 60*time.Second)
@@ -373,4 +385,74 @@ func testName(loss float64) string {
 	default:
 		return "loss-20%"
 	}
+}
+
+// TestDownloadOverUplinkLoss requires a transfer whose data travels in the
+// direction that loses nothing to complete while its acknowledgements travel in
+// the one that loses most of them. That is what a mobile uplink is: the downlink
+// carries the transfer, the uplink carries the answers to it.
+//
+// A lost acknowledgement is not a lost packet, and a sender that cannot tell the
+// two apart has nothing to go on but the packet numbers an acknowledgement did
+// not name: it declares everything behind the largest one lost and sends its
+// window again. The path then carries duplicates until the window collapses, and
+// the transfer stops even though no data was missing. What separates the two is
+// the range limit: an acknowledgement that names every range it has is telling
+// the sender what it holds, and one that ran out of room is not.
+func TestDownloadOverUplinkLoss(t *testing.T) {
+	if testing.Short() {
+		t.Skip("a path that loses most of one direction takes its time")
+	}
+	const payloadSize = 256 * 1024
+	password := NewPassword("password")
+	listenerConn := udpConn(t)
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
+	defer listener.Close()
+	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
+		loss:       0.4,
+		lossReturn: 0,
+		delay:      100 * time.Millisecond,
+	})
+
+	ctx := testContext(t, 120*time.Second)
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseWithError(nil)
+	server, err := listener.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.CloseWithError(nil)
+
+	payload := testPayload(payloadSize)
+	go func() {
+		stream, openErr := server.OpenStream(ctx)
+		if openErr != nil {
+			t.Errorf("open the download: %v", openErr)
+			return
+		}
+		if _, writeErr := stream.Write(payload); writeErr != nil {
+			t.Errorf("download: %v", writeErr)
+			return
+		}
+		if closeErr := stream.CloseWrite(); closeErr != nil {
+			t.Errorf("close the download: %v", closeErr)
+		}
+	}()
+	start := time.Now()
+	stream, err := client.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, err := readToEnd(stream, len(payload))
+	if err != nil {
+		t.Fatalf("the download stopped after %d of %d bytes: %v", len(read), len(payload), err)
+	}
+	if !bytes.Equal(read, payload) {
+		t.Fatal("the download changed on the way")
+	}
+	elapsed := time.Since(start)
+	t.Logf("%d KiB in %v", payloadSize/1024, elapsed.Round(time.Millisecond))
 }

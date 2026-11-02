@@ -745,6 +745,38 @@ func (s *Stream) moveWindow() {
 	}
 }
 
+// appendWindowUpdate appends the credit this stream allows now to an acknowledgement
+// that is about to leave, for a stream the peer is still writing to. The window is a
+// ceiling, so what the peer already knows is not worth a frame: only a stream whose
+// window has moved past the one both ends started with has anything to say, and it
+// keeps saying it until the stream ends because the acknowledgement that first said
+// it is what the path may have dropped.
+func (s *Stream) appendWindowUpdate(dst []byte) []byte {
+	s.recvMu.Lock()
+	limit := s.recvLimit
+	moved := limit > initialStreamWindow
+	s.recvMu.Unlock()
+	if !moved {
+		return dst
+	}
+	return appendMaxStreamData(dst, s.id, limit)
+}
+
+// extendWindow moves this stream's window forward to what the read allows, and
+// reports whether it moved. It is what the window loop asks for, for the reason the
+// association's own is asked for: a sender spends its credit when it writes, and a
+// path that drops what it carries spends it on bytes this end never saw.
+func (s *Stream) extendWindow() bool {
+	s.recvMu.Lock()
+	defer s.recvMu.Unlock()
+	limit := min(s.recvHighest+s.recvWindow, s.readOffset+2*s.recvWindow)
+	if limit <= s.recvLimit {
+		return false
+	}
+	s.recvLimit = limit
+	return true
+}
+
 // signalSend wakes the writer: credit moved forward, or the stream ended.
 func (s *Stream) signalSend() {
 	select {

@@ -92,6 +92,8 @@ func TestWriteFailedLogsSizes(t *testing.T) {
 func TestWriteTooLongStepsDownMTU(t *testing.T) {
 	conn := newFakeConn()
 	a := newTestAssociation(t, conn)
+	// The retry after the refused size is written by the send loop.
+	a.start()
 	a.batchIO = &failingIO{conn: conn, failures: 1, err: os.NewSyscallError("sendmsg", syscall.EMSGSIZE)}
 	a.sendMu.Lock()
 	a.mtu = 1352

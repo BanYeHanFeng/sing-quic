@@ -197,10 +197,11 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
-		loss:      0.02,
-		duplicate: 0.02,
-		delay:     100 * time.Millisecond,
-		jitter:    30 * time.Millisecond,
+		loss:       0.02,
+		lossReturn: 0.02,
+		duplicate:  0.02,
+		delay:      100 * time.Millisecond,
+		jitter:     30 * time.Millisecond,
 	})
 
 	ctx := testContext(t, 240*time.Second)
