@@ -41,8 +41,12 @@ const (
 	// path has been measured.
 	initialPTO = 500 * time.Millisecond
 
-	// maxProbeBackoff is how often the wait between probes may double.
-	maxProbeBackoff = 4
+	// maxProbeBackoff is how often the wait between probes may double. It stays
+	// small because a probe is also what asks a peer for the acknowledgement that
+	// carries a window this end is waiting on: a wait of sixteen round trips
+	// between questions turns a lost window update into a stall long enough to look
+	// like a broken path.
+	maxProbeBackoff = 2
 
 	// maxProbeSilence is how long an association may ask a peer that answers
 	// nothing before the peer is declared gone. A path that comes back within it
@@ -206,12 +210,13 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	for _, packet := range fecRecovered {
 		releaseFrames(packet.frames)
 	}
-	if len(acked) > 0 {
-		// An answer arrived, so the path is there and the probes start over.
-		a.probes = 0
-		a.probeSince = time.Time{}
-	}
-	lost := a.inFlight.lost(now, acknowledgement.largest, lossDelay(a.rtt))
+	// An answer arrived, so the path is there and the probes start over. It does
+	// not have to acknowledge anything new to say that: an answer that settled
+	// nothing is still a packet the peer sent, and a probe that kept counting it
+	// as unanswered would close an association that is answering.
+	a.probes = 0
+	a.probeSince = time.Time{}
+	lost := a.inFlight.lost(now, acknowledgement.largest, lossDelay(a.rtt), acknowledgement.count >= maxAckRanges)
 	a.stats.lostPackets.Add(int64(len(lost)))
 	if len(lost) > 0 || len(fecRecovered) > 0 {
 		a.logDebug("ack ", acknowledgement.largest, " acked=", len(acked), " lost=", len(lost),

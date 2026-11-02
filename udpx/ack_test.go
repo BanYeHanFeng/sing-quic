@@ -138,6 +138,31 @@ func TestAckRoundTrip(t *testing.T) {
 	}
 }
 
+// TestAckNamesEveryRangeItHolds requires an acknowledgement to carry every range
+// the association remembers. The ranges it leaves out are the ones the sender
+// reads as holes, declares lost and sends again, so on a path that loses enough
+// to split what arrived into more ranges than an acknowledgement carries, the
+// transfer would be sent twice over and the window would collapse under it.
+func TestAckNamesEveryRangeItHolds(t *testing.T) {
+	var ranges pnRanges
+	// Every other packet arrived, which is a path that loses half of them: what
+	// arrived is one range per packet.
+	for index := uint32(0); index < 2*receivedRangeLimit; index += 2 {
+		ranges.add(index)
+	}
+	built := ranges.ack()
+	if built.count != receivedRangeLimit {
+		t.Fatalf("acknowledgement of %d ranges, want %d", built.count, receivedRangeLimit)
+	}
+	parsed, err := nextFrameAck(t, built.appendTo(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.count != receivedRangeLimit {
+		t.Fatalf("parsed %d ranges, want %d", parsed.count, receivedRangeLimit)
+	}
+}
+
 func nextFrameAck(t *testing.T, encoded []byte) (ack, error) {
 	t.Helper()
 	f, rest, err := nextFrame(encoded)

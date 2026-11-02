@@ -304,13 +304,16 @@ func (s *sentPackets) acked(ranges []pnRange) []*sentPacket {
 }
 
 // lost marks the packets that are lost by now and returns them, oldest first.
-func (s *sentPackets) lost(now time.Time, largestAcked uint32, lossDelay time.Duration) []*sentPacket {
+// ackTruncated says the acknowledgement that largestAcked came from named as
+// many ranges as an acknowledgement can carry, so the packet numbers it left out
+// are ones the peer may have received rather than ones it is missing.
+func (s *sentPackets) lost(now time.Time, largestAcked uint32, lossDelay time.Duration, ackTruncated bool) []*sentPacket {
 	var lost []*sentPacket
 	for _, packet := range s.packets {
 		if packet.removed {
 			continue
 		}
-		if !isLost(packet, now, largestAcked, lossDelay) {
+		if !isLost(packet, now, largestAcked, lossDelay, ackTruncated) {
 			// The table is ordered by packet number and, with it, by send time, so
 			// nothing behind a packet that is not lost is lost either.
 			break
@@ -388,15 +391,25 @@ func (s *sentPackets) compact() {
 // has been in flight for longer than a round trip and something behind it was
 // acknowledged, so its acknowledgement is therefore not on the way.
 //
+// The packet number rule is only what the acknowledgement was allowed to say. It
+// names the ranges the peer holds, so a number three behind the largest one is a
+// number the peer reported as missing — unless the acknowledgement ran out of
+// room for ranges, in which case the numbers it left out are ones the peer may
+// well have received, and the rule would declare them lost and send them again.
+// What is left then is the time rule, which asks the peer for nothing but a round
+// trip: a packet that long in flight whose data the peer has not acknowledged is
+// worth sending again either way, and one whose acknowledgement was merely lost
+// costs a duplicate rather than a window.
+//
 // A packet the peer has acknowledged nothing behind is not lost by the second rule
 // however long it has been in flight: its answer may be exactly what is on the way,
 // and a retransmission of it would be a duplicate. A packet like that is what the
 // probe asks about instead, which is the one place where being late is the signal.
-func isLost(packet *sentPacket, now time.Time, largestAcked uint32, lossDelay time.Duration) bool {
+func isLost(packet *sentPacket, now time.Time, largestAcked uint32, lossDelay time.Duration, ackTruncated bool) bool {
 	if largestAcked < packet.packetNumber {
 		return false
 	}
-	if largestAcked-packet.packetNumber >= packetThreshold {
+	if !ackTruncated && largestAcked-packet.packetNumber >= packetThreshold {
 		return true
 	}
 	return now.Sub(packet.sentAt) >= lossDelay

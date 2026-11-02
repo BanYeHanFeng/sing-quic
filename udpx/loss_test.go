@@ -169,6 +169,28 @@ func TestLossByPacketThreshold(t *testing.T) {
 	}
 }
 
+// TestLossWithTruncatedAck requires a packet number an acknowledgement had no room
+// to name to stay in flight until the time rule says otherwise. An acknowledgement
+// that named as many ranges as it can carry is not saying the numbers between them
+// were lost: the peer may hold them and the acknowledgement ran out of room. A
+// sender that reads the gaps as losses sends what the peer already has and charges
+// the window for a loss the path did not cause.
+func TestLossWithTruncatedAck(t *testing.T) {
+	packet := &sentPacket{packetNumber: 10, sentAt: time.Now()}
+	lossDelay := time.Second
+	if !isLost(packet, time.Now(), 20, lossDelay, false) {
+		t.Fatal("a packet three behind the largest acknowledged is not lost")
+	}
+	if isLost(packet, time.Now(), 20, lossDelay, true) {
+		t.Fatal("a packet the acknowledgement had no room to name is lost")
+	}
+	// The time rule still applies: a packet in flight for longer than the round
+	// trip is lost whatever the acknowledgement could name.
+	if !isLost(packet, time.Now().Add(2*lossDelay), 20, lossDelay, true) {
+		t.Fatal("a packet in flight for longer than the round trip is not lost")
+	}
+}
+
 // TestLossByTimeThreshold requires a packet that has been in flight for longer
 // than the round trip to be sent again once something behind it was acknowledged,
 // and requires a packet the peer acknowledged nothing behind to be left alone: its
@@ -398,5 +420,36 @@ func TestProbeSurvivesAnAnswer(t *testing.T) {
 	}
 	if !since.IsZero() {
 		t.Fatalf("probe start %v after an answer", since)
+	}
+}
+
+// TestProbeSurvivesAnAnswerThatSettlesNothing requires an answer that acknowledged
+// no new packet to count as an answer all the same. A probe asks whether the peer is
+// there, and a peer whose acknowledgement covers only packets already settled is
+// there: counting that as silence is what closes an association that is answering,
+// and on a path that loses acknowledgements that is most of them.
+func TestProbeSurvivesAnAnswerThatSettlesNothing(t *testing.T) {
+	conn := newFakeConn()
+	a := newTestAssociation(t, conn)
+	queueStream(t, a, 0, 1000)
+	a.handleAck(testAck(0, pnRange{start: 0, end: 0}), time.Now())
+	if err := a.flush(); err != nil {
+		t.Fatal(err)
+	}
+	a.flightMu.Lock()
+	a.probes = 3
+	a.probeSince = time.Now().Add(-maxProbeSilence / 2)
+	a.flightMu.Unlock()
+	// The same acknowledgement again: it settles nothing that was still in flight.
+	a.handleAck(testAck(0, pnRange{start: 0, end: 0}), time.Now())
+	a.flightMu.Lock()
+	probes := a.probes
+	since := a.probeSince
+	a.flightMu.Unlock()
+	if probes != 0 {
+		t.Fatalf("%d probes after an answer that settled nothing", probes)
+	}
+	if !since.IsZero() {
+		t.Fatalf("probe start %v after an answer that settled nothing", since)
 	}
 }

@@ -20,11 +20,13 @@ import (
 // delay, whichever comes first, and goes out immediately when a packet arrives
 // out of order: a hole is worth reporting as soon as it is known.
 const (
-	// maxAckRanges is how many disjoint ranges an acknowledgement carries. A
-	// peer that has lost more than this many packets in a row is in the middle
-	// of an outage, and the older ranges it would report are the ones whose
-	// retransmissions are already on the way.
-	maxAckRanges = 8
+	// maxAckRanges is how many disjoint ranges an acknowledgement carries. It is
+	// what an association remembers, so an acknowledgement never leaves out a
+	// range the peer still holds: on a path that drops enough packets to split
+	// what arrived into more ranges than this, the ranges left out are the ones
+	// the sender would declare lost and send again, and a path that drops that
+	// much would then be sent everything twice.
+	maxAckRanges = receivedRangeLimit
 
 	// receivedRangeLimit bounds the ranges an association remembers. Ranges
 	// rather than a bitmap or a list of numbers: a peer that skips a thousand
@@ -179,9 +181,9 @@ type ack struct {
 	largest uint32
 	count   int
 
-	recovered      [maxAckRanges]pnRange
+	recovered        [maxAckRanges]pnRange
 	recoveredLargest uint32
-	recoveredCount int
+	recoveredCount   int
 }
 
 // ackBodyLen is the size of the body of an acknowledgement frame.
