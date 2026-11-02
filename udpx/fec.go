@@ -192,10 +192,14 @@ const (
 	// is one packet long.
 	fecMinGroupMembers = 2
 
-	// fecGroupTimeout is how long an open group waits for more members before it is
-	// closed as it is. Parity is not something the peer waits for, so this is the
-	// cost of protecting a group the sender was too idle to fill: a member that is
-	// lost is recovered one timeout later instead of one round trip later.
+	// fecGroupTimeout is how long a group waits for a member that does not follow
+	// before it is closed as it is. Parity is not something the peer waits for, so
+	// this is the cost of protecting a group the sender was too idle to fill: a
+	// member that is lost is recovered one timeout later instead of one round trip
+	// later. It is a gap and not a deadline counted from the first member, because
+	// a group that keeps being fed is one that fills: a deadline makes the group
+	// size a function of the send rate, and then data_shards is a count no transfer
+	// ever reaches.
 	fecGroupTimeout = 10 * time.Millisecond
 
 	// fecReceiveGroups is how many groups a receiver assembles at once. A group is
@@ -223,9 +227,10 @@ const (
 // order the groups describe.
 type fecSender struct {
 	dataShards int
-	// parityShards is how many redundant packets each group gets. It is what the
-	// caller asked for: redundancy is a cost paid on every group, so how much of it
-	// is worth paying is the caller's answer, not something this end measures.
+	// parityShards is the redundancy of a full group, which is what the caller
+	// asked for: redundancy is a cost paid on every group, so how much of it is
+	// worth paying is the caller's answer, not something this end measures. A group
+	// that closes before it fills carries its share of it, see parityFor.
 	parityShards int
 
 	codec fecCodec
@@ -276,6 +281,24 @@ func newFECSender(options FECOptions) *fecSender {
 		dataShards:   dataShards,
 		parityShards: parityShards,
 	}
+}
+
+// parityFor returns how many parity shards a group of members members carries.
+//
+// The caller's count is the redundancy of a full group, and a group that closed
+// before it filled carries its share of it: two parity shards for a group of two
+// members is everything sent twice, which is not the trade a caller asking for a
+// sixteenth of the traffic made, and the small groups are the ones a transfer
+// spends most of its time in once the rate drops.
+func (s *fecSender) parityFor(members int) int {
+	parity := (members*s.parityShards + s.dataShards - 1) / s.dataShards
+	if parity < 1 {
+		parity = 1
+	}
+	if parity > s.parityShards {
+		parity = s.parityShards
+	}
+	return parity
 }
 
 // buffer returns an empty buffer of one packet's size, kept from a group that was
@@ -375,8 +398,11 @@ func (s *fecSender) add(packet []byte, packetNumber uint32) {
 		// A group is named after its first member, which is what a receiver counts
 		// from: members are not enumerated, they are the packet numbers that follow.
 		s.groupID = packetNumber
-		s.timer.Reset(fecGroupTimeout)
 	}
+	// The timer is rearmed by every member, so what it measures is the gap behind
+	// the group rather than its age: a group that is still being fed waits for the
+	// member that fills it, and one the sender has stopped feeding closes as it is.
+	s.timer.Reset(fecGroupTimeout)
 	member := append(s.buffer(), packet...)
 	s.group = append(s.group, member)
 	if len(member) > s.shardLen {
@@ -427,7 +453,7 @@ func (a *association) closeGroupLocked() error {
 	if len(members) == 0 {
 		return nil
 	}
-	parityCount := sender.parityShards
+	parityCount := sender.parityFor(len(members))
 	description := fecHeader{
 		GroupID:     sender.groupID,
 		MemberCount: uint8(len(members)),
@@ -490,6 +516,7 @@ func (a *association) planParityLocked(description fecHeader, shard []byte) erro
 		packet:       packet,
 		payloadStart: payloadStart,
 	})
+	a.stats.paritySent.Add(1)
 	return nil
 }
 

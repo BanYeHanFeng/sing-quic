@@ -32,6 +32,7 @@ type associationStats struct {
 	lostPackets  atomic.Int64
 	retransmits  atomic.Int64
 	recovered    atomic.Int64
+	paritySent   atomic.Int64
 	probes       atomic.Int64
 	spuriousLoss atomic.Int64
 	// droppedDatagrams counts what the application did not keep up with, which is
@@ -48,6 +49,7 @@ type statsSnapshot struct {
 	lostPackets  int64
 	retransmits  int64
 	recovered    int64
+	paritySent   int64
 	probes       int64
 	spuriousLoss int64
 	dropped      int64
@@ -74,6 +76,7 @@ func (a *association) snapshot() statsSnapshot {
 		lostPackets:  a.stats.lostPackets.Load(),
 		retransmits:  a.stats.retransmits.Load(),
 		recovered:    a.stats.recovered.Load(),
+		paritySent:   a.stats.paritySent.Load(),
 		probes:       a.stats.probes.Load(),
 		spuriousLoss: a.stats.spuriousLoss.Load(),
 		dropped:      a.stats.droppedDatagrams.Load(),
@@ -118,6 +121,7 @@ func (a *association) statsLoop() {
 			" retx=", current.retransmits-last.retransmits,
 			" spurious=", current.spuriousLoss-last.spuriousLoss,
 			" fec=", current.recovered-last.recovered,
+			" parity=", current.paritySent-last.paritySent,
 			" drop=", current.dropped-last.dropped,
 			" probes=", current.probes-last.probes,
 			" inflight=", current.inFlight,
