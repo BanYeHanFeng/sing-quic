@@ -298,6 +298,15 @@ func (b *bbrSender) CanSend(bytesInFlight ByteCount) bool {
 	return bytesInFlight < b.GetCongestionWindow()
 }
 
+// OnAppLimited tells the sampler that the application has nothing to send, which
+// is what keeps a quiet association from measuring itself: the packets after it are
+// keep-alives, and a keep-alive's rate is the rate of the application, not of the
+// path. The sample they produce is ignored until one of them is acknowledged, at
+// which point the phase ends and the next real transfer is measured again.
+func (b *bbrSender) OnAppLimited() {
+	b.sampler.onAppLimited()
+}
+
 // GetCongestionWindow is the window the transport may fill. It is the model's
 // window and nothing else: a loss does not shrink it, because a loss is not what
 // the window is built from. What a loss does is lower the estimate of the path

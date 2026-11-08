@@ -113,6 +113,19 @@ func (a *association) windowAllows() bool {
 	return a.cc.CanSend(charged)
 }
 
+// congestionAppLimited says the queue ran empty, so the next packets are what the
+// application asked for and not what the path can carry. Without it an idle
+// association measures its keep-alives: one packet a second is a few hundred bits,
+// the bandwidth filter takes that as the newest estimate, and the window derived
+// from it closes to the floor. What follows is a transfer that crawls until
+// something restarts the association, which is the shape of the report this was
+// found by.
+func (a *association) congestionAppLimited() {
+	a.ccMu.Lock()
+	defer a.ccMu.Unlock()
+	a.cc.OnAppLimited()
+}
+
 // pacingWait is how long the next batch has to wait, or zero when it may leave now.
 //
 // The window is asked once per packet and the pacing once per batch: pacing is what

@@ -81,6 +81,13 @@ type Controller interface {
 	// what was in flight before either of them left the flight table.
 	OnCongestionEvent(priorInFlight ByteCount, eventTime time.Time, ackedPackets []AckedPacketInfo, lostPackets []LostPacketInfo)
 	CanSend(bytesInFlight ByteCount) bool
+	// OnAppLimited says the application had nothing to send. What the packets after
+	// it measure is the rate the application asked for, not the rate the path
+	// carries: a keep-alive every second is a few hundred bits, and a bandwidth
+	// filter that took it would forget the path in the window it takes to send a
+	// few of them. It is reported rather than inferred because only the transport
+	// knows when its queue ran empty.
+	OnAppLimited()
 	// PacingWait is how long the send path has to wait before the next batch may
 	// leave, or zero when it may leave now. It is asked once per batch, because a
 	// batch is one write to the socket: the rate is enforced on batches, and the

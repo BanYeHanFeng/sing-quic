@@ -546,11 +546,15 @@ func (a *association) pump() error {
 		frames := a.nextFramesLocked()
 		if frames == nil {
 			pending := len(a.batch.pending) > 0
+			empty := a.queue.len() == 0
 			a.sendMu.Unlock()
 			if pending {
 				if err := a.writeBatch(); err != nil {
 					return err
 				}
+			}
+			if empty {
+				a.congestionAppLimited()
 			}
 			return nil
 		}
