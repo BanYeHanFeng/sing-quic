@@ -72,6 +72,14 @@ const (
 	// is a packet a second and not a second transfer.
 	windowUpdateInterval = time.Second
 
+	// maxParseFailures is how many authenticated packets in a row may fail to
+	// parse before the association ends. One that fails is one packet the peer
+	// wrote in a shape this end does not read — a length that runs past the end of
+	// the payload, a frame type from another version — and dropping it costs that
+	// packet, not the session. What a run of them means is that the two ends are
+	// not speaking the same protocol, which no amount of dropping fixes.
+	maxParseFailures = 8
+
 	// maxPacketSize is the size of the largest packet either end sends. Path MTU
 	// discovery is not on the list of things this transport does, so the value
 	// is a constant with a hard ceiling.
@@ -252,6 +260,10 @@ type association struct {
 	// receive path has to know about it.
 	fec        fecReceiver
 	recovering bool
+	// parseFailures counts authenticated packets that failed to parse, in a row,
+	// which is what tells a peer this end cannot follow apart from a packet it
+	// cannot.
+	parseFailures int
 
 	// timers are the timers of an association, in one place because a timer that
 	// fires reads them: they are built with the association and never change, so
@@ -671,9 +683,20 @@ func (a *association) handlePacket(packet []byte, source net.Addr) error {
 		var f frame
 		f, payload, err = nextFrame(payload)
 		if err != nil {
-			a.shutdown(err, true)
+			// The packet authenticated, so it is the peer's and its shape is the
+			// peer's too: one that does not parse is one packet this end cannot
+			// read, not a session that has to end. Ending it here is what turned a
+			// single malformed answer into every connection of the session dying
+			// with it.
+			a.parseFailures++
+			if a.parseFailures >= maxParseFailures {
+				a.shutdown(err, true)
+				return err
+			}
+			a.logDebug("drop packet ", packetHeader.PacketNumber, " of ", len(packet), " bytes: ", err)
 			return err
 		}
+		a.parseFailures = 0
 		switch f.frameType {
 		case frameTypePing:
 			ackEliciting = true
