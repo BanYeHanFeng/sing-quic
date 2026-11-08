@@ -462,31 +462,48 @@ func (a *association) windowLoop() {
 // window that is half spent by the count that arrived is all spent by the count that
 // was written. What the read allows is therefore asked for once a second regardless.
 func (a *association) sendWindowUpdates() {
-	moved := a.extendWindow()
+	var payload []byte
+	if limit, moved := a.extendWindow(); moved {
+		payload = appendMaxData(payload, limit)
+	}
 	a.streamsMu.Lock()
+	var updates []streamWindowUpdate
 	for _, stream := range a.streams {
-		if stream.extendWindow() {
-			moved = true
+		limit, moved := stream.extendWindow()
+		if moved {
+			updates = append(updates, streamWindowUpdate{id: stream.id, limit: limit})
 		}
 	}
 	a.streamsMu.Unlock()
-	if !moved {
-		return
+	for _, update := range updates {
+		if len(payload) > 0 && len(payload)+maxStreamDataFrameLen > a.maxPayload {
+			_ = a.send(payload)
+			payload = nil
+		}
+		payload = appendMaxStreamData(payload, update.id, update.limit)
 	}
-	_ = a.send(a.appendWindowUpdates(nil))
+	if len(payload) > 0 {
+		_ = a.send(payload)
+	}
+}
+
+// streamWindowUpdate is one stream's credit that the window loop has to announce.
+type streamWindowUpdate struct {
+	id    uint32
+	limit uint64
 }
 
 // extendWindow moves the association window forward to what the read allows, and
 // reports whether it moved.
-func (a *association) extendWindow() bool {
+func (a *association) extendWindow() (uint64, bool) {
 	a.fcMu.Lock()
 	defer a.fcMu.Unlock()
 	limit := min(a.recvReceived+a.recvWindow, a.recvRead+2*a.recvWindow)
 	if limit <= a.recvLimit {
-		return false
+		return 0, false
 	}
 	a.recvLimit = limit
-	return true
+	return limit, true
 }
 
 // maxPacketSize is the largest packet this end sends right now. It is a method
@@ -721,7 +738,7 @@ func (a *association) scheduleAck(packetNumber uint32, now time.Time) {
 	a.ackMu.Unlock()
 	if immediate {
 		if len(acknowledgement) > 0 {
-			_ = a.send(a.appendWindowUpdates(acknowledgement))
+			_ = a.send(acknowledgement)
 		}
 		return
 	}
@@ -755,43 +772,7 @@ func (a *association) flushAck() {
 	if len(acknowledgement) == 0 {
 		return
 	}
-	_ = a.send(a.appendWindowUpdates(acknowledgement))
-}
-
-// appendWindowUpdates appends the credit this end allows now to an acknowledgement
-// that is about to leave.
-//
-// A window that moved in a packet the path dropped is a peer that stops sending
-// until something else makes it ask again, and on a path that loses a third of what
-// it carries that is a stall of the whole transfer: the peer has data to write, the
-// window it was given is spent, and the only frame that could unblock it is one that
-// was already sent. The frames are ceilings rather than increments, so repeating one
-// costs a few bytes and says nothing new: they ride along with every acknowledgement
-// instead of being sent once and hoped for.
-func (a *association) appendWindowUpdates(dst []byte) []byte {
-	a.fcMu.Lock()
-	limit := a.recvLimit
-	a.fcMu.Unlock()
-	dst = appendMaxData(dst, limit)
-	// A busy association has as many streams as the peer opened, and one frame for
-	// each of them does not fit in a packet: what rides along is the streams whose
-	// window moved, and only as many of those as a packet holds. A stream that is
-	// left out is one whose window is still the one both ends started with, or one
-	// whose next arrival moves it again.
-	a.streamsMu.Lock()
-	appended := 0
-	for _, stream := range a.streams {
-		if appended >= maxWindowUpdatesPerAck {
-			break
-		}
-		before := len(dst)
-		dst = stream.appendWindowUpdate(dst)
-		if len(dst) > before {
-			appended++
-		}
-	}
-	a.streamsMu.Unlock()
-	return dst
+	_ = a.send(acknowledgement)
 }
 
 // roundTrip returns the current round trip estimate.

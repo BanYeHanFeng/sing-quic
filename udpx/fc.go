@@ -85,13 +85,6 @@ const (
 	// connection of a machine is a stream on one session, and a browser alone keeps
 	// hundreds.
 	streamBudget = 4096
-
-	// maxWindowUpdatesPerAck is how many streams may repeat their window in one
-	// acknowledgement. The frame is thirteen bytes, so this bounds what rides along
-	// to a couple of hundred bytes: an association with thousands of streams answers
-	// with a packet of window frames otherwise, and one packet is what the
-	// acknowledgement is worth.
-	maxWindowUpdatesPerAck = 16
 )
 
 // credit is a send-side window: how much data may still be sent.

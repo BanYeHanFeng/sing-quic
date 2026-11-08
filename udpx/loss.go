@@ -216,7 +216,7 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	// as unanswered would close an association that is answering.
 	a.probes = 0
 	a.probeSince = time.Time{}
-	lost := a.inFlight.lost(now, acknowledgement.largest, lossDelay(a.rtt), acknowledgement.count >= maxAckRanges)
+	lost := a.inFlight.lost(now, acknowledgement.largest, lossDelay(a.rtt), acknowledgement.count >= ackRangeReport)
 	a.stats.lostPackets.Add(int64(len(lost)))
 	if len(lost) > 0 || len(fecRecovered) > 0 {
 		a.logDebug("ack ", acknowledgement.largest, " acked=", len(acked), " lost=", len(lost),

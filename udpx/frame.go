@@ -97,6 +97,10 @@ const (
 	resetStreamBodyLen  = 4 + 1
 )
 
+// maxStreamDataFrameLen is how many bytes one window update takes, which is what
+// bounds how many of them fit in the packet the window loop builds.
+const maxStreamDataFrameLen = 1 + 4 + 8
+
 // Layout of a datagram frame: the type byte, the channel the message belongs to,
 // which message on that channel it is part of, where in that message it goes and
 // how much of it is here. The channel is a key the caller chooses; one association

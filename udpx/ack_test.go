@@ -138,12 +138,12 @@ func TestAckRoundTrip(t *testing.T) {
 	}
 }
 
-// TestAckNamesEveryRangeItHolds requires an acknowledgement to carry every range
-// the association remembers. The ranges it leaves out are the ones the sender
-// reads as holes, declares lost and sends again, so on a path that loses enough
-// to split what arrived into more ranges than an acknowledgement carries, the
-// transfer would be sent twice over and the window would collapse under it.
-func TestAckNamesEveryRangeItHolds(t *testing.T) {
+// TestAckNamesTheRecentRanges requires an acknowledgement to name the newest
+// ranges it holds and no more. A hole the sender has already retransmitted is a
+// packet it no longer has in flight, so naming it again costs eight bytes in every
+// answer for the length of the transfer; what a sender still has to learn from is
+// the recent past, and what is left out is what its own loss timer covers.
+func TestAckNamesTheRecentRanges(t *testing.T) {
 	var ranges pnRanges
 	// Every other packet arrived, which is a path that loses half of them: what
 	// arrived is one range per packet.
@@ -151,15 +151,68 @@ func TestAckNamesEveryRangeItHolds(t *testing.T) {
 		ranges.add(index)
 	}
 	built := ranges.ack()
-	if built.count != receivedRangeLimit {
-		t.Fatalf("acknowledgement of %d ranges, want %d", built.count, receivedRangeLimit)
+	if built.count != ackRangeReport {
+		t.Fatalf("acknowledgement of %d ranges, want %d", built.count, ackRangeReport)
 	}
 	parsed, err := nextFrameAck(t, built.appendTo(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.count != receivedRangeLimit {
-		t.Fatalf("parsed %d ranges, want %d", parsed.count, receivedRangeLimit)
+	if parsed.count != ackRangeReport {
+		t.Fatalf("parsed %d ranges, want %d", parsed.count, ackRangeReport)
+	}
+	// The ranges named are the newest ones, which is what a sender still has in
+	// flight, and the count says the list was cut short so that a range left out is
+	// never read as a packet that went missing.
+	if parsed.largest != ranges.ranges[0].end {
+		t.Fatalf("largest %d, want %d", parsed.largest, ranges.ranges[0].end)
+	}
+	if parsed.count < ackRangeReport {
+		t.Fatalf("truncated acknowledgement of %d ranges", parsed.count)
+	}
+}
+
+// TestAcknowledgementCarriesNothingElse requires an acknowledgement to be an
+// acknowledgement. What used to ride on one — the credit this end allows, for the
+// association and for every stream that moved — is a frame of its own now, because
+// a packet whose first frame is an acknowledgement is never acknowledged in turn:
+// a window update in one was never sent again, so it had to be repeated in every
+// answer, and repeating sixteen of them is what made a four hundred byte packet
+// out of "I received 42".
+func TestAcknowledgementCarriesNothingElse(t *testing.T) {
+	var scheduler ackScheduler
+	scheduler.received(42, time.Now())
+	encoded := scheduler.pack(time.Now())
+	if len(encoded) == 0 {
+		t.Fatal("no acknowledgement")
+	}
+	f, rest, err := nextFrame(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.frameType != frameTypeAck {
+		t.Fatalf("frame type %d", f.frameType)
+	}
+	if len(rest) != 0 {
+		t.Fatalf("an acknowledgement of %d bytes carries %d more", len(encoded), len(rest))
+	}
+}
+
+// TestAckOfManyRangesStaysSmall pins what an acknowledgement of a path that loses
+// half its packets costs: the ranges named are the newest ones, so the frame is the
+// size of ackRangeReport ranges and not of everything the association remembers.
+func TestAckOfManyRangesStaysSmall(t *testing.T) {
+	var ranges pnRanges
+	for index := uint32(0); index < 2*receivedRangeLimit; index += 2 {
+		ranges.add(index)
+	}
+	encoded := ranges.ack().appendTo(nil)
+	// The type byte, the largest packet number, the delay, the count, the first
+	// range, every range after it, and the empty recovered half: seventeen bytes
+	// plus eight per range beyond the first.
+	want := 17 + (ackRangeReport-1)*8
+	if len(encoded) != want {
+		t.Fatalf("acknowledgement of %d bytes, want %d", len(encoded), want)
 	}
 }
 
