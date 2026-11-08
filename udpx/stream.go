@@ -346,13 +346,17 @@ func (s *Stream) bufferSendData(p []byte) {
 // releaseSendChunks drops what was written and not framed, and with it the hold the
 // send buffer has on the chunks that hold those bytes. The frames already cut from
 // them hold it themselves, so the memory still lives until the peer acknowledged
-// what was sent.
-func (s *Stream) releaseSendChunks() {
+// what was sent. It returns how many bytes were dropped, which is what the caller
+// owes back to the association window.
+func (s *Stream) releaseSendChunks() uint64 {
+	dropped := uint64(0)
 	for index, chunk := range s.sendChunks {
+		dropped += uint64(chunk.end - chunk.start)
 		s.sendChunks[index] = nil
 		chunk.release()
 	}
 	s.sendChunks = nil
+	return dropped
 }
 
 // waitForCredit waits until a window moves forward, the write deadline expires, or
@@ -527,8 +531,11 @@ func (s *Stream) end(cause error) {
 	close(s.done)
 	s.endMu.Unlock()
 	s.sendMu.Lock()
-	s.releaseSendChunks()
+	dropped := s.releaseSendChunks()
 	s.sendMu.Unlock()
+	if dropped > 0 {
+		s.association.releaseSendCredit(dropped)
+	}
 	s.signalSend()
 	s.signalRecv()
 }
@@ -581,13 +588,14 @@ func (s *Stream) endCause() error {
 // its bytes until it is filled, which is the conservative side to be on.
 func (s *Stream) push(offset uint64, data []byte, fin bool) (int, error) {
 	// A stream the application is done with has no reader left, so what is still
-	// on its way for it is dropped rather than stored.
-	if s.isEnded() {
-		return 0, nil
-	}
+	// on its way for it is dropped rather than stored. The bytes go back to the
+	// association window here rather than through the caller: the peer spent its
+	// credit on them, and a window that never heard of them is a window the peer
+	// cannot get back.
+	ended := s.isEnded()
 	s.recvMu.Lock()
 	end := offset + uint64(len(data))
-	if end > s.recvLimit {
+	if !ended && end > s.recvLimit {
 		s.recvMu.Unlock()
 		return 0, E.New("stream ", s.id, " received up to ", end, " beyond its window ", s.recvLimit)
 	}
@@ -595,6 +603,13 @@ func (s *Stream) push(offset uint64, data []byte, fin bool) (int, error) {
 	if end > s.recvHighest {
 		received = int(end - s.recvHighest)
 		s.recvHighest = end
+	}
+	if ended {
+		s.recvMu.Unlock()
+		if received > 0 {
+			s.association.dataDropped(received)
+		}
+		return 0, nil
 	}
 	if len(data) > 0 && end > s.readOffset {
 		if offset < s.readOffset {
@@ -1014,19 +1029,25 @@ func (a *association) handleStreamFrame(data streamData) error {
 			// A stream this end opened, which it no longer has: the ids of them are
 			// counted, so the count is what says whether this one existed. A frame
 			// for one that did is what the peer sent before it heard about the end,
-			// however many streams ended here since.
+			// however many streams ended here since. The bytes still count against
+			// the association window, because the peer spent its credit on them and
+			// nothing here will ever be read to give it back.
 			a.streamsMu.Lock()
 			opened := data.streamID>>1 < a.nextStreamID
 			a.streamsMu.Unlock()
 			if opened {
+				a.dataDropped(len(data.data))
 				return nil
 			}
 			return E.New("stream frame for stream ", data.streamID, " that was never opened")
 		}
 		// A stream that just ended is not a stream the peer is opening now: what
 		// is still in flight for it arrives after the end and is dropped, the
-		// same way a stream that ended on both sides drops it.
+		// same way a stream that ended on both sides drops it. The bytes still
+		// count against the association window, because the peer spent its credit
+		// on them and nothing here will ever be read to give it back.
 		if a.streamEnded(data.streamID) {
+			a.dataDropped(len(data.data))
 			return nil
 		}
 		var err error
@@ -1124,6 +1145,21 @@ func (a *association) takeConnectionCredit(n uint64) {
 	a.fcMu.Unlock()
 }
 
+// releaseSendCredit gives back credit taken for bytes that are never going to be
+// sent: a stream that ends with a send buffer full of bytes that were never framed
+// spent the association window on data nobody will see, and that window is shared, so
+// leaving it spent stops every stream beside the one that ended.
+func (a *association) releaseSendCredit(n uint64) {
+	a.fcMu.Lock()
+	if n >= a.sendCredit.used {
+		a.sendCredit.used = 0
+	} else {
+		a.sendCredit.used -= n
+	}
+	a.fcMu.Unlock()
+	a.notifyStreams()
+}
+
 // dataRead records bytes handed to an application and tells the peer about the
 // association credit the read released, for the same reason a stream does: a peer
 // waiting at the buffer bound is unblocked by the read and by nothing else.
@@ -1139,8 +1175,13 @@ func (a *association) dataRead(n int) {
 
 // windowMoved reports whether the association credit has to be moved forward, and to
 // where. The caller holds fcMu.
+//
+// What arrived is compared against what was granted before the subtraction, because
+// bytes thrown away are counted as received without the peer having spent a window
+// for them: a subtraction that underflowed would read as room to spare and leave the
+// window behind for good.
 func (a *association) windowMoved() (uint64, bool) {
-	if a.recvLimit-a.recvReceived > a.recvWindow/2 {
+	if a.recvReceived < a.recvLimit && a.recvLimit-a.recvReceived > a.recvWindow/2 {
 		return 0, false
 	}
 	limit := min(a.recvReceived+a.recvWindow, a.recvRead+2*a.recvWindow)
@@ -1172,6 +1213,24 @@ func (a *association) dataReceived(n int) error {
 		_ = a.send(appendMaxData(nil, limit))
 	}
 	return nil
+}
+
+// dataDropped counts bytes that arrived for a stream this end is done with and were
+// thrown away. They cost no memory here, so they count as read as well as received:
+// the peer already spent its credit on them, and a window that kept them spent would
+// stop every stream beside the one that ended, for as long as the association lived.
+func (a *association) dataDropped(n int) {
+	if n == 0 {
+		return
+	}
+	a.fcMu.Lock()
+	a.recvReceived += uint64(n)
+	a.recvRead += uint64(n)
+	limit, moved := a.windowMoved()
+	a.fcMu.Unlock()
+	if moved {
+		_ = a.send(appendMaxData(nil, limit))
+	}
 }
 
 // notifyStreams wakes every stream that waits for association credit.
