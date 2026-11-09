@@ -1,6 +1,7 @@
 package udpx
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -321,5 +322,63 @@ func TestAcknowledgementOverSocket(t *testing.T) {
 	roundTrip, sampled := serverAssociation.roundTrip()
 	if sampled {
 		t.Fatalf("the server measured %v from an acknowledgement of an acknowledgement", roundTrip)
+	}
+}
+
+// TestRepeatedHelloIsOneAssociation requires the repetitions of a hello to cost an
+// answer rather than a handshake. A client repeats the hello it already sent, byte
+// for byte, every 250 ms until it hears an answer; answering each repetition with a
+// new association leaves a session's worth of them behind, each probing a path that
+// answers nothing until it gives up, and puts the derivation the handshake is built
+// around on the path that is already too slow to answer in time.
+func TestRepeatedHelloIsOneAssociation(t *testing.T) {
+	password := NewPassword("password")
+	listenerConn := udpConn(t)
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+	clientConn := udpConn(t)
+	handshake, err := newClientHandshake(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readAnswer := func() []byte {
+		t.Helper()
+		buffer := make([]byte, maxPacketSize)
+		err = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, _, readErr := clientConn.ReadFrom(buffer)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		return append([]byte(nil), buffer[:n]...)
+	}
+	_, err = clientConn.WriteTo(handshake.hello(), listenerConn.LocalAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := readAnswer()
+	server, err := listener.Accept(testContext(t, 5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = server.CloseWithError(nil)
+	})
+	_, err = clientConn.WriteTo(handshake.hello(), listenerConn.LocalAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := readAnswer()
+	if !bytes.Equal(first, second) {
+		t.Fatal("the repeated hello was answered with a different answer")
+	}
+	ctx := testContext(t, 200*time.Millisecond)
+	_, err = listener.Accept(ctx)
+	if err == nil {
+		t.Fatal("the repeated hello became a second association")
 	}
 }
