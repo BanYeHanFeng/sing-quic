@@ -174,10 +174,12 @@ func (q *frameQueue) takeAckOnly(budget int) []outFrame {
 }
 
 // take removes and returns the frames that fit in budget bytes. A frame that
-// does not fit waits for the next packet rather than being split: a frame is the
-// unit that is retransmitted, so a frame that changed shape between attempts
-// would need its own bookkeeping.
+// does not fit waits for the next packet rather than being split, unless it does
+// not fit the next packet either: see splitHead.
 func (q *frameQueue) take(budget int) []outFrame {
+	if len(q.frames) > 0 && q.frames[0].size() > budget {
+		q.splitHead(budget)
+	}
 	count := 0
 	size := 0
 	for count < len(q.frames) {
@@ -192,6 +194,45 @@ func (q *frameQueue) take(budget int) []outFrame {
 		return nil
 	}
 	return q.takePrefix(count)
+}
+
+// splitHead cuts the frame at the head of the queue in two when it does not fit
+// in one packet, which is what keeps a size that changed under a queue from
+// stopping it.
+//
+// What a packet carries is not fixed for the length of an association: it falls
+// when the path refuses a larger size, and it moves when the redundancy is turned
+// on or off, because a member gives up the room the description of its group
+// needs. A frame cut for the larger size never fits the smaller one, and a queue
+// whose head does not fit hands out nothing at all: the association would answer
+// what arrives and send no data until something changed the size back, which on a
+// path that has gone quiet is exactly what does not happen.
+func (q *frameQueue) splitHead(budget int) {
+	frame := q.frames[0]
+	if !frame.streamFrame.carried {
+		// Nothing else is cut to a size: an acknowledgement is a few bytes and a
+		// probe is built for the size it asks about.
+		return
+	}
+	length := budget - streamFixedLen
+	if length <= 0 || length >= len(frame.streamFrame.data) {
+		return
+	}
+	head, tail := frame, frame
+	head.streamFrame.data = frame.streamFrame.data[:length]
+	head.streamFrame.fin = false
+	tail.streamFrame.data = frame.streamFrame.data[length:]
+	tail.streamFrame.offset = frame.streamFrame.offset + uint64(length)
+	if frame.streamFrame.chunk != nil {
+		// Two frames are two holders of the chunk, and the last of them to leave
+		// is what gives it back.
+		frame.streamFrame.chunk.retain()
+	}
+	frame.streamFrame.stream.splitPendingFrame()
+	q.frames = append(q.frames, outFrame{})
+	copy(q.frames[2:], q.frames[1:])
+	q.frames[0] = head
+	q.frames[1] = tail
 }
 
 // takePrefix removes the first count frames and returns them.

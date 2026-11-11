@@ -428,6 +428,15 @@ func (s *Stream) sendQueued() error {
 	}
 }
 
+// splitPendingFrame counts a frame the send path cut in two, which is what the
+// queue does when a frame no longer fits in one packet: both halves are frames the
+// peer has to acknowledge before a reset may overtake them.
+func (s *Stream) splitPendingFrame() {
+	s.sendMu.Lock()
+	s.sendPending++
+	s.sendMu.Unlock()
+}
+
 // CloseWrite closes the write half: the peer reads what was written before it and
 // then the end of the stream.
 func (s *Stream) CloseWrite() error {
