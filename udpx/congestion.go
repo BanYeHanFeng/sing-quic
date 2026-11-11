@@ -89,7 +89,7 @@ func (a *association) congestionCharged() congestion.ByteCount {
 	parityBytes := a.inFlight.parityBytes
 	a.flightMu.Unlock()
 	charged := congestion.ByteCount(inFlight)
-	if a.fecSender != nil && a.fecSender.planned > 0 {
+	if a.fecSender != nil && a.fecSender.lossAllowed.Load() && a.fecSender.planned > 0 {
 		// The parity of the group being assembled has not left yet, so it is charged
 		// to the data that is going to need it: a window that holds only data leaves
 		// no room for the redundancy, and redundancy that never leaves is the same

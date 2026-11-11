@@ -202,3 +202,39 @@ func TestFECRejects(t *testing.T) {
 		t.Fatalf("%d members filled in for two missing", filled)
 	}
 }
+
+// TestFECStopsPayingForAPathThatCannotUseIt requires the redundancy to be dropped
+// on a path that drops more than the code repairs, and to come back once the path
+// stops dropping. A group of k members with one parity shard repairs a group that
+// lost exactly one member, which a path dropping a quarter of what it carries
+// almost never produces: what the parity costs there is its share of the window
+// and the path, and what it buys is nothing.
+func TestFECStopsPayingForAPathThatCannotUseIt(t *testing.T) {
+	conn := newFakeConn()
+	a := newTestAssociation(t, conn)
+	a.fecSender = newFECSender(FECOptions{DataShards: 32, ParityShards: 1})
+	a.sendMu.Lock()
+	defer a.sendMu.Unlock()
+	if !a.fecWorthwhileLocked(a.fecSender) {
+		t.Fatal("redundancy is not worth sending before the path said anything")
+	}
+	// A path that drops a quarter of what it carries.
+	a.stats.sentPackets.Add(fecLossWindow)
+	a.stats.lostPackets.Add(fecLossWindow / 4)
+	if a.fecWorthwhileLocked(a.fecSender) {
+		t.Fatal("redundancy is worth sending on a path that drops a quarter")
+	}
+	// The room a member gave up for the group description comes back with the
+	// redundancy.
+	if a.maxPayload != a.mtu-headerLen-tagLen {
+		t.Fatalf("payload of %d bytes after the redundancy stopped, want %d", a.maxPayload, a.mtu-headerLen-tagLen)
+	}
+	// The path recovers, and the window is judged again from where it left off.
+	a.stats.sentPackets.Add(fecLossWindow)
+	if !a.fecWorthwhileLocked(a.fecSender) {
+		t.Fatal("redundancy is not worth sending on a path that stopped dropping")
+	}
+	if a.maxPayload != a.fecSender.payloadBudget(a.mtu) {
+		t.Fatalf("payload of %d bytes after the redundancy came back, want %d", a.maxPayload, a.fecSender.payloadBudget(a.mtu))
+	}
+}

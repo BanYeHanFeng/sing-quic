@@ -579,7 +579,7 @@ func (a *association) shutdown(cause error, notifyPeer bool) {
 		timers.idle.Stop()
 		timers.ack.Stop()
 		timers.pto.Stop()
-		if a.fecSender != nil {
+		if a.fecSender != nil && a.fecSender.timer != nil {
 			a.fecSender.timer.Stop()
 		}
 		a.cancel(cause)

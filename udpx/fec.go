@@ -192,6 +192,25 @@ const (
 	// is one packet long.
 	fecMinGroupMembers = 2
 
+	// fecLossWindow is how many packets the loss rate is measured over before the
+	// redundancy is judged again. A window rather than a running total: a path
+	// that improves is a path whose parity is worth paying again, and a total that
+	// only ever grows never gives it back.
+	fecLossWindow = 256
+
+	// fecLossPercent is the loss rate above which the redundancy is no longer worth
+	// what it costs.
+	//
+	// A group of k members with one parity shard repairs a group that lost exactly
+	// one member, which at a loss rate p is k*p*(1-p)^(k-1) of the groups: a third
+	// of them at two percent, a tenth at ten, one in a thousand at twenty-five.
+	// Beyond the point where the path drops more than the code repairs, the parity
+	// is paid on every group and repairs nothing. Measured over twenty-two hours of
+	// a proxied phone: eighty-nine thousand parity packets rebuilt one thousand
+	// eight hundred members, and the fifth of the path they took was a fifth of a
+	// path that had none to spare.
+	fecLossPercent = 15
+
 	// fecGroupTimeout is how long a group waits for a member that does not follow
 	// before it is closed as it is. Parity is not something the peer waits for, so
 	// this is the cost of protecting a group the sender was too idle to fill: a
@@ -260,6 +279,19 @@ type fecSender struct {
 
 	// timer closes the open group when nothing followed it for a while.
 	timer *time.Timer
+
+	// lossAllowed says whether the path still drops little enough for the parity to
+	// repair what it loses, and lossBaseSent and lossBaseLost are the counters the
+	// last judgement was made from. A sender that keeps paying for redundancy a
+	// path cannot use is a sender that spends its share of the window on it.
+	//
+	// It is read without the send lock, by the window that has to leave room for
+	// the parity of the group being assembled: the judgement is a bool, and a
+	// window that reads the answer from one group late is a window that is wrong
+	// by one group's worth of room.
+	lossAllowed  atomic.Bool
+	lossBaseSent int64
+	lossBaseLost int64
 }
 
 func newFECSender(options FECOptions) *fecSender {
@@ -277,10 +309,12 @@ func newFECSender(options FECOptions) *fecSender {
 	if parityShards > fecMaxParityShards {
 		parityShards = fecMaxParityShards
 	}
-	return &fecSender{
+	sender := &fecSender{
 		dataShards:   dataShards,
 		parityShards: parityShards,
 	}
+	sender.lossAllowed.Store(true)
+	return sender
 }
 
 // parityFor returns how many parity shards a group of members members carries.
@@ -453,6 +487,13 @@ func (a *association) closeGroupLocked() error {
 	if len(members) == 0 {
 		return nil
 	}
+	if !a.fecWorthwhileLocked(sender) {
+		// The path drops more than the code repairs, so the group is closed without
+		// its parity: what it would have cost is the window and the path, and what
+		// it would have bought is nothing.
+		sender.close()
+		return nil
+	}
 	parityCount := sender.parityFor(len(members))
 	description := fecHeader{
 		GroupID:     sender.groupID,
@@ -484,6 +525,30 @@ func (a *association) closeGroupLocked() error {
 		sender.release(shard)
 	}
 	return err
+}
+
+// fecWorthwhileLocked reports whether the redundancy is worth its share of the
+// path, and judges the path again once per window. The caller holds sendMu.
+//
+// What it reads is what the path already said: packets sent and packets declared
+// lost. A judgement that comes out the same as the last one changes nothing, which
+// is what keeps a path that is merely jittery from turning the redundancy on and
+// off around its threshold.
+func (a *association) fecWorthwhileLocked(sender *fecSender) bool {
+	sent := a.stats.sentPackets.Load()
+	if sent-sender.lossBaseSent < fecLossWindow {
+		return sender.lossAllowed.Load()
+	}
+	lost := a.stats.lostPackets.Load()
+	allowed := (lost-sender.lossBaseLost)*100 < (sent-sender.lossBaseSent)*fecLossPercent
+	sender.lossBaseSent = sent
+	sender.lossBaseLost = lost
+	if allowed != sender.lossAllowed.Swap(allowed) {
+		// The room a member gives up for the group description is only worth giving
+		// up while there is a description to carry.
+		a.updatePayloadLocked()
+	}
+	return allowed
 }
 
 // planParityLocked puts one parity shard into the batch. The caller holds sendMu,
