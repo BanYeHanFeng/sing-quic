@@ -257,8 +257,12 @@ func (b *bbrSender) PacingWait(now time.Time) time.Duration {
 
 // Describe is what a debug log says about the controller: the phase, the window,
 // the rate, the estimate and how much of the path the model believes it may fill.
+// The last number is the controller's view in bytes, and it is named for that
+// rather than for the flight table: a line that says inflight twice says the packet
+// count and the byte count in one breath, and a reader parsing it gets whichever
+// came last.
 func (b *bbrSender) Describe() string {
-	return fmt.Sprintf("mode=%s cwnd=%d pacing=%d bw=%d minrtt=%s inflight=%d",
+	return fmt.Sprintf("mode=%s cwnd=%d pacing=%d bw=%d minrtt=%s unacked=%d",
 		b.mode, b.GetCongestionWindow(), b.pacingRate(), b.bandwidthEstimate(),
 		b.getMinRtt(), b.bytesInFlight)
 }
