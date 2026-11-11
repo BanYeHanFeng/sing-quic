@@ -185,7 +185,9 @@ func TestLossWithTruncatedAck(t *testing.T) {
 		t.Fatal("a packet the acknowledgement had no room to name is lost")
 	}
 	// The time rule still applies: a packet in flight for longer than the round
-	// trip is lost whatever the acknowledgement could name.
+	// trip is lost whatever the acknowledgement could name. It has to: a number the
+	// peer's own table of ranges no longer holds is never named again, so waiting
+	// for an answer that cannot come is waiting forever.
 	if !isLost(packet, time.Now().Add(2*lossDelay), 20, lossDelay, true) {
 		t.Fatal("a packet in flight for longer than the round trip is not lost")
 	}

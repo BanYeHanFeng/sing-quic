@@ -53,7 +53,17 @@ const (
 	// was interrupted; a peer that restarted has no state for the association and
 	// never answers, and an association that keeps probing it is a session that
 	// cannot be used and is never replaced.
-	maxProbeSilence = 10 * time.Second
+	//
+	// What the wait costs when the peer is gone is the wait itself, because the
+	// next connection dials as soon as this one ends. What it costs when the path
+	// is merely interrupted is every stream multiplexed on the association, which
+	// is why it is measured against what an interruption looks like rather than
+	// against how fast a restart could be noticed: a phone that changes networks,
+	// or that goes through a tunnel, is out for ten to twenty seconds and comes
+	// back to a mapping that is still there. Measured over twenty-two hours of a
+	// proxied phone: sixty-one associations ended this way, one of them after
+	// eleven hours, and the rest of a session's connections ended with it.
+	maxProbeSilence = 20 * time.Second
 )
 
 // lossDelay is how long a packet must have been in flight before it is lost. The
@@ -165,6 +175,11 @@ func (a *association) probe() {
 
 	a.sendMu.Lock()
 	if len(frames) > 0 {
+		// The frames of the packet the probe gave up on are what it sends again, and
+		// they are retransmissions like any other: a line of numbers that counted
+		// only what the loss rules found would leave the probe's share of the path
+		// out of the one number it is read from.
+		a.stats.retransmits.Add(int64(len(frames)))
 		a.queue.pushFront(frames)
 	} else {
 		// A probe of nothing but a ping is what asks a silent peer for an answer
@@ -216,7 +231,7 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	// as unanswered would close an association that is answering.
 	a.probes = 0
 	a.probeSince = time.Time{}
-	lost := a.inFlight.lost(now, acknowledgement.largest, lossDelay(a.rtt), acknowledgement.count >= ackRangeReport)
+	lost := a.inFlight.lost(now, acknowledgement.largest, lossDelay(a.rtt), acknowledgement.count >= maxAckRanges)
 	a.stats.lostPackets.Add(int64(len(lost)))
 	if len(lost) > 0 || len(fecRecovered) > 0 {
 		a.logDebug("ack ", acknowledgement.largest, " acked=", len(acked), " lost=", len(lost),

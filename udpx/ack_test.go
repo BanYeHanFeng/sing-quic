@@ -138,12 +138,11 @@ func TestAckRoundTrip(t *testing.T) {
 	}
 }
 
-// TestAckNamesTheRecentRanges requires an acknowledgement to name the newest
-// ranges it holds and no more. A hole the sender has already retransmitted is a
-// packet it no longer has in flight, so naming it again costs eight bytes in every
-// answer for the length of the transfer; what a sender still has to learn from is
-// the recent past, and what is left out is what its own loss timer covers.
-func TestAckNamesTheRecentRanges(t *testing.T) {
+// TestAckNamesEveryRangeItRemembers requires an acknowledgement to name every
+// range the association remembers, up to what the frame can carry. A range left
+// out is a packet the peer may have received and cannot say so, which is what a
+// sender's loss timer reads as a loss and retransmits.
+func TestAckNamesEveryRangeItRemembers(t *testing.T) {
 	var ranges pnRanges
 	// Every other packet arrived, which is a path that loses half of them: what
 	// arrived is one range per packet.
@@ -151,24 +150,41 @@ func TestAckNamesTheRecentRanges(t *testing.T) {
 		ranges.add(index)
 	}
 	built := ranges.ack()
-	if built.count != ackRangeReport {
-		t.Fatalf("acknowledgement of %d ranges, want %d", built.count, ackRangeReport)
+	if built.count != receivedRangeLimit {
+		t.Fatalf("acknowledgement of %d ranges, want %d", built.count, receivedRangeLimit)
 	}
 	parsed, err := nextFrameAck(t, built.appendTo(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.count != ackRangeReport {
-		t.Fatalf("parsed %d ranges, want %d", parsed.count, ackRangeReport)
+	if parsed.count != receivedRangeLimit {
+		t.Fatalf("parsed %d ranges, want %d", parsed.count, receivedRangeLimit)
 	}
-	// The ranges named are the newest ones, which is what a sender still has in
-	// flight, and the count says the list was cut short so that a range left out is
-	// never read as a packet that went missing.
 	if parsed.largest != ranges.ranges[0].end {
 		t.Fatalf("largest %d, want %d", parsed.largest, ranges.ranges[0].end)
 	}
-	if parsed.count < ackRangeReport {
-		t.Fatalf("truncated acknowledgement of %d ranges", parsed.count)
+	for index := range parsed.count {
+		if parsed.ranges[index] != ranges.ranges[index] {
+			t.Fatalf("range %d is %+v, want %+v", index, parsed.ranges[index], ranges.ranges[index])
+		}
+	}
+}
+
+// TestAckOfFewRangesIsNotTruncated requires an acknowledgement of a path that
+// loses nothing to stay the size of what it names: a transfer that arrives in
+// order is one range, and the loss rule that reads a truncation is not armed.
+func TestAckOfFewRangesIsNotTruncated(t *testing.T) {
+	var scheduler ackScheduler
+	now := time.Now()
+	for pn := uint32(0); pn < 40; pn += 2 {
+		scheduler.received(pn, now)
+	}
+	built := scheduler.ranges.ack()
+	if built.count != 20 {
+		t.Fatalf("acknowledgement of %d ranges, want 20", built.count)
+	}
+	if built.count >= maxAckRanges {
+		t.Fatalf("acknowledgement of %d ranges is truncated", built.count)
 	}
 }
 
@@ -198,9 +214,9 @@ func TestAcknowledgementCarriesNothingElse(t *testing.T) {
 	}
 }
 
-// TestAckOfManyRangesStaysSmall pins what an acknowledgement of a path that loses
-// half its packets costs: the ranges named are the newest ones, so the frame is the
-// size of ackRangeReport ranges and not of everything the association remembers.
+// TestAckOfManyRangesStaysSmall pins the bound of an acknowledgement: naming
+// every range an association remembers costs a frame that still fits a packet,
+// which is what makes it worth naming them rather than guessing.
 func TestAckOfManyRangesStaysSmall(t *testing.T) {
 	var ranges pnRanges
 	for index := uint32(0); index < 2*receivedRangeLimit; index += 2 {
@@ -210,9 +226,12 @@ func TestAckOfManyRangesStaysSmall(t *testing.T) {
 	// The type byte, the largest packet number, the delay, the count, the first
 	// range, every range after it, and the empty recovered half: seventeen bytes
 	// plus eight per range beyond the first.
-	want := 17 + (ackRangeReport-1)*8
+	want := 17 + (receivedRangeLimit-1)*8
 	if len(encoded) != want {
 		t.Fatalf("acknowledgement of %d bytes, want %d", len(encoded), want)
+	}
+	if len(encoded) > mtuMin-headerLen-tagLen {
+		t.Fatalf("acknowledgement of %d bytes does not fit a packet", len(encoded))
 	}
 }
 

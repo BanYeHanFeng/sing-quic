@@ -20,31 +20,28 @@ import (
 // delay, whichever comes first, and goes out immediately when a packet arrives
 // out of order: a hole is worth reporting as soon as it is known.
 const (
-	// maxAckRanges is how many disjoint ranges an acknowledgement may carry, which
-	// is also how many an association remembers: the parser accepts what the wire
-	// format allows rather than what this end chooses to say.
-	maxAckRanges = receivedRangeLimit
-
-	// receivedRangeLimit bounds the ranges an association remembers. Ranges
-	// rather than a bitmap or a list of numbers: a peer that skips a thousand
-	// packet numbers costs one range, not a thousand entries.
+	// receivedRangeLimit bounds the ranges an association remembers, and it is
+	// also how many an acknowledgement names: the parser accepts what the wire
+	// format allows rather than what this end chooses to say. Ranges rather than a
+	// bitmap or a list of numbers: a peer that skips a thousand packet numbers
+	// costs one range, not a thousand entries.
+	//
+	// Naming fewer was tried. Eight ranges kept an answer at a hundred and sixty
+	// bytes on a path whose ranges settled at twenty, and the saving looked worth
+	// it. What it costs is that a sender can no longer tell a packet the peer
+	// received from one the path dropped, and what its loss timer answers instead
+	// is wrong by every range left out. Measured over twenty-two hours of a
+	// proxied phone on a path dropping a quarter of what it carried: two thirds of
+	// the acknowledgements settled fewer packets than they declared lost, twenty-
+	// seven thousand of them settled one packet and declared ten or more, and a
+	// third of everything the sender put on the wire was a packet that had already
+	// arrived. The number of ranges a path fragments into is its loss rate, so
+	// eight is enough only where there is nothing to report, which is the one case
+	// where the size of an answer does not matter.
 	receivedRangeLimit = 32
 
-	// ackRangeReport is how many of those ranges an acknowledgement names.
-	//
-	// What a range is worth is what the sender still has to learn from it, and a
-	// hole that the sender already retransmitted is worth nothing: the packet left
-	// the flight table when the loss was declared, and naming it again costs eight
-	// bytes in every answer for the length of the transfer. Measured over 27 hours
-	// of a proxied desktop: the remembered ranges settle at twenty or so, and the
-	// acknowledgement that names all of them is a hundred and sixty bytes of the
-	// four hundred every answer took.
-	//
-	// Eight covers the recent past, which is where a sender's own loss detection
-	// has not caught up yet; anything older is what the time rule in isLost is
-	// for. An acknowledgement that names this many is reported as truncated, so a
-	// range left out is never taken for a packet that went missing.
-	ackRangeReport = 8
+	// maxAckRanges is how many disjoint ranges an acknowledgement may carry.
+	maxAckRanges = receivedRangeLimit
 
 	// ackThreshold is how many ack-eliciting packets may arrive before an
 	// acknowledgement goes out without waiting for the delay.
@@ -166,8 +163,8 @@ func (r *pnRanges) ack() ack {
 	}
 	result.largest = r.ranges[0].end
 	result.count = len(r.ranges)
-	if result.count > ackRangeReport {
-		result.count = ackRangeReport
+	if result.count > maxAckRanges {
+		result.count = maxAckRanges
 	}
 	copy(result.ranges[:], r.ranges[:result.count])
 	return result
@@ -397,7 +394,7 @@ func (s *ackScheduler) pack(now time.Time) []byte {
 	built.delay = now.Sub(s.largestAt)
 	if len(s.recovered.ranges) > 0 {
 		built.recoveredLargest = s.recovered.ranges[0].end
-		built.recoveredCount = min(len(s.recovered.ranges), ackRangeReport)
+		built.recoveredCount = min(len(s.recovered.ranges), maxAckRanges)
 		copy(built.recovered[:], s.recovered.ranges[:built.recoveredCount])
 		s.recovered.ranges = s.recovered.ranges[:0]
 	}
