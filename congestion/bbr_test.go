@@ -184,3 +184,74 @@ func TestBbrInitialWindowIsTheCallers(t *testing.T) {
 		}
 	}
 }
+
+// TestBbrProbeRttEndsWithoutADrain requires PROBE_RTT to end on its own clock when
+// the window never drains. A path that is dropping what it carries acknowledges
+// nothing, and the packets in flight leave the table only when the probe timer
+// gives up on them: a probe that waits for the drain waits for a timer, and a
+// deadline that is only set by the drain is a deadline that is never set.
+func TestBbrProbeRttEndsWithoutADrain(t *testing.T) {
+	simulation := newBBRSimulation()
+	simulation.send(100)
+	// One acknowledgement per round, so the round trip has been measured and the
+	// rest of the window stays in flight.
+	settle := func(count int) {
+		acked := simulation.sent[:count]
+		simulation.now = simulation.now.Add(testRoundTrip)
+		simulation.controller.OnCongestionEvent(simulation.inFlight, simulation.now, acked, nil)
+		simulation.inFlight -= ByteCount(count) * testDatagramSize
+		simulation.sent = simulation.sent[count:]
+	}
+	settle(1)
+	if minRtt := simulation.controller.(*bbrSender).minRtt; minRtt == 0 {
+		t.Fatal("the round trip was never measured")
+	}
+	// Nothing is answered for longer than the minimum round trip expires.
+	simulation.now = simulation.now.Add(minRttExpiry + time.Second)
+	settle(1)
+	if mode := simulation.controller.(*bbrSender).mode; mode != bbrModeProbeRtt {
+		t.Fatalf("mode %s after the minimum round trip expired", mode)
+	}
+	// The window does not drain: one packet is answered per round, the rest stays
+	// in flight, which is more than the probe allows. Ten rounds is half of
+	// probeRttMaxStay, so the probe has to be given more than that to end.
+	for round := 0; round < 30; round++ {
+		settle(1)
+	}
+	if mode := simulation.controller.(*bbrSender).mode; mode == bbrModeProbeRtt {
+		t.Fatalf("still in probe_rtt after thirty rounds without a drain")
+	}
+}
+
+// TestBbrProbeRttSkippedWhileLosing requires a round that declared packets lost not
+// to start a probe. What the probe measures is the queue this end built, and a path
+// that is dropping what it is handed has no queue left to drain: the probe buys
+// nothing and costs the window it holds at four packets.
+func TestBbrProbeRttSkippedWhileLosing(t *testing.T) {
+	simulation := newBBRSimulation()
+	simulation.send(100)
+	settle := func(count int, lost int) {
+		acked := simulation.sent[:count]
+		lostPackets := make([]LostPacketInfo, 0, lost)
+		for index := 0; index < lost; index++ {
+			packet := simulation.sent[count+index]
+			lostPackets = append(lostPackets, LostPacketInfo{
+				SendState:    packet.SendState,
+				TimeSent:     packet.TimeSent,
+				BytesLost:    testDatagramSize,
+				PacketNumber: packet.PacketNumber,
+			})
+		}
+		simulation.now = simulation.now.Add(testRoundTrip)
+		simulation.controller.OnCongestionEvent(simulation.inFlight, simulation.now, acked, lostPackets)
+		simulation.inFlight -= ByteCount(count+lost) * testDatagramSize
+		simulation.sent = simulation.sent[count+lost:]
+	}
+	settle(1, 0)
+	simulation.now = simulation.now.Add(minRttExpiry + time.Second)
+	settle(1, 1)
+	if mode := simulation.controller.(*bbrSender).mode; mode == bbrModeProbeRtt {
+		t.Fatal("probe_rtt entered on a round that lost packets")
+	}
+}
+

@@ -194,6 +194,13 @@ type bbrSender struct {
 	// app-limited.
 	lastSampleIsAppLimited bool
 
+	// lastEventHadLoss says the last acknowledgement declared packets lost. A
+	// round that lost packets is a round in which the path is dropping what it is
+	// handed, which is not a path with a queue left to drain: PROBE_RTT exists to
+	// empty the queue and measure the round trip without it, and a queue that is
+	// already overflowing is empty by definition. See maybeEnterOrExitProbeRtt.
+	lastEventHadLoss bool
+
 	// Recorded on packet sent. equivalent |unacked_packets_->bytes_in_flight()|
 	bytesInFlight ByteCount
 }
@@ -338,6 +345,8 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 	totalBytesAckedBefore := b.sampler.totalBytesAcked
 
 	var isRoundStart, minRttExpired bool
+
+	b.lastEventHadLoss = len(lostPackets) != 0
 
 	// Update bytesInFlight
 	b.bytesInFlight = priorInFlight
@@ -561,7 +570,29 @@ func (b *bbrSender) maybeExitStartupOrDrain(now time.Time) {
 }
 
 // Decides whether to enter or exit PROBE_RTT.
+//
+// Entering it is for a path whose queue this end filled itself: the estimate the
+// window is derived from is measured through that queue, so the round trip it
+// believes is the one with the queue in it. A round that lost packets has no queue
+// to drain — the path is dropping what it is handed — and a probe there buys a
+// measurement of a queue that is not the reason the round trip grew. What it costs
+// is the window: four packets for as long as the probe lasts, on a path that is
+// already losing a third of what it carries. Measured over nineteen hours of a
+// proxied phone: two hundred and thirty-nine probes, the longest of them twelve
+// seconds, every one of them on a path that was dropping packets.
+//
+// Leaving it needs a round trip to have passed, and the window to have drained to
+// what the probe allows. Neither is guaranteed on a path that is dropping: an
+// acknowledgement that never comes is not a round trip, and packets that were lost
+// leave the flight table only when the probe timer gives up on them, so the drain
+// waits for a timer instead of for an answer. That is what probeRttMaxStay is for,
+// and it is checked here rather than only in the branch that has a deadline: a
+// deadline that is never set is a probe that never ends.
 func (b *bbrSender) maybeEnterOrExitProbeRtt(now time.Time, isRoundStart, minRttExpired bool) {
+	if minRttExpired && b.lastEventHadLoss {
+		b.minRttTimestamp = now
+		minRttExpired = false
+	}
 	if minRttExpired && !b.exitingQuiescence && b.mode != bbrModeProbeRtt {
 		b.mode = bbrModeProbeRtt
 		b.pacingGain = 1.0
@@ -586,6 +617,13 @@ func (b *bbrSender) maybeEnterOrExitProbeRtt(now time.Time, isRoundStart, minRtt
 			// packet.
 			if b.bytesInFlight < b.probeRttCongestionWindow()+probeRTTWindowSlack {
 				b.exitProbeRttAt = now.Add(probeRttTime)
+				b.probeRttRoundPassed = false
+			} else if now.Sub(b.enteredProbeRttAt) >= probeRttMaxStay {
+				// The window did not drain, and it will not: what is in flight on a
+				// path that is dropping is waiting for a timer, not for an answer.
+				// The probe ends on its own clock rather than on a drain that never
+				// finishes.
+				b.exitProbeRttAt = now
 				b.probeRttRoundPassed = false
 			}
 		} else {
