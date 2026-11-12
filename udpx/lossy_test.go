@@ -60,6 +60,13 @@ type linkOptions struct {
 	// than the bandwidth-delay product builds a queue on a path that has one instead
 	// of arriving sooner.
 	rate float64
+	// queueLimit is how many bytes the path holds for a capacity before it starts
+	// dropping, which is what a buffer in front of a narrow link is. Zero is a
+	// queue that never fills, which is the shape of a link that carries everything
+	// it is handed: a window above the bandwidth-delay product then builds a queue
+	// instead of losing anything, and the sender is never told that it asked for
+	// more than the path carries.
+	queueLimit float64
 }
 
 func newSimulatedLink(t *testing.T, server net.Addr, options linkOptions) *simulatedLink {
@@ -126,6 +133,13 @@ func (l *simulatedLink) send(queue chan<- simulatedPacket, packet []byte, to net
 	arrival := time.Now()
 	if l.options.rate > 0 {
 		if free.After(arrival) {
+			if l.options.queueLimit > 0 &&
+				float64(free.Sub(arrival).Seconds())*l.options.rate+float64(len(packet)) > l.options.queueLimit {
+				// The buffer in front of the link is full, so the datagram is
+				// dropped here rather than queued: what a path with a buffer does
+				// to a sender that asks for more than it carries.
+				return
+			}
 			arrival = *free
 		}
 		*free = arrival.Add(time.Duration(float64(len(packet)) / l.options.rate * float64(time.Second)))
@@ -455,4 +469,79 @@ func TestDownloadOverUplinkLoss(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 	t.Logf("%d KiB in %v", payloadSize/1024, elapsed.Round(time.Millisecond))
+}
+
+// TestStreamOverABufferedPath requires a transfer to keep moving over a path that
+// has a capacity and a buffer in front of it, which is the shape a mobile downlink
+// has: what the sender asks for beyond the capacity is not queued forever, it is
+// dropped when the buffer is full, and the drops are the path telling the sender
+// what it asked for.
+//
+// A controller that reads the peak it once managed as the capacity keeps asking for
+// it: the buffer overflows again, the loss is answered by sending it again, and the
+// share of the path that arrives falls with every round. What this pins is the rate
+// against a collapse and the loss against a path that spends itself on duplicates.
+func TestStreamOverABufferedPath(t *testing.T) {
+	if testing.Short() {
+		t.Skip("a path with a buffer takes its time")
+	}
+	const capacity = 400 * 1024
+	const payloadSize = 2 * 1024 * 1024
+	password := NewPassword("password")
+	listenerConn := udpConn(t)
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
+	defer listener.Close()
+	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
+		loss:       0.006,
+		lossReturn: 0.006,
+		delay:      33 * time.Millisecond,
+		jitter:     2 * time.Millisecond,
+		rate:       capacity,
+		queueLimit: 25 * 1024,
+	})
+	ctx := testContext(t, 300*time.Second)
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseWithError(nil)
+	server, err := listener.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := server.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := testPayload(payloadSize)
+	start := time.Now()
+	go func() {
+		if _, writeErr := stream.Write(payload); writeErr != nil {
+			t.Errorf("write: %v", writeErr)
+		}
+	}()
+	accepted, err := client.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := 0
+	buffer := make([]byte, 64*1024)
+	for read < len(payload) {
+		n, readErr := accepted.Read(buffer)
+		if readErr != nil {
+			t.Fatalf("read %d of %d bytes: %v", read, len(payload), readErr)
+		}
+		read += n
+	}
+	elapsed := time.Since(start)
+	rate := float64(len(payload)) / elapsed.Seconds()
+	if rate < capacity/2 {
+		t.Fatalf("%.2f KiB/s over a path of %d KiB/s", rate/1024, capacity/1024)
+	}
+	serverAssociation := server.(*association)
+	stats := serverAssociation.snapshot()
+	if stats.sentPackets > 0 && stats.lostPackets*2 > stats.sentPackets {
+		t.Fatalf("%d of %d packets declared lost", stats.lostPackets, stats.sentPackets)
+	}
+	t.Logf("%.2f KiB/s, %d of %d packets lost, %d sent again", rate/1024, stats.lostPackets, stats.sentPackets, stats.retransmits)
 }
