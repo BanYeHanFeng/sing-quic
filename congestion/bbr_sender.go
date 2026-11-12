@@ -559,8 +559,30 @@ func (b *bbrSender) updateGainCyclePhase(now time.Time, priorInFlight ByteCount,
 // Tracks for how many round-trips the bandwidth has not increased
 // significantly, which is the one signal startup ends on: the path has stopped
 // saying that it carries more.
+//
+// A round the application did not fill says nothing about the path, which is why it
+// is not one of the rounds counted against startup: what it measures is the rate the
+// application asked for. What it does say, once enough of them have passed, is that
+// the application is not going to fill the path at all — a proxied phone answers a
+// request, waits, and answers the next one — and a startup that waits for a transfer
+// that never comes never ends. The gain it keeps is not free: every burst leaves at
+// two and a half times the estimate, which on a path that is already dropping what it
+// is handed is the burst that fills the queue. Measured over nineteen hours of a
+// proxied phone: forty-four thousand seconds in startup and none in probe_bw, on an
+// uplink whose queue was empty most of that time.
+//
+// The count is four times the one a filled round needs, because an application that
+// paused for a round trip has not stopped: a quarter of a second of quiet on a phone
+// is the radio, not the transfer.
 func (b *bbrSender) checkIfFullBandwidthReached() {
 	if b.lastSampleIsAppLimited {
+		if b.bandwidthEstimate() == 0 {
+			return
+		}
+		b.roundsWithoutBandwidthGain++
+		if b.roundsWithoutBandwidthGain >= b.numStartupRtts*4 {
+			b.isAtFullBandwidth = true
+		}
 		return
 	}
 

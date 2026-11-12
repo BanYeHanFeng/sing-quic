@@ -99,3 +99,29 @@ func TestBbrTransferAfterIdleIsMeasured(t *testing.T) {
 		t.Fatalf("bandwidth estimate of %d after the transfer resumed, down from %d", measured, burstBandwidth)
 	}
 }
+
+// TestBbrStartupEndsWhenTheApplicationStops requires a startup that is never fed a
+// transfer to end anyway. A round the application did not fill measures the
+// application, not the path, which is why it is not counted against startup: what it
+// does say, once enough of them have passed, is that the transfer startup is waiting
+// for is not coming. The gain it keeps until then is two and a half times the
+// estimate on every burst.
+func TestBbrStartupEndsWhenTheApplicationStops(t *testing.T) {
+	simulation := newIdleSimulation()
+	// One filled round, so the path has said something and startup has a rate to
+	// grow from.
+	simulation.send(32, testDatagramSize)
+	simulation.acknowledge()
+	if mode := simulation.controller.mode; mode != bbrModeStartup {
+		t.Fatalf("mode %s after the first round", mode)
+	}
+	// The application answers a request and stops, twenty times over.
+	for round := 0; round < 20; round++ {
+		simulation.controller.OnAppLimited()
+		simulation.send(1, testDatagramSize)
+		simulation.acknowledge()
+	}
+	if mode := simulation.controller.mode; mode == bbrModeStartup {
+		t.Fatal("still in startup after twenty rounds the application did not fill")
+	}
+}
