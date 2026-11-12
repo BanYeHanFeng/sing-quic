@@ -365,6 +365,27 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 	sample := b.sampler.OnCongestionEvent(eventTime,
 		ackedPackets, lostPackets, b.maxBandwidth.getBest(), infBandwidth, b.roundTripCount)
 	b.lastSampleIsAppLimited = sample.lastPacketState.appLimited
+	// A sample is a slope between two acknowledgements, and the transport sends in
+	// batches: sixteen packets leave in one write and the next batch waits for the
+	// pacer, so the slope between the two acknowledgements of one batch is the slope
+	// of a burst rather than of the path. The send rate the sampler bounds the answer
+	// with has the same shape, which is why a burst can raise the estimate the window
+	// is derived from past what the pacer was willing to send.
+	//
+	// The rate this end paced at is the one number that says what the path was asked
+	// to carry, and a sample above it is a sample of the burst: what the path
+	// answered is more than what was asked of it, which is compression somewhere
+	// between the two ends and not capacity. Measured over nineteen hours of a
+	// proxied phone: an estimate of twelve megabits on a path that carried two and
+	// six tenths, a third of everything sent declared lost, and the loss answered by
+	// sending it again.
+	//
+	// What the bound costs is the ramp: an estimate may grow by the pacing gain per
+	// round instead of by whatever a burst measured, which is the growth the probe
+	// cycle of PROBE_BW is built around anyway.
+	if paced := b.pacingRate(); sample.sampleMaxBandwidth > paced {
+		sample.sampleMaxBandwidth = paced
+	}
 	// Avoid updating |max_bandwidth_| if a) this is a loss-only event, or b) all
 	// packets in |acked_packets| did not generate valid samples. (e.g. ack of
 	// ack-only packets). In both cases, sampler_.total_bytes_acked() will not

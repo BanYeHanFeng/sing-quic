@@ -255,3 +255,33 @@ func TestBbrProbeRttSkippedWhileLosing(t *testing.T) {
 	}
 }
 
+// TestBbrEstimateBoundedByPacing requires a burst not to raise the estimate above
+// the rate this end paced at. The sample is a slope between two acknowledgements,
+// and a transport that sends in batches answers sixteen packets in one write: the
+// slope of that burst is the slope of the write, not of the path, and an estimate
+// taken from it is an estimate the pacer is then told to send at.
+func TestBbrEstimateBoundedByPacing(t *testing.T) {
+	sender := newBbrSender(testDatagramSize, initialCongestionWindowPackets)
+	sender.SetRTTStatsProvider(fixedRTT(testRoundTrip))
+	now := time.Unix(0, 0)
+	var inFlight ByteCount
+	var sent []AckedPacketInfo
+	for index := 0; index < 16; index++ {
+		packet := PacketNumber(index + 1)
+		state := sender.OnPacketSent(now, inFlight, packet, testDatagramSize)
+		inFlight += testDatagramSize
+		sent = append(sent, AckedPacketInfo{
+			SendState:    state,
+			TimeSent:     now,
+			BytesAcked:   testDatagramSize,
+			PacketNumber: packet,
+		})
+	}
+	// The whole burst is answered one millisecond later, which is a delivery rate
+	// far above anything the pacer asked for.
+	paced := sender.pacingRate()
+	sender.OnCongestionEvent(inFlight, now.Add(time.Millisecond), sent, nil)
+	if estimate := sender.bandwidthEstimate(); estimate > paced {
+		t.Fatalf("estimate of %d bits per second above the paced rate of %d", estimate, paced)
+	}
+}
