@@ -268,7 +268,8 @@ func TestFECGroupNotEnoughShards(t *testing.T) {
 }
 
 // TestFECGroupTimer requires a group that the sender is too idle to fill to be
-// closed anyway, and a group of one packet to be closed without redundancy.
+// closed anyway, without redundancy while it is too small for a shard of it to be
+// earned, and with its share of the redundancy once it is not.
 func TestFECGroupTimer(t *testing.T) {
 	sender, _, conn := newTestFECPair(t, Options{IdleTimeout: time.Minute, FEC: FECOptions{DataShards: 8, ParityShards: 2}})
 	// What the timer closes is written by the send loop, which is what the waits
@@ -281,37 +282,46 @@ func TestFECGroupTimer(t *testing.T) {
 	if written := conn.len(); written != 1 {
 		t.Fatalf("%d packets written for a group of one member", written)
 	}
-	// Two members are, and the group that the timer closes describes the two it has
-	// rather than the eight it was waiting for: it carries an eighth of the
-	// redundancy, which rounds up to the one shard a group is worth.
+	// Two members are not worth a shard either: a shard of two is half of what the
+	// group carries, which is not the eighth the caller asked for.
 	fecQueueFrame(t, sender, 1000, 1000, 1)
 	fecQueueFrame(t, sender, 2000, 1000, 2)
 	time.Sleep(4 * fecGroupTimeout)
+	if written := conn.len(); written != 3 {
+		t.Fatalf("%d packets written for a group of two members", written)
+	}
+	// Four members carry an eighth of the redundancy, which rounds up to the one
+	// shard a group is worth.
+	fecQueueFrame(t, sender, 3000, 1000, 3)
+	fecQueueFrame(t, sender, 4000, 1000, 4)
+	fecQueueFrame(t, sender, 5000, 1000, 5)
+	fecQueueFrame(t, sender, 6000, 1000, 6)
+	time.Sleep(4 * fecGroupTimeout)
 	packets := fecTestPackets(t, conn, &sender.sendRing)
-	if len(packets) != 4 {
-		t.Fatalf("%d packets written for a group of two members and its share of the parity", len(packets))
+	if len(packets) != 8 {
+		t.Fatalf("%d packets written for a group of four members and its share of the parity", len(packets))
 	}
-	parity := packets[3]
+	parity := packets[7]
 	if parity.header.Type != packetTypeFEC {
-		t.Fatalf("packet 3 is of type %d", parity.header.Type)
+		t.Fatalf("packet 7 is of type %d", parity.header.Type)
 	}
-	if parity.description.MemberCount != 2 || parity.description.ParityCount != 1 {
+	if parity.description.MemberCount != 4 || parity.description.ParityCount != 1 {
 		t.Fatalf("a group closed by the timer describes %d members and %d parity shards", parity.description.MemberCount, parity.description.ParityCount)
 	}
-	if parity.description.GroupID != 1 {
+	if parity.description.GroupID != 3 {
 		t.Fatalf("group starts at %d", parity.description.GroupID)
 	}
 	// A group that keeps being fed is closed by the member that fills it, so what
 	// the configuration says a group is is what a transfer gets.
-	offset := uint64(3000)
+	offset := uint64(7000)
 	for index := 0; index < 8; index++ {
 		offset += uint64(len(fecQueueFrame(t, sender, offset, 1000, byte(index))))
 	}
 	packets = fecTestPackets(t, conn, &sender.sendRing)
-	if len(packets) != 4+8+2 {
+	if len(packets) != 8+8+2 {
 		t.Fatalf("%d packets written for a filled group", len(packets))
 	}
-	for index := 12; index < len(packets); index++ {
+	for index := 16; index < len(packets); index++ {
 		parity := packets[index]
 		if parity.header.Type != packetTypeFEC {
 			t.Fatalf("packet %d is of type %d", index, parity.header.Type)
@@ -419,17 +429,21 @@ func TestFECParityIsTheCallers(t *testing.T) {
 }
 
 // TestFECParityOfAShortGroup requires the redundancy of a group to be the share of
-// a full group that its fill earns: a group that closed early is one the sender
-// was too idle to fill, and paying two shards for it is paying the redundancy of
-// thirty-two packets for two.
+// a full group that its fill earns, and to be paid only when the group is expected
+// to lose that much: a group that closed early is one the sender was too idle to
+// fill, and one shard of six on a path losing half a percent is a shard of six
+// spent to repair a thirtieth of what it costs.
 func TestFECParityOfAShortGroup(t *testing.T) {
 	sender := newFECSender(FECOptions{DataShards: 32, ParityShards: 2})
+	sender.lossPermille.Store(200)
 	for _, group := range []struct {
 		members int
 		parity  int
 	}{
-		{1, 1},
-		{2, 1},
+		{1, 0},
+		{2, 0},
+		{4, 0},
+		{5, 1},
 		{16, 1},
 		{17, 2},
 		{32, 2},
@@ -438,14 +452,23 @@ func TestFECParityOfAShortGroup(t *testing.T) {
 			t.Fatalf("%d parity shards for a group of %d members, want %d", parity, group.members, group.parity)
 		}
 	}
+	// A path that loses nothing pays nothing, whatever the group holds.
+	sender.lossPermille.Store(0)
+	for _, members := range []int{1, 8, 16, 32} {
+		if parity := sender.parityFor(members); parity != 0 {
+			t.Fatalf("%d parity shards for a group of %d members on a path losing nothing", parity, members)
+		}
+	}
 	// A caller that pays a quarter of its traffic gets a quarter of it, whatever
-	// the group it is paid on.
+	// the group it is paid on, once the path loses what it pays.
 	quarter := newFECSender(FECOptions{DataShards: 8, ParityShards: 2})
+	quarter.lossPermille.Store(500)
 	for _, group := range []struct {
 		members int
 		parity  int
 	}{
-		{1, 1},
+		{1, 0},
+		{2, 1},
 		{4, 1},
 		{5, 2},
 		{8, 2},

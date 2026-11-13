@@ -289,7 +289,11 @@ type fecSender struct {
 	// the parity of the group being assembled: the judgement is a bool, and a
 	// window that reads the answer from one group late is a window that is wrong
 	// by one group's worth of room.
-	lossAllowed  atomic.Bool
+	lossAllowed atomic.Bool
+	// lossPermille is the loss rate the last judgement measured, in thousandths:
+	// what a group is expected to lose is what decides whether a parity shard is
+	// paid for it.
+	lossPermille atomic.Int32
 	lossBaseSent int64
 	lossBaseLost int64
 }
@@ -314,6 +318,10 @@ func newFECSender(options FECOptions) *fecSender {
 		parityShards: parityShards,
 	}
 	sender.lossAllowed.Store(true)
+	// Before the path said anything, it is assumed to lose what the redundancy
+	// costs: a full group pays the shards the caller asked for, a short one pays
+	// nothing.
+	sender.lossPermille.Store(int32((parityShards*1000 + dataShards - 1) / dataShards))
 	return sender
 }
 
@@ -331,6 +339,14 @@ func (s *fecSender) parityFor(members int) int {
 	}
 	if parity > s.parityShards {
 		parity = s.parityShards
+	}
+	// A shard is paid by the members of its group and repairs a member that is
+	// lost, so it is worth its share only when the group is expected to lose at
+	// least that much: a group of six on a path losing half a percent loses one
+	// member in thirty groups, and one shard of six for that is a shard of six
+	// spent to repair a thirtieth of what it costs.
+	if int64(members)*int64(s.lossPermille.Load()) < int64(parity)*1000 {
+		return 0
 	}
 	return parity
 }
@@ -495,6 +511,13 @@ func (a *association) closeGroupLocked() error {
 		return nil
 	}
 	parityCount := sender.parityFor(len(members))
+	if parityCount == 0 {
+		// The group is too small for what the path loses to be worth a shard of it,
+		// or it is a group the code could not repair: either way the members leave
+		// without redundancy rather than with one paid for nothing.
+		sender.close()
+		return nil
+	}
 	description := fecHeader{
 		GroupID:     sender.groupID,
 		MemberCount: uint8(len(members)),
@@ -540,9 +563,12 @@ func (a *association) fecWorthwhileLocked(sender *fecSender) bool {
 		return sender.lossAllowed.Load()
 	}
 	lost := a.stats.lostPackets.Load()
-	allowed := (lost-sender.lossBaseLost)*100 < (sent-sender.lossBaseSent)*fecLossPercent
+	permille := int32((lost - sender.lossBaseLost) * 1000 / (sent - sender.lossBaseSent))
 	sender.lossBaseSent = sent
 	sender.lossBaseLost = lost
+	sender.lossPermille.Store(permille)
+	allowed := permille < fecLossPercent*10 &&
+		int64(sender.dataShards)*int64(permille) >= int64(sender.parityShards)*1000
 	if allowed != sender.lossAllowed.Swap(allowed) {
 		// The room a member gives up for the group description is only worth giving
 		// up while there is a description to carry.

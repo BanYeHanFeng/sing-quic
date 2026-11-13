@@ -203,12 +203,12 @@ func TestFECRejects(t *testing.T) {
 	}
 }
 
-// TestFECStopsPayingForAPathThatCannotUseIt requires the redundancy to be dropped
-// on a path that drops more than the code repairs, and to come back once the path
-// stops dropping. A group of k members with one parity shard repairs a group that
-// lost exactly one member, which a path dropping a quarter of what it carries
-// almost never produces: what the parity costs there is its share of the window
-// and the path, and what it buys is nothing.
+// TestFECStopsPayingForAPathThatCannotUseIt requires the redundancy to be paid only
+// on a path that loses enough for it to repair something and little enough for the
+// code to repair it. A group of thirty-two members with one parity shard repairs a
+// group that lost exactly one member: a path dropping a quarter almost never
+// produces one, and a path dropping a half a percent produces one in thirty groups
+// for a shard paid on every one of them.
 func TestFECStopsPayingForAPathThatCannotUseIt(t *testing.T) {
 	conn := newFakeConn()
 	a := newTestAssociation(t, conn)
@@ -218,23 +218,28 @@ func TestFECStopsPayingForAPathThatCannotUseIt(t *testing.T) {
 	if !a.fecWorthwhileLocked(a.fecSender) {
 		t.Fatal("redundancy is not worth sending before the path said anything")
 	}
-	// A path that drops a quarter of what it carries.
-	a.stats.sentPackets.Add(fecLossWindow)
-	a.stats.lostPackets.Add(fecLossWindow / 4)
-	if a.fecWorthwhileLocked(a.fecSender) {
-		t.Fatal("redundancy is worth sending on a path that drops a quarter")
-	}
-	// The room a member gave up for the group description comes back with the
-	// redundancy.
-	if a.maxPayload != a.mtu-headerLen-tagLen {
-		t.Fatalf("payload of %d bytes after the redundancy stopped, want %d", a.maxPayload, a.mtu-headerLen-tagLen)
-	}
-	// The path recovers, and the window is judged again from where it left off.
-	a.stats.sentPackets.Add(fecLossWindow)
-	if !a.fecWorthwhileLocked(a.fecSender) {
-		t.Fatal("redundancy is not worth sending on a path that stopped dropping")
-	}
-	if a.maxPayload != a.fecSender.payloadBudget(a.mtu) {
-		t.Fatalf("payload of %d bytes after the redundancy came back, want %d", a.maxPayload, a.fecSender.payloadBudget(a.mtu))
+	for _, path := range []struct {
+		name  string
+		lost  int64
+		worth bool
+	}{
+		{"a quarter", fecLossWindow / 4, false},
+		{"nothing", 0, false},
+		{"a twentieth", fecLossWindow / 20, true},
+	} {
+		a.stats.sentPackets.Add(fecLossWindow)
+		a.stats.lostPackets.Add(path.lost)
+		if worth := a.fecWorthwhileLocked(a.fecSender); worth != path.worth {
+			t.Fatalf("redundancy of a path dropping %s is %v", path.name, worth)
+		}
+		// The room a member gives up for the group description follows the
+		// redundancy: there is nothing to describe when there is no parity.
+		want := a.mtu - headerLen - tagLen
+		if path.worth {
+			want = a.fecSender.payloadBudget(a.mtu)
+		}
+		if a.maxPayload != want {
+			t.Fatalf("payload of %d bytes on a path dropping %s, want %d", a.maxPayload, path.name, want)
+		}
 	}
 }
