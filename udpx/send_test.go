@@ -71,9 +71,12 @@ func TestInFlightAcked(t *testing.T) {
 	if inFlight.bytes != 600 {
 		t.Fatalf("%d bytes in flight", inFlight.bytes)
 	}
-	acked := inFlight.acked([]pnRange{{start: 3, end: 4}})
+	acked, spurious := inFlight.acked([]pnRange{{start: 3, end: 4}})
 	if len(acked) != 2 {
 		t.Fatalf("%d packets acknowledged", len(acked))
+	}
+	if spurious != 0 {
+		t.Fatalf("%d packets counted as sent twice", spurious)
 	}
 	if inFlight.len() != 4 || inFlight.bytes != 400 {
 		t.Fatalf("%d packets and %d bytes left", inFlight.len(), inFlight.bytes)
@@ -84,7 +87,7 @@ func TestInFlightAcked(t *testing.T) {
 			t.Fatalf("packet %d is still in flight", packet.packetNumber)
 		}
 	}
-	if acked = inFlight.acked([]pnRange{{start: 10, end: 20}}); len(acked) != 0 {
+	if acked, _ = inFlight.acked([]pnRange{{start: 10, end: 20}}); len(acked) != 0 {
 		t.Fatalf("%d packets acknowledged that were never sent", len(acked))
 	}
 }
@@ -111,7 +114,7 @@ func TestInFlightCompaction(t *testing.T) {
 	for packetNumber := uint32(0); packetNumber < 100; packetNumber++ {
 		inFlight.append(&sentPacket{packetNumber: packetNumber, size: 100})
 	}
-	acked := inFlight.acked([]pnRange{{start: 0, end: 49}})
+	acked, _ := inFlight.acked([]pnRange{{start: 0, end: 49}})
 	if len(acked) != 50 {
 		t.Fatalf("%d packets acknowledged", len(acked))
 	}
@@ -126,7 +129,7 @@ func TestInFlightCompaction(t *testing.T) {
 			t.Fatal("a packet that left the flight table is still in it")
 		}
 	}
-	acked = inFlight.acked([]pnRange{{start: 50, end: 99}})
+	acked, _ = inFlight.acked([]pnRange{{start: 50, end: 99}})
 	if len(acked) != 50 {
 		t.Fatalf("%d packets acknowledged", len(acked))
 	}

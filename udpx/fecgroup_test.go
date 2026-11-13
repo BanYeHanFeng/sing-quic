@@ -701,8 +701,8 @@ func TestFECRecoveryReportedAsLoss(t *testing.T) {
 	}
 
 	sender.handleAck(parsed.body, time.Now())
-	if reported := sender.stats.spuriousLoss.Load(); reported != 1 {
-		t.Fatalf("%d recovered packets reported as lost", reported)
+	if reported := sender.stats.spuriousLoss.Load(); reported != 0 {
+		t.Fatalf("%d recovered packets counted as packets that arrived twice", reported)
 	}
 	if senderConn.len() != written {
 		t.Fatalf("%d packets written after the report, %d before", senderConn.len(), written)

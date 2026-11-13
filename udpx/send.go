@@ -287,6 +287,10 @@ type sentPacket struct {
 	// a range of packet numbers and rewriting the whole table once per range is
 	// what turns a transfer into a quadratic amount of work.
 	removed bool
+	// lost says the packet left the table because it was given up on rather than
+	// because it arrived, which is what makes an acknowledgement that names it
+	// afterwards a packet this end sent twice for nothing.
+	lost bool
 }
 
 // sentPackets is the set of packets in flight, ordered by packet number.
@@ -320,12 +324,17 @@ func (s *sentPackets) len() int {
 	return len(s.packets) - s.removed
 }
 
-// acked marks the packets an acknowledgement covers and returns them.
-func (s *sentPackets) acked(ranges []pnRange) []*sentPacket {
+// acked marks the packets an acknowledgement covers and returns them, together
+// with how many of them this end had already given up on: a packet that was
+// declared lost and is acknowledged afterwards is a packet that was sent twice
+// for nothing, which is the one number that says whether the loss rules are too
+// eager.
+func (s *sentPackets) acked(ranges []pnRange) ([]*sentPacket, int) {
 	if len(s.packets) == 0 || len(ranges) == 0 {
-		return nil
+		return nil, 0
 	}
 	var acked []*sentPacket
+	spurious := 0
 	for _, current := range ranges {
 		index := sort.Search(len(s.packets), func(index int) bool {
 			return s.packets[index].packetNumber >= current.start
@@ -333,6 +342,9 @@ func (s *sentPackets) acked(ranges []pnRange) []*sentPacket {
 		for ; index < len(s.packets) && s.packets[index].packetNumber <= current.end; index++ {
 			packet := s.packets[index]
 			if packet.removed {
+				if packet.lost {
+					spurious++
+				}
 				continue
 			}
 			if s.markRemoved(packet) {
@@ -341,7 +353,7 @@ func (s *sentPackets) acked(ranges []pnRange) []*sentPacket {
 		}
 	}
 	s.compact()
-	return acked
+	return acked, spurious
 }
 
 // lost marks the packets that are lost by now and returns them, oldest first.
@@ -359,12 +371,22 @@ func (s *sentPackets) lost(now time.Time, largestAcked uint32, lossDelay time.Du
 			// nothing behind a packet that is not lost is lost either.
 			break
 		}
-		if s.markRemoved(packet) {
+		if s.markLost(packet) {
 			lost = append(lost, packet)
 		}
 	}
 	s.compact()
 	return lost
+}
+
+// markLost takes a packet out of flight because it is given up on rather than
+// because it arrived. It reports whether the packet was still in flight.
+func (s *sentPackets) markLost(packet *sentPacket) bool {
+	if packet.removed {
+		return false
+	}
+	packet.lost = true
+	return s.markRemoved(packet)
 }
 
 // remove drops one packet from flight, which is what a failed write leaves

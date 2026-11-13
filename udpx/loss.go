@@ -154,7 +154,7 @@ func (a *association) probe() {
 		return
 	}
 	frames := retransmittableFrames([]*sentPacket{oldest})
-	a.inFlight.remove(oldest)
+	a.inFlight.markLost(oldest)
 	a.probes++
 	now := time.Now()
 	if a.probes == 1 {
@@ -207,7 +207,7 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	a.mtuProbeConfirmed(acknowledgement)
 	a.flightMu.Lock()
 	priorInFlight := a.inFlight.bytes
-	acked := a.inFlight.acked(acknowledgement.ranges[:acknowledgement.count])
+	acked, spurious := a.inFlight.acked(acknowledgement.ranges[:acknowledgement.count])
 	for _, packet := range acked {
 		// What the packet carried is not going to be sent again, so the send
 		// buffer chunks behind its stream frames are given up here.
@@ -221,7 +221,7 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	// reported to the controller as lost: the data arrived, the path did not carry
 	// it, and the difference matters to a controller that would otherwise keep
 	// sending into a path that is dropping what it sends.
-	fecRecovered := a.inFlight.acked(acknowledgement.recovered[:acknowledgement.recoveredCount])
+	fecRecovered, _ := a.inFlight.acked(acknowledgement.recovered[:acknowledgement.recoveredCount])
 	for _, packet := range fecRecovered {
 		releaseFrames(packet.frames)
 	}
@@ -241,7 +241,7 @@ func (a *association) handleAck(body []byte, now time.Time) {
 	empty := a.inFlight.len() == 0
 	a.flightMu.Unlock()
 
-	a.stats.spuriousLoss.Add(int64(len(fecRecovered)))
+	a.stats.spuriousLoss.Add(int64(spurious))
 	a.rttStats.update(a.rttEstimate())
 	a.congestionAcked(acked, append(lost, fecRecovered...), priorInFlight, now)
 	if empty {
