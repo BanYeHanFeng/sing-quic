@@ -84,15 +84,39 @@ func NewClient(options ClientOptions) (*Client, error) {
 	}, nil
 }
 
+// errPathQuiet is why a session that stopped answering is closed: not because it
+// ended, but because the work it would have carried was given to a session that
+// answers. The connections it carried learn it the way they learn any other end,
+// and the session is reported as closed rather than as failed.
+var errPathQuiet = E.New("path quiet")
+
 // offer returns the session to use, dialing one if there is none. Concurrent
 // callers share one attempt: a second handshake to the same server while the
 // first is running is a password hash nobody waits for.
+//
+// A session whose path has stopped answering is not offered, even though it has
+// not ended. What it would offer is a stream that carries nothing until the path
+// comes back, and the twenty seconds the transport gives a quiet path are twenty
+// seconds of a connection that is open and silent. Measured over five days of a
+// proxied phone: every association that ended by probe timeout had the peer still
+// sending for the whole of it, so none of those twenty seconds was spent waiting
+// for a peer that might come back — it was a path this end could not be heard on,
+// and it did not come back at all.
 func (c *Client) offer(ctx context.Context) (*clientSession, error) {
 	c.connAccess.Lock()
 	conn := c.conn
 	if conn != nil && conn.active() {
-		c.connAccess.Unlock()
-		return conn, nil
+		if conn.reachable() {
+			c.connAccess.Unlock()
+			return conn, nil
+		}
+		// The session is replaced, and closed with it: nothing can be added to
+		// it, the connections on it are stalled on a path that is not
+		// answering, and the caller is about to redo them elsewhere. Keeping it
+		// would keep a socket and a heartbeat alive to wait for a path the work
+		// has already been moved off.
+		c.conn = nil
+		defer conn.dropQuiet()
 	}
 	pending := c.pending
 	if pending != nil {
@@ -332,6 +356,20 @@ func (c *clientSession) active() bool {
 	default:
 	}
 	return !common.Done(c.association.Context())
+}
+
+// reachable reports whether the session's path answered recently enough to be
+// given work. A session that ended is not asked: active answers that.
+func (c *clientSession) reachable() bool {
+	return c.association.Reachable()
+}
+
+// dropQuiet closes a session that was replaced while its path was quiet. It runs
+// in the background because the caller that replaced it has a dial to start and
+// ending the old session is not on the way there: the client has already stopped
+// offering it.
+func (c *clientSession) dropQuiet() {
+	go c.closeWithError(errPathQuiet)
 }
 
 func (c *clientSession) closeWithError(err error) {

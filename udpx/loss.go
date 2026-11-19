@@ -71,6 +71,26 @@ const (
 	// proxied phone: sixty-one associations ended this way, one of them after
 	// eleven hours, and the rest of a session's connections ended with it.
 	maxProbeSilence = 20 * time.Second
+
+	// quietPathBudget is how long a path may spend not answering a probe before
+	// it stops being a place to put new work (see Reachable). It is not the wait
+	// above: a path that comes back within maxProbeSilence keeps the streams that
+	// are already multiplexed on the association, which is what a phone that
+	// changes networks needs. What it does not keep is the work that has somewhere
+	// else to go, because a connection that arrives while this end is asking a
+	// path that does not answer is a connection that would hang for the rest of
+	// that wait.
+	//
+	// Two seconds is what the two shapes of silence look like from a phone.
+	// Measured over five days of a proxied phone, of the silences that came back
+	// on their own, two thirds were over within two seconds and nine tenths within
+	// six; of the silences that did not, every one ran to the seventeen to twenty
+	// seconds an association gives a path before it ends it. Every association
+	// that ended in that log ended that way, and in every one of them the peer was
+	// still sending while the silence lasted, so none of them was a peer that had
+	// gone away: they were paths this end could not be heard on, and no wait
+	// brought those back.
+	quietPathBudget = 2 * time.Second
 )
 
 // lossDelay is how long a packet must have been in flight before it is lost. The
@@ -145,6 +165,29 @@ func (a *association) armPTO() {
 // arrived, and with nothing in flight there is no packet left to ask about.
 func (a *association) disarmPTO() {
 	a.timers.Load().pto.Stop()
+}
+
+// Reachable reports whether the path has answered recently enough that new work
+// belongs on this association.
+//
+// What it reports is the probe, and only the probe: an acknowledgement is proof
+// that a packet arrived, and a probe that was not answered is proof that one did
+// not. The budget therefore measures how long this end has been asking a path
+// that does not answer, not how long the application has been quiet: an
+// association with nothing in flight has asked nothing and is reachable.
+//
+// The decision it feeds is the caller's. What the transport knows is that the
+// path is quiet; what to do about it is a question about the work, which the
+// transport does not have.
+func (a *association) Reachable() bool {
+	a.flightMu.Lock()
+	probing := a.probes > 0
+	since := a.probeSince
+	a.flightMu.Unlock()
+	if !probing {
+		return true
+	}
+	return time.Since(since) < quietPathBudget
 }
 
 // probe declares the oldest packet in flight lost and sends it again.

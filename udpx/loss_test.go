@@ -377,6 +377,35 @@ func TestLossDelay(t *testing.T) {
 	}
 }
 
+// TestReachable requires a path that has been asked and does not answer to stop
+// being offered for new work, and an answer to make it a path again. What it
+// measures is the probe: an association with nothing in flight has asked nothing
+// and is reachable however long the application has been quiet.
+func TestReachable(t *testing.T) {
+	conn := newFakeConn()
+	a := newTestAssociation(t, conn)
+	if !a.Reachable() {
+		t.Fatal("an association that has asked nothing is not reachable")
+	}
+	queueStream(t, a, 0, 1000)
+	a.probe()
+	if !a.Reachable() {
+		t.Fatal("a path that was just asked is not reachable")
+	}
+	a.flightMu.Lock()
+	// The budget is a wall clock, so the silence is put in the state rather than
+	// waited out: what this test asks is what the probe state means.
+	a.probeSince = time.Now().Add(-quietPathBudget)
+	a.flightMu.Unlock()
+	if a.Reachable() {
+		t.Fatal("a path that has been asked for the whole budget is still reachable")
+	}
+	a.handleAck(testAck(0, pnRange{start: 0, end: 0}), time.Now())
+	if !a.Reachable() {
+		t.Fatal("a path that answered is not reachable")
+	}
+}
+
 // TestProbeTimeout requires a peer that answers nothing for long enough to be
 // declared gone: the association ends so that the next connection dials a new
 // one, instead of probing a session the peer has no state for any more.

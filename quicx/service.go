@@ -285,9 +285,10 @@ func (s *serverSession[U]) closePacketConn(sessionID uint32, cause error) {
 	}
 }
 
-// isNormalSessionEnd reports whether a session ended without a failure. The two
-// ways an association ends on purpose are a close of either end and an idle
-// timeout; a stream that was reset with a code is the only failure the peer can
+// isNormalSessionEnd reports whether a session ended without a failure. The ways
+// an association ends on purpose are a close of either end, an idle timeout, and
+// a path that stopped answering and had its work moved to a session that
+// answers; a stream that was reset with a code is the only failure the peer can
 // report without ending the session.
 func isNormalSessionEnd(err error) bool {
 	if err == nil || E.IsClosedOrCanceled(err) {
@@ -297,6 +298,9 @@ func isNormalSessionEnd(err error) bool {
 		return true
 	}
 	if errors.Is(err, udpx.ErrIdleTimeout) {
+		return true
+	}
+	if errors.Is(err, errPathQuiet) {
 		return true
 	}
 	return false

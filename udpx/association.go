@@ -30,6 +30,13 @@ type Association interface {
 	// needs: there is no path validation to run, because the peer address was
 	// never load bearing.
 	RemoteAddr() net.Addr
+	// Reachable reports whether the path has answered recently enough that new
+	// work belongs on this association. A path that has stopped answering is not
+	// an association that ended: what is already multiplexed on it waits for the
+	// path to come back, which is what a phone that changes networks needs. What
+	// must not wait is work that has somewhere else to go, and where that is is
+	// the caller's to decide.
+	Reachable() bool
 	// Context is done when the association ended. context.Cause says why:
 	// net.ErrClosed for a close of either end, ErrIdleTimeout for silence.
 	Context() context.Context
