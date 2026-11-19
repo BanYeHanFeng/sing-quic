@@ -843,6 +843,7 @@ func (a *association) writeBatch() error {
 	// of them.
 	a.flightMu.Lock()
 	wasEmpty := a.inFlight.len() == 0
+	added := false
 	for index := range current.pending {
 		packet := &current.pending[index]
 		if !packet.sent.ackEliciting {
@@ -852,21 +853,31 @@ func (a *association) writeBatch() error {
 			// packet nobody is waiting for.
 			continue
 		}
+		if packet.sent.mtuProbe {
+			// A path MTU probe asks a question about the path and carries nothing
+			// else: it is not retransmitted, so an entry for it in flight could
+			// only be given up on, and a probe timer aimed at it asks the peer to
+			// acknowledge a size the path was chosen to try. Both are what the
+			// probe is not: an unanswered size is the answer.
+			continue
+		}
 		packet.priorInFlight = a.inFlight.bytes
 		a.inFlight.append(packet.sent)
+		added = true
 	}
 	a.flightMu.Unlock()
 	for index := range current.pending {
 		packet := &current.pending[index]
-		if packet.sent.ackEliciting {
+		if packet.sent.ackEliciting && !packet.sent.mtuProbe {
 			packet.sent.sendState = a.congestionSent(packet.sent.packetNumber, packet.sent.size, packet.priorInFlight)
 		}
 	}
 	a.resetIdle()
 	// The probe timer belongs to the oldest packet in flight, so it is armed when
 	// there was nothing in flight before this batch. A packet that follows a
-	// pending one is already covered by the wait that packet armed.
-	if wasEmpty {
+	// pending one is already covered by the wait that packet armed, and a batch
+	// that put nothing in flight has nothing for the timer to ask about.
+	if wasEmpty && added {
 		a.armPTO()
 	}
 	// The packets leave the batch before the write, not after it: what is in

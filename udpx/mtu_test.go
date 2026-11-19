@@ -12,7 +12,6 @@ import (
 func TestMTUProbeRetriesALostProbe(t *testing.T) {
 	conn := newFakeConn()
 	a := newTestAssociation(t, conn)
-	a.timers.Load().pto.Stop()
 	a.startMTUProbe()
 	a.sendMu.Lock()
 	if !a.mtuProbe.active {
@@ -55,12 +54,35 @@ func TestMTUProbeRetriesALostProbe(t *testing.T) {
 	}
 }
 
+// TestMTUProbeStaysOutOfFlight requires a path MTU probe to be a question and
+// not a packet in flight. Nothing acknowledges it on behalf of data and it is
+// never sent again, so an entry for it in flight could only be given up on — and
+// the probe timer aimed at it asks the peer, twice, to acknowledge a size the
+// path was chosen to try, which is the one answer the probe already has.
+func TestMTUProbeStaysOutOfFlight(t *testing.T) {
+	conn := newFakeConn()
+	a := newTestAssociation(t, conn)
+	a.startMTUProbe()
+	if conn.len() != 1 {
+		t.Fatalf("%d packets written, want the probe", conn.len())
+	}
+	a.flightMu.Lock()
+	inFlight := a.inFlight.len()
+	flightBytes := a.inFlight.bytes
+	a.flightMu.Unlock()
+	if inFlight != 0 || flightBytes != 0 {
+		t.Fatalf("%d packets of %d bytes in flight after an mtu probe, want none", inFlight, flightBytes)
+	}
+	if charged := a.congestionCharged(); charged != 0 {
+		t.Fatalf("an mtu probe charged %d bytes to the window", charged)
+	}
+}
+
 // TestMTUProbeRaisesTheSize requires the size a probe confirmed to be the size the
 // association sends with, and the payload budget to follow it.
 func TestMTUProbeRaisesTheSize(t *testing.T) {
 	conn := newFakeConn()
 	a := newTestAssociation(t, conn)
-	a.timers.Load().pto.Stop()
 	a.startMTUProbe()
 	a.sendMu.Lock()
 	packetNumber := a.mtuProbe.packetNumber
