@@ -41,12 +41,19 @@ const (
 	// path has been measured.
 	initialPTO = 500 * time.Millisecond
 
-	// maxProbeBackoff is how often the wait between probes may double. It stays
-	// small because a probe is also what asks a peer for the acknowledgement that
-	// carries a window this end is waiting on: a wait of sixteen round trips
-	// between questions turns a lost window update into a stall long enough to look
-	// like a broken path.
-	maxProbeBackoff = 2
+	// maxProbeBackoff is how often the wait between probes may double, which is
+	// thirty-two probe timeouts at the cap: on a path whose round trip is a few
+	// dozen milliseconds, a packet every three seconds.
+	//
+	// The cap is what a silent association costs the path, and it was small while
+	// a probe was also the only way to repeat a window update this end had lost:
+	// a wait of sixteen round trips between questions turned a lost update into a
+	// stall that looked like a broken path. The window loop repeats a window that
+	// moved once a second (windowUpdateInterval), so a probe no longer has to, and
+	// what is left for it is the question it was built for: is the path still
+	// there? A path that is there answers one probe; a path that is gone does not
+	// answer fifty.
+	maxProbeBackoff = 5
 
 	// maxProbeSilence is how long an association may ask a peer that answers
 	// nothing before the peer is declared gone. A path that comes back within it
