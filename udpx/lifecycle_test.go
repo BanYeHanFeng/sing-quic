@@ -1,0 +1,92 @@
+package udpx
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"runtime"
+	"testing"
+	"time"
+)
+
+func TestIsNormalClose(t *testing.T) {
+	for _, err := range []error{
+		nil,
+		net.ErrClosed,
+		io.EOF,
+		context.Canceled,
+		ErrIdleTimeout,
+		ErrProbeTimeout,
+		StreamResetError{},
+	} {
+		if !IsNormalClose(err) {
+			t.Fatalf("%v is not a normal close", err)
+		}
+	}
+	for _, err := range []error{
+		errAuthentication,
+		errShortFrame,
+		net.UnknownNetworkError("tcp"),
+	} {
+		if IsNormalClose(err) {
+			t.Fatalf("%v is a normal close", err)
+		}
+	}
+}
+
+func waitGoroutines(t *testing.T, baseline int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var current int
+	for time.Now().Before(deadline) {
+		current = runtime.NumGoroutine()
+		if current <= baseline {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	buffer := make([]byte, 1<<20)
+	n := runtime.Stack(buffer, true)
+	t.Fatalf("%d goroutines are left after the connection ended, baseline %d\n%s", current, baseline, buffer[:n])
+}
+
+func TestCloseLeavesNoGoroutines(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+	client, server, listener := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 10*time.Second)
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = stream.Write(testPayload(64 * 1024)); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stream.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = io.Copy(io.Discard, accepted); err != nil {
+		t.Fatal(err)
+	}
+	_ = accepted.Close()
+	_ = stream.Close()
+	_ = client.CloseWithError(nil)
+	_ = server.CloseWithError(nil)
+	_ = listener.Close()
+	waitGoroutines(t, baseline, 5*time.Second)
+}
+
+func TestPeerCloseEndsTheAssociation(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	if err := client.CloseWithError(nil); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, server.Context(), 3*time.Second)
+	if cause := context.Cause(server.Context()); !errors.Is(cause, net.ErrClosed) {
+		t.Fatalf("the server ended with %v", cause)
+	}
+}

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sagernet/sing-quic/udpio"
+	"github.com/sagernet/sing-quic/udpx/internal/udpio"
 
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -18,6 +18,8 @@ const (
 	acceptBacklog = 16
 
 	helloLifetime = 10 * time.Second
+
+	helloSweepInterval = time.Second
 )
 
 type Listener struct {
@@ -33,6 +35,7 @@ type Listener struct {
 	mu           sync.Mutex
 	associations map[connectionID]*association
 	hellos       map[connectionID]*helloAnswer
+	sweptAt      time.Time
 
 	closeOnce sync.Once
 }
@@ -79,7 +82,7 @@ func (l *Listener) Close() error {
 func (l *Listener) shutdown(cause error) {
 	l.closeOnce.Do(func() {
 		l.cancel(cause)
-		_ = l.conn.Close()
+		_ = l.conn.SetReadDeadline(time.Now())
 		l.mu.Lock()
 		associations := l.associations
 		l.associations = make(map[connectionID]*association)
@@ -96,16 +99,20 @@ func (l *Listener) readLoop() {
 	for {
 		packets, err := l.batchIO.ReadPackets([][]byte{buffer})
 		if err != nil {
+			if l.ctx.Err() != nil {
+				return
+			}
 			if isClosed(err) {
 				l.shutdown(err)
 				return
 			}
 			continue
 		}
+		l.sweepHellos(time.Now())
 		for _, packet := range packets {
 			packet.ForEach(func(datagram []byte) {
-				packetHeader, err := parseHeader(datagram)
-				if err != nil {
+				packetHeader, parseErr := parseHeader(datagram)
+				if parseErr != nil {
 					return
 				}
 				if packetHeader.Type == packetTypeHandshake {
@@ -116,6 +123,21 @@ func (l *Listener) readLoop() {
 			})
 		}
 	}
+}
+
+func (l *Listener) sweepHellos(now time.Time) {
+	l.mu.Lock()
+	if now.Sub(l.sweptAt) < helloSweepInterval {
+		l.mu.Unlock()
+		return
+	}
+	l.sweptAt = now
+	for connID, answer := range l.hellos {
+		if now.Sub(answer.at) >= helloLifetime {
+			delete(l.hellos, connID)
+		}
+	}
+	l.mu.Unlock()
 }
 
 func (l *Listener) dispatch(packetHeader header, packet []byte, source net.Addr) {
@@ -162,20 +184,6 @@ func (l *Listener) forgetHello(clientConnID connectionID, answer *helloAnswer) {
 	l.mu.Unlock()
 }
 
-func (l *Listener) keepHello(clientConnID connectionID, answer *helloAnswer, packet []byte) {
-	l.mu.Lock()
-	if l.hellos[clientConnID] != answer {
-		l.mu.Unlock()
-		return
-	}
-	answer.packet = packet
-	answer.at = time.Now()
-	l.mu.Unlock()
-	time.AfterFunc(helloLifetime, func() {
-		l.forgetHello(clientConnID, answer)
-	})
-}
-
 func (l *Listener) completeHandshake(clientConnID connectionID, answer *helloAnswer, hello []byte, source net.Addr) {
 	handshake, err := newServerHandshake(hello, l.verifier)
 	if err != nil {
@@ -187,11 +195,11 @@ func (l *Listener) completeHandshake(clientConnID connectionID, answer *helloAns
 		l.forgetHello(clientConnID, answer)
 		return
 	}
-	a := newAssociation(l.conn, result, source, l.options, false, false)
-	a.start()
+	a := newAssociation(l.conn, l.batchIO, result, source, l.options, false)
 	a.onClose = func() {
 		l.remove(a.localConnID)
 	}
+	a.start()
 	if !l.add(a) {
 		a.shutdown(net.ErrClosed, false)
 		l.forgetHello(clientConnID, answer)
@@ -204,8 +212,12 @@ func (l *Listener) completeHandshake(clientConnID connectionID, answer *helloAns
 		l.forgetHello(clientConnID, answer)
 		return
 	}
-	l.keepHello(clientConnID, answer, serverHello)
-	go a.startMTUProbe()
+	l.mu.Lock()
+	if l.hellos[clientConnID] == answer {
+		answer.packet = serverHello
+		answer.at = time.Now()
+	}
+	l.mu.Unlock()
 	select {
 	case l.accept <- a:
 	default:

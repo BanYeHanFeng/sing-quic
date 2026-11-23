@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sagernet/sing-quic/udpio"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -126,31 +125,27 @@ func testContext(t *testing.T, timeout time.Duration) context.Context {
 	return ctx
 }
 
-func TestClientBatches(t *testing.T) {
-	probe, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer probe.Close()
-	if gso, gro := udpio.New(probe, udpio.Options{GRO: true}).Offload(); !gso || !gro {
-		t.Skip("this kernel does not batch: gso ", gso, ", gro ", gro)
-	}
+func TestClientSessionsAreShared(t *testing.T) {
 	client, _ := testSetup(t, "password")
 	ctx := testContext(t, 20*time.Second)
-	conn, err := client.DialConn(ctx, M.ParseSocksaddr("example.com:80"))
+	first, err := client.DialConn(ctx, M.ParseSocksaddr("example.com:80"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
-	client.connAccess.Lock()
-	session := client.conn
-	client.connAccess.Unlock()
-	if session == nil {
-		t.Fatal("a dial left no session")
+	defer first.Close()
+	second, err := client.DialConn(ctx, M.ParseSocksaddr("example.com:81"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	gso, gro := session.association.Offload()
-	if !gso || !gro {
-		t.Fatalf("the client socket batches with gso %v and gro %v", gso, gro)
+	defer second.Close()
+	client.access.Lock()
+	sessions := 0
+	if client.session != nil {
+		sessions = 1
+	}
+	client.access.Unlock()
+	if sessions != 1 {
+		t.Fatal("the client opened more than one session")
 	}
 }
 

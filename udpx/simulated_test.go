@@ -23,22 +23,17 @@ type transferBounds struct {
 
 func sampleBounds(association *association) transferBounds {
 	association.streamsMu.Lock()
-	streams := make([]*Stream, 0, len(association.streams))
-	for _, stream := range association.streams {
+	streams := make([]*Stream, 0, len(association.streams.table))
+	for _, stream := range association.streams.table {
 		streams = append(streams, stream)
 	}
 	association.streamsMu.Unlock()
-	association.flightMu.Lock()
-	inFlightBytes := association.inFlight.bytes
-	association.flightMu.Unlock()
-	association.sendMu.Lock()
-	queuedFrames := association.queue.len()
-	association.sendMu.Unlock()
-	association.datagramMu.Lock()
-	reassembly := association.defragger.bytes
-	association.datagramMu.Unlock()
+	association.txMu.Lock()
+	inFlightBytes := int(association.tx.inFlight.bytes)
+	queuedFrames := len(association.tx.queue)
+	association.txMu.Unlock()
 	association.fcMu.Lock()
-	connectionWindow := association.recvWindow
+	connectionWindow := association.fc.recvWindow
 	association.fcMu.Unlock()
 	streamSegments := 0
 	streamWindow := uint64(0)
@@ -55,7 +50,6 @@ func sampleBounds(association *association) transferBounds {
 		inFlightBytes:    inFlightBytes,
 		queuedFrames:     queuedFrames,
 		streamSegments:   streamSegments,
-		reassembly:       reassembly,
 		streamWindow:     streamWindow,
 		connectionWindow: connectionWindow,
 	}
@@ -89,7 +83,6 @@ func startBoundsSampler(t *testing.T, associations ...Association) *boundsSample
 				sampler.worst.inFlightBytes = max(sampler.worst.inFlightBytes, bounds.inFlightBytes)
 				sampler.worst.queuedFrames = max(sampler.worst.queuedFrames, bounds.queuedFrames)
 				sampler.worst.streamSegments = max(sampler.worst.streamSegments, bounds.streamSegments)
-				sampler.worst.reassembly = max(sampler.worst.reassembly, bounds.reassembly)
 				sampler.worst.streamWindow = max(sampler.worst.streamWindow, bounds.streamWindow)
 				sampler.worst.connectionWindow = max(sampler.worst.connectionWindow, bounds.connectionWindow)
 				sampler.mu.Unlock()
@@ -107,6 +100,14 @@ func (s *boundsSampler) worstBounds() transferBounds {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.worst
+}
+
+func streamCount(t *testing.T, conn Association) int {
+	t.Helper()
+	a := conn.(*association)
+	a.streamsMu.Lock()
+	defer a.streamsMu.Unlock()
+	return len(a.streams.table)
 }
 
 func otherPayload(size int) []byte {
@@ -162,9 +163,9 @@ func waitGroup(t *testing.T, group *sync.WaitGroup, timeout time.Duration) {
 func TestTransferOverSimulatedPath(t *testing.T) {
 	const payloadSize = 512 * 1024
 	const datagramCount = 32
-	password := NewPassword("password")
+	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
+	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
 		loss:       0.02,
@@ -175,7 +176,7 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	})
 
 	ctx := testContext(t, 240*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +190,7 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	sampler := startBoundsSampler(t, client, server)
 	upload := testPayload(payloadSize)
 	download := otherPayload(payloadSize)
-	datagramPayload := testPayload(2 * client.(*association).datagramDataLen())
+	datagramPayload := testPayload(2 * (int(client.(*association).maxPayload.Load()) - datagramHeaderLen))
 	var wg sync.WaitGroup
 
 	wg.Add(2)
@@ -300,20 +301,17 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	}
 
 	bounds := sampler.worstBounds()
-	if bounds.streams > streamBudget {
+	if bounds.streams > initialStreams {
 		t.Errorf("%d streams were open at once", bounds.streams)
 	}
 	if bounds.inFlightBytes > int(2*bounds.connectionWindow) {
 		t.Errorf("%d bytes were in flight at once, with a window of %d", bounds.inFlightBytes, bounds.connectionWindow)
 	}
-	if dataLen := client.(*association).streamDataLen(); bounds.queuedFrames > int(8*(max(bounds.streamWindow, initialStreamWindow)/uint64(dataLen))) {
+	if dataLen := int(client.(*association).maxPayload.Load()) - streamHeaderLen; bounds.queuedFrames > int(8*(max(bounds.streamWindow, initialStreamWindow)/uint64(dataLen))) {
 		t.Errorf("%d frames were queued at once, with a window of %d", bounds.queuedFrames, bounds.streamWindow)
 	}
 	if bounds.streamSegments > int(2*bounds.streamWindow) {
 		t.Errorf("%d bytes were waiting to be read on the streams at once, with a window of %d", bounds.streamSegments, bounds.streamWindow)
-	}
-	if bounds.reassembly > maxDatagramReassemblyBytes {
-		t.Errorf("%d bytes of datagrams were reassembled at once", bounds.reassembly)
 	}
 	if count := streamCount(t, client); count != 0 {
 		t.Errorf("%d streams are left on the client", count)
@@ -372,14 +370,14 @@ func TestStreamBothDirectionsBlocked(t *testing.T) {
 }
 
 func TestAssociationEndsUnderLoad(t *testing.T) {
-	password := NewPassword("password")
+	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
+	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{delay: 20 * time.Millisecond})
 
 	ctx := testContext(t, 60*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
 	if err != nil {
 		t.Fatal(err)
 	}

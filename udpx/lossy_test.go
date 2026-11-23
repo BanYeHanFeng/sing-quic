@@ -200,14 +200,14 @@ func (l *simulatedLink) close() {
 func TestTransferUnderLoss(t *testing.T) {
 	for _, loss := range []float64{0.01, 0.05, 0.20} {
 		t.Run(testName(loss), func(t *testing.T) {
-			password := NewPassword("password")
+			credential := NewCredential("password")
 			listenerConn := udpConn(t)
-			listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
+			listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 			defer listener.Close()
 			link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: loss, lossReturn: loss})
 
 			ctx := testContext(t, 60*time.Second)
-			client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
+			client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -249,9 +249,9 @@ func TestTransferUnderLoss(t *testing.T) {
 				t.Fatal("the payload changed on the way")
 			}
 			serverAssociation := server.(*association)
-			serverAssociation.flightMu.Lock()
-			inFlight := serverAssociation.inFlight.len()
-			serverAssociation.flightMu.Unlock()
+			serverAssociation.txMu.Lock()
+			inFlight := serverAssociation.tx.inFlight.len()
+			serverAssociation.txMu.Unlock()
 			if inFlight > 2*initialStreams {
 				t.Fatalf("%d packets in flight after the transfer", inFlight)
 			}
@@ -264,9 +264,9 @@ func TestStreamOverALossyCapacityPath(t *testing.T) {
 		t.Skip("a path with a capacity takes its time")
 	}
 	const capacity = 12.5 * 1024 * 1024
-	password := NewPassword("password")
+	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
+	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
 		loss:       0.05,
@@ -277,7 +277,7 @@ func TestStreamOverALossyCapacityPath(t *testing.T) {
 	})
 
 	ctx := testContext(t, 60*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,9 +332,9 @@ func TestDownloadOverUplinkLoss(t *testing.T) {
 		t.Skip("a path that loses most of one direction takes its time")
 	}
 	const payloadSize = 256 * 1024
-	password := NewPassword("password")
+	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
+	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
 		loss:       0.4,
@@ -343,7 +343,7 @@ func TestDownloadOverUplinkLoss(t *testing.T) {
 	})
 
 	ctx := testContext(t, 120*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,9 +391,9 @@ func TestStreamOverABufferedPath(t *testing.T) {
 	}
 	const capacity = 400 * 1024
 	const payloadSize = 2 * 1024 * 1024
-	password := NewPassword("password")
+	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
+	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
 		loss:       0.006,
@@ -404,7 +404,7 @@ func TestStreamOverABufferedPath(t *testing.T) {
 		queueLimit: 25 * 1024,
 	})
 	ctx := testContext(t, 300*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), password, Options{MTU: mtuIPv4})
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,9 +443,9 @@ func TestStreamOverABufferedPath(t *testing.T) {
 		t.Fatalf("%.2f KiB/s over a path of %d KiB/s", rate/1024, capacity/1024)
 	}
 	serverAssociation := server.(*association)
-	stats := serverAssociation.snapshot()
-	if stats.sentPackets > 0 && stats.lostPackets*2 > stats.sentPackets {
-		t.Fatalf("%d of %d packets declared lost", stats.lostPackets, stats.sentPackets)
+	stats := testSnapshot(serverAssociation)
+	if stats.txPackets > 0 && stats.lostPackets*2 > stats.txPackets {
+		t.Fatalf("%d of %d packets declared lost", stats.lostPackets, stats.txPackets)
 	}
-	t.Logf("%.2f KiB/s, %d of %d packets lost, %d sent again", rate/1024, stats.lostPackets, stats.sentPackets, stats.retransmits)
+	t.Logf("%.2f KiB/s, %d of %d packets lost, %d sent again", rate/1024, stats.lostPackets, stats.txPackets, stats.retransmits)
 }

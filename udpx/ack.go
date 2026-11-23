@@ -3,6 +3,7 @@ package udpx
 import (
 	"encoding/binary"
 	"math"
+	"sync/atomic"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -83,20 +84,6 @@ func (r *pnRanges) largest() (uint32, bool) {
 	return r.ranges[0].end, true
 }
 
-func (r *pnRanges) ack() ack {
-	var result ack
-	if len(r.ranges) == 0 {
-		return result
-	}
-	result.largest = r.ranges[0].end
-	result.count = len(r.ranges)
-	if result.count > maxAckRanges {
-		result.count = maxAckRanges
-	}
-	copy(result.ranges[:], r.ranges[:result.count])
-	return result
-}
-
 type ack struct {
 	ranges  [maxAckRanges]pnRange
 	delay   time.Duration
@@ -104,72 +91,42 @@ type ack struct {
 	count   int
 }
 
-func ackBodyLen(body []byte) (int, error) {
+func parseAckFrame(body []byte) (ack, error) {
 	if len(body) < 4+2+1 {
-		return 0, errShortFrame
+		return ack{}, errShortFrame
 	}
-	count := int(body[6])
-	if count == 0 || count > maxAckRanges {
-		return 0, E.New("acknowledgement of ", count, " ranges")
-	}
-	length := 4 + 2 + 1 + 4 + (count-1)*(4+4)
-	if len(body) < length {
-		return 0, errShortFrame
-	}
-	return length, nil
-}
-
-func parseAck(body []byte) (ack, error) {
-	if _, err := ackBodyLen(body); err != nil {
-		return ack{}, err
-	}
-	var result ack
 	count := int(body[6])
 	if count == 0 || count > maxAckRanges {
 		return ack{}, E.New("acknowledgement of ", count, " ranges")
 	}
+	if len(body) < 4+2+1+count*8 {
+		return ack{}, errShortFrame
+	}
+	var result ack
 	result.largest = binary.BigEndian.Uint32(body)
 	result.delay = time.Duration(binary.BigEndian.Uint16(body[4:])) * time.Microsecond
 	result.count = count
-	offset := 7
-	end := result.largest
-	firstRange := binary.BigEndian.Uint32(body[offset:])
-	offset += 4
-	if firstRange > end {
-		return ack{}, E.New("first range of ", firstRange, " below packet number ", end)
-	}
-	result.ranges[0] = pnRange{start: end - firstRange, end: end}
-	for index := 1; index < count; index++ {
-		gap := binary.BigEndian.Uint32(body[offset:])
-		length := binary.BigEndian.Uint32(body[offset+4:])
-		offset += 8
-		if gap >= result.ranges[index-1].start {
-			return ack{}, E.New("gap of ", gap, " below packet number ", result.ranges[index-1].start)
+	for index := range count {
+		start := binary.BigEndian.Uint32(body[7+index*8:])
+		end := binary.BigEndian.Uint32(body[7+index*8+4:])
+		if start > end {
+			return ack{}, E.New("acknowledged range of ", start, " above ", end)
 		}
-		end = result.ranges[index-1].start - gap - 1
-		if length > end {
-			return ack{}, E.New("range of ", length, " below packet number ", end)
-		}
-		result.ranges[index] = pnRange{start: end - length, end: end}
+		result.ranges[index] = pnRange{start: start, end: end}
 	}
 	return result, nil
 }
 
 func (a ack) appendTo(dst []byte) []byte {
-	dst = append(dst, byte(frameTypeAck))
+	bodyLen := 4 + 2 + 1 + a.count*8
+	dst = append(dst, frameTypeAck, byte(bodyLen>>8), byte(bodyLen))
 	dst = binary.BigEndian.AppendUint32(dst, a.largest)
-	delay := a.delay
-	if delay > ackDelayLimit {
-		delay = ackDelayLimit
-	}
+	delay := min(a.delay, ackDelayLimit)
 	dst = binary.BigEndian.AppendUint16(dst, uint16(delay/time.Microsecond))
 	dst = append(dst, byte(a.count))
-	dst = binary.BigEndian.AppendUint32(dst, a.ranges[0].end-a.ranges[0].start)
-	for index := 1; index < a.count; index++ {
-		previous := a.ranges[index-1]
-		current := a.ranges[index]
-		dst = binary.BigEndian.AppendUint32(dst, previous.start-current.end-1)
-		dst = binary.BigEndian.AppendUint32(dst, current.end-current.start)
+	for index := range a.count {
+		dst = binary.BigEndian.AppendUint32(dst, a.ranges[index].start)
+		dst = binary.BigEndian.AppendUint32(dst, a.ranges[index].end)
 	}
 	return dst
 }
@@ -200,11 +157,14 @@ func (s *ackScheduler) pack(now time.Time) []byte {
 		s.pending = false
 		return nil
 	}
-	built := s.ranges.ack()
-	built.delay = now.Sub(s.largestAt)
+	var packed ack
+	packed.largest = s.ranges.ranges[0].end
+	packed.count = min(len(s.ranges.ranges), maxAckRanges)
+	copy(packed.ranges[:], s.ranges.ranges[:packed.count])
+	packed.delay = now.Sub(s.largestAt)
 	s.pending = false
 	s.elicited = 0
-	return built.appendTo(nil)
+	return packed.appendTo(nil)
 }
 
 type rttEstimator struct {
@@ -251,4 +211,43 @@ func (e *rttEstimator) rto() time.Duration {
 
 func (e *rttEstimator) pto() time.Duration {
 	return e.rto() + maxAckDelay
+}
+
+func lossDelay(rtt rttEstimator) time.Duration {
+	base := rtt.smoothed
+	if rtt.latest > base {
+		base = rtt.latest
+	}
+	if base <= 0 {
+		base = initialRTT
+	}
+	delay := time.Duration(float64(base)*timeThreshold) + maxAckDelay
+	if delay < timerGranularity {
+		delay = timerGranularity
+	}
+	return delay
+}
+
+type rttStats struct {
+	min      atomic.Int64
+	smoothed atomic.Int64
+	latest   atomic.Int64
+}
+
+func (s *rttStats) update(estimator rttEstimator) {
+	s.min.Store(int64(estimator.min))
+	s.smoothed.Store(int64(estimator.smoothed))
+	s.latest.Store(int64(estimator.latest))
+}
+
+func (s *rttStats) MinRTT() time.Duration {
+	return time.Duration(s.min.Load())
+}
+
+func (s *rttStats) SmoothedRTT() time.Duration {
+	return time.Duration(s.smoothed.Load())
+}
+
+func (s *rttStats) LatestRTT() time.Duration {
+	return time.Duration(s.latest.Load())
 }

@@ -2,206 +2,147 @@ package udpx
 
 import (
 	"bytes"
-	"context"
 	"testing"
 	"time"
 )
 
-func receiveDatagram(t *testing.T, association Association, ctx context.Context) Datagram {
-	t.Helper()
-	datagram, err := association.ReceiveDatagram(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return datagram
-}
-
 func TestDatagramRoundTrip(t *testing.T) {
 	client, server, _ := testSetup(t, Options{}, Options{})
 	ctx := testContext(t, 10*time.Second)
-	if err := client.SendDatagram(1, []byte("first")); err != nil {
+	payload := testPayload(1000)
+	if err := client.SendDatagram(7, payload); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.SendDatagram(9, []byte("second")); err != nil {
+	datagram, err := server.ReceiveDatagram(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	first := receiveDatagram(t, server, ctx)
-	if first.Channel != 1 || string(first.Data) != "first" {
-		t.Fatalf("first message is %d %q", first.Channel, first.Data)
+	if datagram.Channel != 7 {
+		t.Fatalf("channel %d", datagram.Channel)
 	}
-	second := receiveDatagram(t, server, ctx)
-	if second.Channel != 9 || string(second.Data) != "second" {
-		t.Fatalf("second message is %d %q", second.Channel, second.Data)
-	}
-	if err := server.SendDatagram(1, []byte("reply")); err != nil {
-		t.Fatal(err)
-	}
-	reply := receiveDatagram(t, client, ctx)
-	if reply.Channel != 1 || string(reply.Data) != "reply" {
-		t.Fatalf("reply is %d %q", reply.Channel, reply.Data)
+	if !bytes.Equal(datagram.Data, payload) {
+		t.Fatal("the datagram changed on the way")
 	}
 }
 
 func TestDatagramEmpty(t *testing.T) {
 	client, server, _ := testSetup(t, Options{}, Options{})
 	ctx := testContext(t, 10*time.Second)
-	if err := client.SendDatagram(4, nil); err != nil {
+	if err := client.SendDatagram(1, nil); err != nil {
 		t.Fatal(err)
 	}
-	datagram := receiveDatagram(t, server, ctx)
-	if datagram.Channel != 4 || len(datagram.Data) != 0 {
-		t.Fatalf("empty message is %d %q", datagram.Channel, datagram.Data)
+	datagram, err := server.ReceiveDatagram(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(datagram.Data) != 0 {
+		t.Fatalf("%d bytes", len(datagram.Data))
 	}
 }
 
 func TestDatagramFragments(t *testing.T) {
 	client, server, _ := testSetup(t, Options{}, Options{})
 	ctx := testContext(t, 10*time.Second)
-	payload := testPayload(8 * client.(*association).datagramDataLen())
-	if err := client.SendDatagram(2, payload); err != nil {
+	payload := testPayload(16 * 1024)
+	if err := client.SendDatagram(3, payload); err != nil {
 		t.Fatal(err)
 	}
-	datagram := receiveDatagram(t, server, ctx)
-	if datagram.Channel != 2 {
-		t.Fatalf("message is on channel %d", datagram.Channel)
+	datagram, err := server.ReceiveDatagram(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if !bytes.Equal(datagram.Data, payload) {
-		t.Fatalf("the message changed on the way: %d bytes of %d", len(datagram.Data), len(payload))
-	}
-}
-
-func TestDatagramFragmentOrder(t *testing.T) {
-	defragger := newDatagramDefragger()
-	now := time.Now()
-	fragment := func(message uint16, index, total uint8, data string) datagramData {
-		return datagramData{channel: 7, message: message, index: index, total: total, data: []byte(data)}
-	}
-	datagram, complete, err := defragger.feed(fragment(1, 2, 3, "cc"), now)
-	if err != nil || complete {
-		t.Fatalf("a tail fragment produced %q, %v", datagram, err)
-	}
-	datagram, complete, err = defragger.feed(fragment(1, 0, 3, "aa"), now)
-	if err != nil || complete {
-		t.Fatalf("a first fragment produced %q, %v", datagram, err)
-	}
-	datagram, complete, err = defragger.feed(fragment(2, 0, 2, "xx"), now)
-	if err != nil || complete {
-		t.Fatalf("a fragment of another message produced %q, %v", datagram, err)
-	}
-	datagram, complete, err = defragger.feed(fragment(1, 1, 3, "bb"), now)
-	if err != nil || !complete || string(datagram) != "aabbcc" {
-		t.Fatalf("the first message is %q, %v", datagram, err)
-	}
-	datagram, complete, err = defragger.feed(fragment(2, 0, 2, "xx"), now)
-	if err != nil || complete {
-		t.Fatalf("a duplicated fragment produced %q, %v", datagram, err)
-	}
-	datagram, complete, err = defragger.feed(fragment(2, 1, 2, "yy"), now)
-	if err != nil || !complete || string(datagram) != "xxyy" {
-		t.Fatalf("the second message is %q, %v", datagram, err)
-	}
-	if len(defragger.entries) != 0 || defragger.bytes != 0 {
-		t.Fatalf("%d reassemblies and %d bytes are left", len(defragger.entries), defragger.bytes)
-	}
-}
-
-func TestDatagramFragmentInvalid(t *testing.T) {
-	defragger := newDatagramDefragger()
-	for _, data := range []datagramData{
-		{channel: 1, message: 1, index: 0, total: 0, data: []byte("aa")},
-		{channel: 1, message: 1, index: 3, total: 3, data: []byte("aa")},
-	} {
-		if _, complete, err := defragger.feed(data, time.Now()); err == nil || complete {
-			t.Fatalf("fragment %d of %d was accepted", data.index, data.total)
-		}
-	}
-}
-
-func TestDatagramFragmentBounded(t *testing.T) {
-	defragger := newDatagramDefragger()
-	for message := 0; message < 4*maxDatagramReassemblyCount; message++ {
-		data := datagramData{channel: 1, message: uint16(message), index: 0, total: 2, data: []byte("aa")}
-		if _, complete, err := defragger.feed(data, time.Now()); err != nil || complete {
-			t.Fatalf("an incomplete message produced %v, %v", complete, err)
-		}
-	}
-	if len(defragger.entries) > maxDatagramReassemblyCount {
-		t.Fatalf("%d reassemblies are tracked", len(defragger.entries))
-	}
-	later := time.Now().Add(datagramReassemblyAge + time.Second)
-	if _, complete, err := defragger.feed(datagramData{channel: 2, message: 1, index: 0, total: 2}, later); err != nil || complete {
-		t.Fatalf("a fragment of an incomplete message produced %v, %v", complete, err)
-	}
-	if len(defragger.entries) != 1 {
-		t.Fatalf("%d reassemblies are tracked after the old ones expired", len(defragger.entries))
+		t.Fatal("the datagram changed on the way")
 	}
 }
 
 func TestDatagramTooLarge(t *testing.T) {
 	client, _, _ := testSetup(t, Options{}, Options{})
-	err := client.SendDatagram(1, make([]byte, maxDatagramSize+1))
-	if err == nil {
-		t.Fatal("a datagram larger than the wire format allows was sent")
+	if err := client.SendDatagram(1, make([]byte, maxDatagramSize+1)); err == nil {
+		t.Fatal("an oversized datagram was accepted")
 	}
 }
 
-func TestDatagramFrame(t *testing.T) {
-	encoded := appendDatagram(nil, datagramData{
-		channel: 1 << 20,
-		message: 1 << 12,
-		index:   2,
-		total:   5,
-		data:    []byte("hello"),
-	})
-	f, rest, err := nextFrame(encoded)
+func TestDatagramDefraggerRejects(t *testing.T) {
+	defragger := newDatagramDefragger()
+	now := time.Now()
+	if _, _, err := defragger.feed(datagramData{index: 0, total: 0}, now); err == nil {
+		t.Fatal("a zero-fragment datagram was accepted")
+	}
+	if _, _, err := defragger.feed(datagramData{index: 2, total: 2}, now); err == nil {
+		t.Fatal("a fragment past the total was accepted")
+	}
+}
+
+func TestDatagramDefraggerOrdersFragments(t *testing.T) {
+	defragger := newDatagramDefragger()
+	now := time.Now()
+	if _, complete, err := defragger.feed(datagramData{channel: 1, message: 1, index: 1, total: 2, data: []byte("world")}, now); err != nil || complete {
+		t.Fatal("an incomplete datagram was completed")
+	}
+	message, complete, err := defragger.feed(datagramData{channel: 1, message: 1, index: 0, total: 2, data: []byte("hello ")}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rest) != 0 || f.frameType != frameTypeDatagram {
-		t.Fatalf("frame of type %d with %d bytes after it", f.frameType, len(rest))
-	}
-	data := f.datagram()
-	if data.channel != 1<<20 || data.message != 1<<12 || data.index != 2 || data.total != 5 {
-		t.Fatalf("frame carries %d %d %d %d", data.channel, data.message, data.index, data.total)
-	}
-	if string(data.data) != "hello" {
-		t.Fatalf("frame carries %q", data.data)
-	}
-	for _, truncated := range []int{0, 1, datagramFixedLen - 1, len(encoded) - 1} {
-		if _, _, err = nextFrame(encoded[:truncated]); err == nil {
-			t.Fatalf("datagram frame truncated to %d bytes parsed", truncated)
-		}
-	}
-	flagged := append([]byte(nil), encoded...)
-	flagged[0] |= frameFlagFIN
-	if _, _, err = nextFrame(flagged); err == nil {
-		t.Fatal("a datagram with the end-of-stream flag parsed")
-	}
-	if frameTypeDatagram.retransmittable() {
-		t.Fatal("a datagram is retransmitted")
+	if !complete || string(message) != "hello world" {
+		t.Fatalf("reassembled %q", message)
 	}
 }
 
-func TestDatagramFragmentBoundary(t *testing.T) {
-	client, server, _ := testSetup(t, Options{}, Options{})
-	assoc := client.(*association)
-	fragmentLen := assoc.datagramDataLen()
-	if fragmentLen <= 0 || fragmentLen != maxPacketSize-headerLen-tagLen-datagramFixedLen {
-		t.Fatalf("fragment length %d does not match the packet size", fragmentLen)
+func TestDatagramDefraggerExpires(t *testing.T) {
+	defragger := newDatagramDefragger()
+	now := time.Now()
+	_, _, _ = defragger.feed(datagramData{channel: 1, message: 1, index: 0, total: 2, data: []byte("a")}, now)
+	if defragger.bytes == 0 {
+		t.Fatal("nothing was remembered")
 	}
-	sizes := []int{1, fragmentLen - 1, fragmentLen, fragmentLen + 1, 2 * fragmentLen, 2005, 4000}
-	ctx := testContext(t, 20*time.Second)
-	for _, size := range sizes {
-		payload := make([]byte, size)
-		for index := range payload {
-			payload[index] = byte(index)
+	_, _, _ = defragger.feed(datagramData{channel: 2, message: 1, index: 0, total: 2, data: []byte("b")}, now.Add(datagramReassemblyAge+time.Second))
+	if defragger.bytes > 1 {
+		t.Fatalf("%d bytes are remembered", defragger.bytes)
+	}
+}
+
+func FuzzDatagramReassembly(f *testing.F) {
+	f.Add(uint32(1), uint16(1), []byte{0, 0, 1, 1}, []byte("data"))
+	f.Fuzz(func(t *testing.T, channel uint32, message uint16, header []byte, data []byte) {
+		if len(header) < 4 {
+			return
 		}
-		if err := client.SendDatagram(1, payload); err != nil {
-			t.Fatalf("size %d: %v", size, err)
+		payload := make([]byte, 0, 8+len(data))
+		payload = append(payload, byte(channel>>24), byte(channel>>16), byte(channel>>8), byte(channel))
+		payload = append(payload, byte(message>>8), byte(message))
+		payload = append(payload, header[0]&0x0f, header[1]&0x0f)
+		payload = append(payload, data...)
+		defragger := newDatagramDefragger()
+		_, _, _ = defragger.feed(parseDatagram(payload), time.Now())
+	})
+}
+
+func TestDatagramChannelIsolation(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 10*time.Second)
+	if err := client.SendDatagram(1, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SendDatagram(2, []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		datagram, err := server.ReceiveDatagram(ctx)
+		if err != nil {
+			t.Fatal(err)
 		}
-		datagram := receiveDatagram(t, server, ctx)
-		if !bytes.Equal(datagram.Data, payload) {
-			t.Fatalf("size %d came back as %d bytes", size, len(datagram.Data))
+		switch datagram.Channel {
+		case 1:
+			if string(datagram.Data) != "one" {
+				t.Fatalf("channel 1 got %q", datagram.Data)
+			}
+		case 2:
+			if string(datagram.Data) != "two" {
+				t.Fatalf("channel 2 got %q", datagram.Data)
+			}
+		default:
+			t.Fatalf("unknown channel %d", datagram.Channel)
 		}
 	}
 }

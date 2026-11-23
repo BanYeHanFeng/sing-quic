@@ -2,37 +2,75 @@ package quicx
 
 import (
 	"encoding/binary"
+	"io"
+	"net/netip"
 
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
-var AddressSerializer = M.NewSerializer(
-	M.AddressFamilyByte(0x00, M.AddressFamilyFqdn),
-	M.AddressFamilyByte(0x01, M.AddressFamilyIPv4),
-	M.AddressFamilyByte(0x02, M.AddressFamilyIPv6),
-	M.AddressFamilyByte(0xff, M.AddressFamilyEmpty),
+const (
+	addressFamilyIPv4 = 0x01
+
+	addressFamilyFqdn = 0x03
+
+	addressFamilyIPv6 = 0x04
+
+	addressFamilyEmpty = 0xff
 )
 
-func writeAddrPort(data []byte, destination M.Socksaddr) int {
+func appendAddrPort(dst []byte, destination M.Socksaddr) []byte {
 	if !destination.IsValid() {
-		data[0] = addressFamilyEmpty
-		return 1
+		return append(dst, addressFamilyEmpty)
 	}
 	if destination.IsIPv4() {
-		data[0] = addressFamilyIPv4
-		copy(data[1:5], destination.Addr.AsSlice())
-		binary.BigEndian.PutUint16(data[5:7], destination.Port)
-		return 7
+		dst = append(dst, addressFamilyIPv4)
+		dst = append(dst, destination.Addr.AsSlice()...)
+		return binary.BigEndian.AppendUint16(dst, destination.Port)
 	}
 	if destination.IsIPv6() {
-		data[0] = addressFamilyIPv6
-		copy(data[1:17], destination.Addr.AsSlice())
-		binary.BigEndian.PutUint16(data[17:19], destination.Port)
-		return 19
+		dst = append(dst, addressFamilyIPv6)
+		dst = append(dst, destination.Addr.AsSlice()...)
+		return binary.BigEndian.AppendUint16(dst, destination.Port)
 	}
-	data[0] = addressFamilyFqdn
-	data[1] = byte(len(destination.Fqdn))
-	fqdnLen := copy(data[2:], destination.Fqdn)
-	binary.BigEndian.PutUint16(data[2+fqdnLen:], destination.Port)
-	return 4 + fqdnLen
+	dst = append(dst, addressFamilyFqdn, byte(len(destination.Fqdn)))
+	dst = append(dst, destination.Fqdn...)
+	return binary.BigEndian.AppendUint16(dst, destination.Port)
+}
+
+func parseAddrPort(data []byte) (M.Socksaddr, int, error) {
+	if len(data) < 1 {
+		return M.Socksaddr{}, 0, io.ErrUnexpectedEOF
+	}
+	switch data[0] {
+	case addressFamilyIPv4:
+		if len(data) < 1+4+2 {
+			return M.Socksaddr{}, 0, io.ErrUnexpectedEOF
+		}
+		var address [4]byte
+		copy(address[:], data[1:5])
+		return M.Socksaddr{Addr: netip.AddrFrom4(address), Port: binary.BigEndian.Uint16(data[5:7])}, 7, nil
+	case addressFamilyIPv6:
+		if len(data) < 1+16+2 {
+			return M.Socksaddr{}, 0, io.ErrUnexpectedEOF
+		}
+		var address [16]byte
+		copy(address[:], data[1:17])
+		return M.Socksaddr{Addr: netip.AddrFrom16(address), Port: binary.BigEndian.Uint16(data[17:19])}.Unwrap(), 19, nil
+	case addressFamilyFqdn:
+		if len(data) < 2 {
+			return M.Socksaddr{}, 0, io.ErrUnexpectedEOF
+		}
+		fqdnLen := int(data[1])
+		if len(data) < 2+fqdnLen+2 {
+			return M.Socksaddr{}, 0, io.ErrUnexpectedEOF
+		}
+		fqdn := string(data[2 : 2+fqdnLen])
+		port := binary.BigEndian.Uint16(data[2+fqdnLen : 4+fqdnLen])
+		return M.ParseSocksaddrHostPort(fqdn, port), 4 + fqdnLen, nil
+	case addressFamilyEmpty:
+		return M.Socksaddr{}, 1, nil
+	default:
+		return M.Socksaddr{}, 0, E.New("unknown address family ", data[0])
+	}
 }

@@ -1,90 +1,99 @@
 package udpx
 
 import (
+	"net"
 	"testing"
+	"time"
 )
 
-func TestMTUProbeRetriesALostProbe(t *testing.T) {
-	conn := newFakeConn()
-	a := newTestAssociation(t, conn)
-	a.startMTUProbe()
-	a.sendMu.Lock()
-	if !a.mtuProbe.active {
-		a.sendMu.Unlock()
-		t.Fatal("no probe after the search started")
+func testMTUState(candidates ...int) mtuState {
+	return mtuState{candidates: candidates}
+}
+
+func TestMTUNext(t *testing.T) {
+	state := testMTUState(1452, 1352, 1232, 1200)
+	candidate, loaded := state.next(1200)
+	if !loaded || candidate != 1452 {
+		t.Fatalf("candidate %d", candidate)
 	}
-	candidate := a.mtuProbe.candidate
-	packetNumber := a.mtuProbe.packetNumber
-	a.sendMu.Unlock()
-	if candidate != mtuIPv4 {
-		t.Fatalf("probe of %d bytes, want %d", candidate, mtuIPv4)
-	}
-	for attempt := 1; attempt < mtuProbeAttempts; attempt++ {
-		a.mtuProbeTimeout(packetNumber)
-		a.sendMu.Lock()
-		if !a.mtuProbe.active || a.mtuProbe.candidate != candidate {
-			a.sendMu.Unlock()
-			t.Fatalf("size %d was ruled out after %d unanswered probes", candidate, attempt)
-		}
-		if a.mtuProbe.attempts != attempt {
-			attempts := a.mtuProbe.attempts
-			a.sendMu.Unlock()
-			t.Fatalf("probe %d of %d is attempt %d, want %d", attempts, candidate, attempts, attempt)
-		}
-		packetNumber = a.mtuProbe.packetNumber
-		a.sendMu.Unlock()
-	}
-	a.mtuProbeTimeout(packetNumber)
-	a.sendMu.Lock()
-	defer a.sendMu.Unlock()
-	for _, known := range a.mtuCandidates {
-		if known == candidate {
-			t.Fatalf("size %d is still a candidate after %d unanswered probes", candidate, mtuProbeAttempts)
-		}
-	}
-	if a.mtuProbe.active && a.mtuProbe.candidate == candidate {
-		t.Fatalf("size %d is still being probed", candidate)
+	state.dropValue(1452)
+	if candidate, loaded = state.next(1200); !loaded || candidate != 1352 {
+		t.Fatalf("candidate %d", candidate)
 	}
 }
 
-func TestMTUProbeStaysOutOfFlight(t *testing.T) {
-	conn := newFakeConn()
-	a := newTestAssociation(t, conn)
-	a.startMTUProbe()
-	if conn.len() != 1 {
-		t.Fatalf("%d packets written, want the probe", conn.len())
+func TestMTUStepDown(t *testing.T) {
+	state := testMTUState(1452, 1352, 1232, 1200)
+	next, loaded := state.nextBelow(1452)
+	if !loaded || next != 1352 {
+		t.Fatalf("next %d", next)
 	}
-	a.flightMu.Lock()
-	inFlight := a.inFlight.len()
-	flightBytes := a.inFlight.bytes
-	a.flightMu.Unlock()
-	if inFlight != 0 || flightBytes != 0 {
-		t.Fatalf("%d packets of %d bytes in flight after an mtu probe, want none", inFlight, flightBytes)
+	if _, loaded = state.nextBelow(1200); loaded {
+		t.Fatal("stepped below the smallest candidate")
 	}
-	if charged := a.congestionCharged(); charged != 0 {
-		t.Fatalf("an mtu probe charged %d bytes to the window", charged)
+}
+
+func TestMTUFixed(t *testing.T) {
+	var state mtuState
+	state.init(1280, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if _, loaded := state.next(1200); loaded {
+		t.Fatal("a fixed mtu was probed")
+	}
+}
+
+func TestMTUCandidatesForTheAddressFamily(t *testing.T) {
+	if candidates := mtuCandidatesFor(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}); candidates[0] != mtuIPv4 {
+		t.Fatalf("IPv4 starts at %d", candidates[0])
+	}
+	if candidates := mtuCandidatesFor(&net.UDPAddr{IP: net.ParseIP("::1")}); candidates[0] != mtuIPv6 {
+		t.Fatalf("IPv6 starts at %d", candidates[0])
 	}
 }
 
 func TestMTUProbeRaisesTheSize(t *testing.T) {
-	conn := newFakeConn()
-	a := newTestAssociation(t, conn)
-	a.startMTUProbe()
-	a.sendMu.Lock()
-	packetNumber := a.mtuProbe.packetNumber
-	candidate := a.mtuProbe.candidate
-	a.sendMu.Unlock()
-	confirmation := ack{largest: packetNumber, count: 1}
-	confirmation.ranges[0] = pnRange{start: packetNumber, end: packetNumber}
-	if !a.mtuProbeConfirmed(confirmation) {
-		t.Fatal("the probe was not confirmed")
+	client, server, _ := testSetup(t, Options{}, Options{})
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if client.(*association).mtuSize() == mtuIPv4 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	a.sendMu.Lock()
-	defer a.sendMu.Unlock()
-	if a.mtu != candidate {
-		t.Fatalf("mtu %d after confirmation, want %d", a.mtu, candidate)
+	if size := client.(*association).mtuSize(); size != mtuIPv4 {
+		t.Fatalf("the client settled on %d", size)
 	}
-	if a.maxPayload != a.mtu-headerLen-tagLen {
-		t.Fatalf("payload of %d bytes, want %d", a.maxPayload, a.mtu-headerLen-tagLen)
+	if size := server.(*association).mtuSize(); size != mtuIPv4 {
+		t.Fatalf("the server settled on %d", size)
+	}
+}
+
+func TestMTUProbeIsSentAlone(t *testing.T) {
+	client, _, _ := testSetup(t, Options{MTU: 0}, Options{})
+	a := client.(*association)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		a.txMu.Lock()
+		probing := a.tx.mtu.active || len(a.tx.mtu.candidates) > 0
+		a.txMu.Unlock()
+		if !probing {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the mtu probe never finished")
+}
+
+func TestMTUProbeTimeoutSkipsTheCandidate(t *testing.T) {
+	state := testMTUState(1452, 1352)
+	state.start(1452, 3, time.Now().Add(-time.Second))
+	if !state.active || state.candidate != 1452 {
+		t.Fatal("the probe did not start")
+	}
+	state.dropCandidate()
+	if state.active {
+		t.Fatal("the probe is still active")
+	}
+	if candidate, loaded := state.next(1200); !loaded || candidate != 1352 {
+		t.Fatalf("candidate %d", candidate)
 	}
 }

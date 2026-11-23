@@ -2,7 +2,6 @@ package quicx
 
 import (
 	"net"
-	"sync"
 	"time"
 
 	"github.com/sagernet/sing-quic/udpx"
@@ -12,8 +11,6 @@ import (
 type streamConn struct {
 	stream      *udpx.Stream
 	destination M.Socksaddr
-	onClose     func()
-	closeOnce   sync.Once
 }
 
 func (c *streamConn) Read(p []byte) (n int, err error) {
@@ -29,13 +26,7 @@ func (c *streamConn) CloseWrite() error {
 }
 
 func (c *streamConn) Close() error {
-	err := c.stream.Close()
-	c.closeOnce.Do(func() {
-		if c.onClose != nil {
-			c.onClose()
-		}
-	})
-	return err
+	return c.stream.Close()
 }
 
 func (c *streamConn) LocalAddr() net.Addr {

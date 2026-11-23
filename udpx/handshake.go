@@ -3,18 +3,15 @@ package udpx
 import (
 	"crypto/ecdh"
 	"crypto/hkdf"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
-
-	"golang.org/x/crypto/argon2"
 
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
 const (
-	version = 6
+	version = 7
 
 	randomLen = 16
 
@@ -32,56 +29,12 @@ const (
 	serverHelloBodyLen = 1 + 2 + randomLen + publicKeyLen + macLen
 )
 
-const (
-	argonTime    uint32 = 2
-	argonMemory  uint32 = 16 * 1024
-	argonThreads uint8  = 2
-)
-
 var (
 	errUnsupportedVersion = E.New("unsupported handshake version")
 	errUnknownKeyID       = E.New("handshake with unknown key id")
 	errHandshakeMAC       = E.New("handshake failed authentication")
 	errHandshakePacket    = E.New("malformed handshake packet")
 )
-
-type Credential interface {
-	KeyID() [keyIDLen]byte
-	AuthKey(transcript []byte) []byte
-}
-
-type Verifier interface {
-	Lookup(keyID [keyIDLen]byte) (AuthKey func(transcript []byte) []byte, ok bool)
-}
-
-type Password struct {
-	password []byte
-	keyID    [keyIDLen]byte
-}
-
-func NewPassword(password string) Password {
-	return Password{
-		password: []byte(password),
-		keyID:    keyIDFromPassword([]byte(password)),
-	}
-}
-
-func (p Password) KeyID() [keyIDLen]byte {
-	return p.keyID
-}
-
-func (p Password) AuthKey(transcript []byte) []byte {
-	salt := sha256.Sum256(transcript)
-	return argon2.IDKey(p.password, salt[:], argonTime, argonMemory, argonThreads, keyLen)
-}
-
-func keyIDFromPassword(password []byte) [keyIDLen]byte {
-	mac := hmac.New(sha256.New, password)
-	mac.Write([]byte("udpx key id"))
-	var keyID [keyIDLen]byte
-	copy(keyID[:], mac.Sum(nil))
-	return keyID
-}
 
 type handshakeResult struct {
 	localConnID connectionID
@@ -96,8 +49,8 @@ type clientHandshake struct {
 	keyID      [keyIDLen]byte
 	random     [randomLen]byte
 	privateKey *ecdh.PrivateKey
+	credential Credential
 	transcript []byte
-	authKey    []byte
 	packet     []byte
 }
 
@@ -106,7 +59,7 @@ func newClientHandshake(credential Credential) (*clientHandshake, error) {
 	if err != nil {
 		return nil, E.Cause(err, "generate key")
 	}
-	h := &clientHandshake{privateKey: privateKey}
+	h := &clientHandshake{privateKey: privateKey, credential: credential}
 	err = fillRandom(h.connID[:])
 	if err != nil {
 		return nil, err
@@ -117,16 +70,15 @@ func newClientHandshake(credential Credential) (*clientHandshake, error) {
 	}
 	h.keyID = credential.KeyID()
 	h.packet = header{ConnectionID: h.connID, Type: packetTypeHandshake}.appendTo(nil)
-	h.transcript = make([]byte, 0, headerLen+clientHelloBodyLen-macLen)
+	h.transcript = make([]byte, 0, headerLen+clientHelloBodyLen)
 	h.transcript = append(h.transcript, h.packet...)
 	h.transcript = append(h.transcript, handshakeTagClient)
 	h.transcript = append(h.transcript, versionBytes()...)
 	h.transcript = append(h.transcript, h.keyID[:]...)
 	h.transcript = append(h.transcript, h.random[:]...)
 	h.transcript = append(h.transcript, privateKey.PublicKey().Bytes()...)
-	h.authKey = credential.AuthKey(h.transcript)
 	h.packet = append(h.packet, h.transcript[headerLen:]...)
-	h.packet = append(h.packet, hmacSum(h.authKey, h.transcript)...)
+	h.packet = append(h.packet, credential.Sign(h.transcript)...)
 	return h, nil
 }
 
@@ -158,7 +110,7 @@ func (h *clientHandshake) handleResponse(packet []byte) (handshakeResult, error)
 	transcript = append(transcript, h.packet...)
 	transcript = append(transcript, packet[:headerLen]...)
 	transcript = append(transcript, body[:len(body)-macLen]...)
-	if !hmac.Equal(body[len(body)-macLen:], hmacSum(h.authKey, transcript)) {
+	if !h.credential.Verify(transcript, body[len(body)-macLen:]) {
 		return handshakeResult{}, errHandshakeMAC
 	}
 	sharedSecret, err := h.privateKey.ECDH(publicKey)
@@ -211,13 +163,12 @@ func newServerHandshake(clientHello []byte, verifier Verifier) (*serverHandshake
 	}
 	var keyID [keyIDLen]byte
 	copy(keyID[:], body[3:3+keyIDLen])
-	authKeyFunc, loaded := verifier.Lookup(keyID)
+	credential, loaded := verifier.Lookup(keyID)
 	if !loaded {
 		return nil, errUnknownKeyID
 	}
 	clientTranscript := clientHello[:headerLen+clientHelloBodyLen-macLen]
-	authKey := authKeyFunc(clientTranscript)
-	if !hmac.Equal(body[len(body)-macLen:], hmacSum(authKey, clientTranscript)) {
+	if !credential.Verify(clientTranscript, body[len(body)-macLen:]) {
 		return nil, errHandshakeMAC
 	}
 	publicKeyOffset := headerLen + 3 + keyIDLen + randomLen
@@ -253,7 +204,7 @@ func newServerHandshake(clientHello []byte, verifier Verifier) (*serverHandshake
 	h.transcript = append(h.transcript, h.serverRandom[:]...)
 	h.transcript = append(h.transcript, privateKey.PublicKey().Bytes()...)
 	h.packet = append(h.packet, h.transcript[len(clientHello)+headerLen:]...)
-	h.packet = append(h.packet, hmacSum(authKey, h.transcript)...)
+	h.packet = append(h.packet, credential.Sign(h.transcript)...)
 	return h, nil
 }
 
@@ -303,28 +254,22 @@ func trafficKeys(sharedSecret, clientRandom, serverRandom, transcript []byte) (c
 }
 
 func directionalCiphers(clientToServer, serverToClient []byte, isClient bool) (send, recv packetCipher, err error) {
-	toServer, err := newAEAD(clientToServer)
+	toServer, err := newPacketCipher(clientToServer)
 	if err != nil {
 		return packetCipher{}, packetCipher{}, err
 	}
-	toClient, err := newAEAD(serverToClient)
+	toClient, err := newPacketCipher(serverToClient)
 	if err != nil {
 		return packetCipher{}, packetCipher{}, err
 	}
 	if isClient {
-		return packetCipher{aead: toServer}, packetCipher{aead: toClient}, nil
+		return toServer, toClient, nil
 	}
-	return packetCipher{aead: toClient}, packetCipher{aead: toServer}, nil
+	return toClient, toServer, nil
 }
 
 func versionBytes() []byte {
 	return []byte{byte(version >> 8), byte(version)}
-}
-
-func hmacSum(authKey, transcript []byte) []byte {
-	mac := hmac.New(sha256.New, authKey)
-	mac.Write(transcript)
-	return mac.Sum(nil)
 }
 
 func fillRandom(b []byte) error {

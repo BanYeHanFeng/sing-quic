@@ -44,9 +44,7 @@ type datagramDefragger struct {
 }
 
 func newDatagramDefragger() datagramDefragger {
-	return datagramDefragger{
-		entries: make(map[datagramKey]*datagramReassembly),
-	}
+	return datagramDefragger{entries: make(map[datagramKey]*datagramReassembly)}
 }
 
 func (d *datagramDefragger) feed(data datagramData, now time.Time) ([]byte, bool, error) {
@@ -59,15 +57,10 @@ func (d *datagramDefragger) feed(data datagramData, now time.Time) ([]byte, bool
 	d.expire(now)
 	key := datagramKey{channel: data.channel, message: data.message}
 	reassembly, loaded := d.entries[key]
-	if !loaded {
-		reassembly = &datagramReassembly{
-			parts: make([][]byte, int(data.total)),
-			added: now,
+	if !loaded || len(reassembly.parts) != int(data.total) {
+		if loaded {
+			d.remove(key)
 		}
-		d.entries[key] = reassembly
-		d.order = append(d.order, key)
-	} else if len(reassembly.parts) != int(data.total) {
-		d.remove(key)
 		reassembly = &datagramReassembly{
 			parts: make([][]byte, int(data.total)),
 			added: now,
@@ -131,10 +124,6 @@ func (d *datagramDefragger) remove(key datagramKey) {
 	delete(d.entries, key)
 }
 
-func (a *association) datagramDataLen() int {
-	return a.maxPayload - datagramFixedLen
-}
-
 func (a *association) SendDatagram(channel uint32, data []byte) error {
 	select {
 	case <-a.ctx.Done():
@@ -144,7 +133,7 @@ func (a *association) SendDatagram(channel uint32, data []byte) error {
 	if len(data) > maxDatagramSize {
 		return E.New("datagram of ", len(data), " bytes is larger than ", maxDatagramSize)
 	}
-	fragmentLen := a.datagramDataLen()
+	fragmentLen := int(a.maxPayload.Load()) - datagramHeaderLen
 	fragmentCount := (len(data) + fragmentLen - 1) / fragmentLen
 	if fragmentCount == 0 {
 		fragmentCount = 1
@@ -152,22 +141,14 @@ func (a *association) SendDatagram(channel uint32, data []byte) error {
 	if fragmentCount > maxDatagramFragments {
 		return E.New("datagram of ", len(data), " bytes does not fit in ", maxDatagramFragments, " fragments")
 	}
-	a.datagramMu.Lock()
-	message := a.datagramMessage
-	a.datagramMessage++
-	a.datagramMu.Unlock()
-	for index := 0; index < fragmentCount; index++ {
+	message := uint16(a.datagramMessage.Add(1))
+	for index := range fragmentCount {
 		start := index * fragmentLen
 		end := min(start+fragmentLen, len(data))
-		a.queueFrame(appendDatagram(nil, datagramData{
-			channel: channel,
-			message: message,
-			index:   uint8(index),
-			total:   uint8(fragmentCount),
-			data:    data[start:end],
-		}))
+		payload := appendDatagramHeader(nil, channel, message, uint8(index), uint8(fragmentCount), end-start)
+		payload = append(payload, data[start:end]...)
+		a.queueControl(payload, true)
 	}
-	a.wake()
 	return nil
 }
 
@@ -182,9 +163,11 @@ func (a *association) ReceiveDatagram(ctx context.Context) (Datagram, error) {
 	}
 }
 
-func (a *association) handleDatagram(data datagramData) error {
-	a.datagramMu.Lock()
-	defer a.datagramMu.Unlock()
+func (a *association) handleDatagram(body []byte) error {
+	if len(body) < 8 {
+		return errShortFrame
+	}
+	data := parseDatagram(body)
 	message, complete, err := a.defragger.feed(data, time.Now())
 	if err != nil {
 		return err

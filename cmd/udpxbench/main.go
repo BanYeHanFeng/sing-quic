@@ -64,7 +64,7 @@ func runServer(ctx context.Context, listen, password string, options udpx.Option
 	if err != nil {
 		return err
 	}
-	listener := udpx.ListenPacket(conn, passwordVerifier{password: udpx.NewPassword(password)}, options)
+	listener := udpx.ListenPacket(conn, passwordVerifier{credential: udpx.NewCredential(password)}, options)
 	defer listener.Close()
 	fmt.Println("listening on", conn.LocalAddr())
 	for {
@@ -111,13 +111,12 @@ func runClient(ctx context.Context, server, password string, options udpx.Option
 	if err != nil {
 		return err
 	}
-	association, err := udpx.Dial(ctx, conn, remote, udpx.NewPassword(password), options)
+	association, err := udpx.Dial(ctx, conn, remote, udpx.NewCredential(password), options)
 	if err != nil {
 		return err
 	}
 	defer association.CloseWithError(nil)
-	gso, gro := association.Offload()
-	fmt.Println("connected to", remote, "gso:", gso, "gro:", gro)
+	fmt.Println("connected to", remote)
 	if streamMode {
 		return runStream(ctx, association, size, duration)
 	}
@@ -253,14 +252,14 @@ func runStream(ctx context.Context, association udpx.Association, sizeMiB int, d
 }
 
 type passwordVerifier struct {
-	password udpx.Password
+	credential udpx.Credential
 }
 
-func (v passwordVerifier) Lookup(keyID [8]byte) (func(transcript []byte) []byte, bool) {
-	if keyID != v.password.KeyID() {
-		return nil, false
+func (v passwordVerifier) Lookup(keyID [8]byte) (udpx.Credential, bool) {
+	if keyID != v.credential.KeyID() {
+		return udpx.Credential{}, false
 	}
-	return v.password.AuthKey, true
+	return v.credential, true
 }
 
 type stdLogger struct{}

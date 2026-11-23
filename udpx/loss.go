@@ -2,6 +2,9 @@ package udpx
 
 import (
 	"time"
+
+	"github.com/sagernet/sing-quic/udpx/internal/congestion"
+	"github.com/sagernet/sing-quic/udpx/internal/udpio"
 )
 
 const (
@@ -9,146 +12,224 @@ const (
 
 	timeThreshold = 9.0 / 8.0
 
-	initialPTO = 500 * time.Millisecond
+	maxSendBatch = 16
 
-	maxProbeBackoff = 5
-
-	maxProbeSilence = 20 * time.Second
-
-	quietPathBudget = 2 * time.Second
+	batchRoom = maxSendBatch * maxPacketSize
 )
 
-func lossDelay(rtt rttEstimator) time.Duration {
-	base := rtt.smoothed
-	if rtt.latest > base {
-		base = rtt.latest
-	}
-	if base <= 0 {
-		base = initialRTT
-	}
-	delay := time.Duration(float64(base)*timeThreshold) + maxAckDelay
-	if delay < timerGranularity {
-		delay = timerGranularity
-	}
-	return delay
+type sentPacket struct {
+	sentAt       time.Time
+	frames       []outFrame
+	data         []byte
+	size         int
+	packetNumber uint32
+	ackEliciting bool
+	probe        bool
+	sendState    congestion.SendState
 }
 
-func retransmittableFrames(packets []*sentPacket) []outFrame {
-	var frames []outFrame
-	for _, packet := range packets {
-		for _, frame := range packet.frames {
-			if frame.frameType().retransmittable() {
-				frames = append(frames, frame)
-			}
-		}
-	}
-	return frames
+type inFlight struct {
+	packets []*sentPacket
+	bytes   congestion.ByteCount
 }
 
-func (a *association) sendFramesRetransmitted(frames []outFrame) {
-	if len(frames) == 0 {
-		return
-	}
-	a.stats.retransmits.Add(int64(len(frames)))
-	a.sendMu.Lock()
-	a.queue.pushFront(frames)
-	a.sendMu.Unlock()
-	a.wake()
+func (f *inFlight) append(packet *sentPacket) {
+	f.packets = append(f.packets, packet)
+	f.bytes += congestion.ByteCount(packet.size)
 }
 
-func (a *association) armPTO() {
-	a.flightMu.Lock()
-	delay := a.rtt.pto()
-	backoff := a.probes
-	a.flightMu.Unlock()
-	if backoff > maxProbeBackoff {
-		backoff = maxProbeBackoff
-	}
-	a.timers.Load().pto.Reset(delay << backoff)
+func (f *inFlight) len() int {
+	return len(f.packets)
 }
 
-func (a *association) disarmPTO() {
-	a.timers.Load().pto.Stop()
+func (f *inFlight) oldest() *sentPacket {
+	if len(f.packets) == 0 {
+		return nil
+	}
+	return f.packets[0]
 }
 
-func (a *association) Reachable() bool {
-	a.flightMu.Lock()
-	probing := a.probes > 0
-	since := a.probeSince
-	a.flightMu.Unlock()
-	if !probing {
-		return true
-	}
-	return time.Since(since) < quietPathBudget
-}
-
-func (a *association) probe() {
-	a.flightMu.Lock()
-	oldest := a.inFlight.oldest()
-	if oldest == nil {
-		a.flightMu.Unlock()
-		return
-	}
-	a.probes++
-	now := time.Now()
-	if a.probes == 1 {
-		a.probeSince = now
-	}
-	silent := now.Sub(a.probeSince) >= maxProbeSilence
-	a.stats.probes.Add(1)
-	a.flightMu.Unlock()
-	if silent {
-		a.logInfo("probe ", oldest.packetNumber, " unanswered for ", maxProbeSilence, ", closing")
-		a.shutdown(ErrProbeTimeout, false)
-		return
-	}
-	a.logDebug("probe ", oldest.packetNumber, " after ", a.probes, " unanswered")
-
-	a.sendMu.Lock()
-	a.queue.pushFront([]outFrame{{payload: appendPing(nil), ackEliciting: true}})
-	a.probeCredits++
-	a.sendMu.Unlock()
-	a.wake()
-	a.armPTO()
-}
-
-func (a *association) handleAck(body []byte, now time.Time) {
-	acknowledgement, err := parseAck(body)
-	if err != nil {
-		return
-	}
-	a.mtuProbeConfirmed(acknowledgement)
-	a.flightMu.Lock()
-	priorInFlight := a.inFlight.bytes
-	acked, spurious := a.inFlight.acked(acknowledgement.ranges[:acknowledgement.count])
-	for _, packet := range acked {
-		releaseFrames(packet.frames)
-		if packet.packetNumber != acknowledgement.largest {
+func (f *inFlight) ack(ranges []pnRange) []*sentPacket {
+	acked := make([]*sentPacket, 0, len(f.packets))
+	keep := f.packets[:0]
+	for _, packet := range f.packets {
+		if coversPacketNumber(ranges, packet.packetNumber) {
+			acked = append(acked, packet)
 			continue
 		}
-		a.rtt.sample(now.Sub(packet.sentAt) - acknowledgement.delay)
+		keep = append(keep, packet)
 	}
-	a.probes = 0
-	a.probeSince = time.Time{}
-	lost := a.inFlight.lost(now, acknowledgement.largest, lossDelay(a.rtt), acknowledgement.count >= maxAckRanges)
-	a.stats.lostPackets.Add(int64(len(lost)))
-	if len(lost) > 0 {
-		a.logDebug("ack ", acknowledgement.largest, " acked=", len(acked), " lost=", len(lost),
-			" inflight=", priorInFlight, "B")
+	for index := len(keep); index < len(f.packets); index++ {
+		f.packets[index] = nil
 	}
-	recovered := retransmittableFrames(lost)
-	empty := a.inFlight.len() == 0
-	a.flightMu.Unlock()
+	f.packets = keep
+	f.recount()
+	return acked
+}
 
-	a.stats.spuriousLoss.Add(int64(spurious))
-	a.rttStats.update(a.rttEstimate())
-	a.congestionAcked(acked, lost, priorInFlight, now)
-	if empty {
-		a.disarmPTO()
-	} else {
-		a.armPTO()
+func (f *inFlight) lost(now time.Time, largestAcked uint32, lossDelay time.Duration, ackTruncated bool) []*sentPacket {
+	count := 0
+	for _, packet := range f.packets {
+		if !isLostPacket(packet, now, largestAcked, lossDelay, ackTruncated) {
+			break
+		}
+		count++
 	}
-	a.ackStreamFrames(acked)
-	a.sendFramesRetransmitted(recovered)
-	a.wake()
+	if count == 0 {
+		return nil
+	}
+	lost := make([]*sentPacket, count)
+	copy(lost, f.packets[:count])
+	remaining := copy(f.packets, f.packets[count:])
+	for index := remaining; index < len(f.packets); index++ {
+		f.packets[index] = nil
+	}
+	f.packets = f.packets[:remaining]
+	f.recount()
+	return lost
+}
+
+func (f *inFlight) remove(packet *sentPacket) bool {
+	for index, candidate := range f.packets {
+		if candidate != packet {
+			continue
+		}
+		f.packets = append(f.packets[:index], f.packets[index+1:]...)
+		f.recount()
+		return true
+	}
+	return false
+}
+
+func (f *inFlight) clear() []*sentPacket {
+	packets := f.packets
+	f.packets = nil
+	f.bytes = 0
+	return packets
+}
+
+func (f *inFlight) recount() {
+	var bytes congestion.ByteCount
+	for _, packet := range f.packets {
+		bytes += congestion.ByteCount(packet.size)
+	}
+	f.bytes = bytes
+}
+
+func coversPacketNumber(ranges []pnRange, packetNumber uint32) bool {
+	for _, current := range ranges {
+		if packetNumber < current.start {
+			continue
+		}
+		return packetNumber <= current.end
+	}
+	return false
+}
+
+func isLostPacket(packet *sentPacket, now time.Time, largestAcked uint32, lossDelay time.Duration, ackTruncated bool) bool {
+	if largestAcked < packet.packetNumber {
+		return false
+	}
+	if !ackTruncated && largestAcked-packet.packetNumber >= packetThreshold {
+		return true
+	}
+	return now.Sub(packet.sentAt) >= lossDelay
+}
+
+type txBatch struct {
+	buffer  []byte
+	packets []udpio.Packet
+	sent    []*sentPacket
+}
+
+func newTXBatch() txBatch {
+	return txBatch{buffer: make([]byte, 0, batchRoom)}
+}
+
+func (b *txBatch) reset() {
+	for index := range b.sent {
+		b.sent[index] = nil
+	}
+	b.sent = b.sent[:0]
+	b.packets = b.packets[:0]
+	b.buffer = b.buffer[:0]
+}
+
+func (t *txState) mtuConfirmed(ack ack) {
+	if !t.mtu.active || !coversPacketNumber(ack.ranges[:ack.count], t.mtu.packet) {
+		return
+	}
+	candidate := t.mtu.candidate
+	t.mtu.confirm()
+	if candidate <= t.association.mtuSize() {
+		return
+	}
+	t.association.maxPayload.Store(int32(candidate - headerLen - tagLen))
+	t.association.logInfo("mtu confirmed ", candidate)
+}
+
+func (t *txState) handleAck(ack ack, now time.Time) {
+	if ack.count == 0 {
+		return
+	}
+	t.mtuConfirmed(ack)
+	priorInFlight := t.inFlight.bytes
+	acked := t.inFlight.ack(ack.ranges[:ack.count])
+	for _, packet := range acked {
+		releaseFrames(packet.frames)
+		if packet.packetNumber != ack.largest || !packet.ackEliciting {
+			continue
+		}
+		t.rtt.sample(now.Sub(packet.sentAt) - ack.delay)
+		t.rttStats.update(t.rtt)
+	}
+	t.probes = 0
+	t.probeSince = time.Time{}
+	lostDelay := lossDelay(t.rtt)
+	lost := t.inFlight.lost(now, ack.largest, lostDelay, ack.count >= maxAckRanges)
+	if len(lost) > 0 {
+		t.association.stats.lostPackets.Add(int64(len(lost)))
+	}
+	var retransmit []outFrame
+	for _, packet := range lost {
+		for index := range packet.frames {
+			frame := packet.frames[index]
+			if frame.ackEliciting && retransmittable(frame.payload[0]&frameTypeMask) {
+				retransmit = append(retransmit, frame)
+				continue
+			}
+			frame.release()
+		}
+	}
+	if len(retransmit) > 0 {
+		t.association.stats.retransmits.Add(int64(len(retransmit)))
+		t.queue = append(retransmit, t.queue...)
+	}
+	if len(acked) > 0 || len(lost) > 0 {
+		ackedInfo := make([]congestion.AckedPacketInfo, 0, len(acked))
+		for _, packet := range acked {
+			if !packet.ackEliciting {
+				continue
+			}
+			ackedInfo = append(ackedInfo, congestion.AckedPacketInfo{
+				SendState:    packet.sendState,
+				TimeSent:     packet.sentAt,
+				BytesAcked:   congestion.ByteCount(packet.size),
+				PacketNumber: congestion.PacketNumber(packet.packetNumber),
+			})
+		}
+		lostInfo := make([]congestion.LostPacketInfo, 0, len(lost))
+		for _, packet := range lost {
+			if !packet.ackEliciting {
+				continue
+			}
+			lostInfo = append(lostInfo, congestion.LostPacketInfo{
+				SendState:    packet.sendState,
+				TimeSent:     packet.sentAt,
+				BytesLost:    congestion.ByteCount(packet.size),
+				PacketNumber: congestion.PacketNumber(packet.packetNumber),
+			})
+		}
+		t.cc.OnCongestionEvent(priorInFlight, now, ackedInfo, lostInfo)
+	}
 }
