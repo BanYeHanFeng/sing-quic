@@ -1,0 +1,352 @@
+package udpx
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"net"
+	"testing"
+	"time"
+)
+
+func udpConn(t *testing.T) net.PacketConn {
+	t.Helper()
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+	return conn
+}
+
+func testContext(t *testing.T, timeout time.Duration) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func waitDone(t *testing.T, ctx context.Context, timeout time.Duration) {
+	t.Helper()
+	select {
+	case <-ctx.Done():
+	case <-time.After(timeout):
+		t.Fatal("association did not end")
+	}
+}
+
+func testSetup(t *testing.T, clientOptions, serverOptions Options) (Association, Association, *Listener) {
+	t.Helper()
+	if clientOptions.MTU == 0 {
+		clientOptions.MTU = mtuIPv4
+	}
+	if serverOptions.MTU == 0 {
+		serverOptions.MTU = mtuIPv4
+	}
+	password := NewPassword("password")
+	listenerConn := udpConn(t)
+	listener := ListenPacket(listenerConn, testVerifier{password}, serverOptions)
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+	client, err := Dial(testContext(t, 5*time.Second), udpConn(t), listenerConn.LocalAddr(), password, clientOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = client.CloseWithError(nil)
+	})
+	server, err := listener.Accept(testContext(t, 5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, server, listener
+}
+
+func TestKeyID(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	password := NewPassword("password")
+	if client.KeyID() != password.KeyID() {
+		t.Fatalf("the client reports key %x", client.KeyID())
+	}
+	if server.KeyID() != password.KeyID() {
+		t.Fatalf("the server reports key %x", server.KeyID())
+	}
+}
+
+func TestHandshakeOverSocket(t *testing.T) {
+	client, server, listener := testSetup(t, Options{}, Options{})
+	if client.RemoteAddr().String() != listener.conn.LocalAddr().String() {
+		t.Fatalf("client peer is %v", client.RemoteAddr())
+	}
+	if server.LocalAddr().String() != listener.conn.LocalAddr().String() {
+		t.Fatalf("server local address is %v", server.LocalAddr())
+	}
+	if client.LocalAddr().String() != server.RemoteAddr().String() {
+		t.Fatalf("server peer is %v, client local address is %v", server.RemoteAddr(), client.LocalAddr())
+	}
+	select {
+	case <-client.Context().Done():
+		t.Fatalf("client ended after the handshake: %v", context.Cause(client.Context()))
+	default:
+	}
+
+	err := client.CloseWithError(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, server.Context(), time.Second)
+	if cause := context.Cause(server.Context()); !errors.Is(cause, net.ErrClosed) {
+		t.Fatalf("server ended with %v", cause)
+	}
+}
+
+func TestDemux(t *testing.T) {
+	password := NewPassword("password")
+	listenerConn := udpConn(t)
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
+	defer listener.Close()
+	ctx := testContext(t, 5*time.Second)
+	var clients []Association
+	for range 2 {
+		client, err := Dial(ctx, udpConn(t), listenerConn.LocalAddr(), password, Options{MTU: mtuIPv4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.CloseWithError(nil)
+		clients = append(clients, client)
+	}
+	var servers []Association
+	for range 2 {
+		server, err := listener.Accept(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		servers = append(servers, server)
+	}
+	if servers[0].RemoteAddr().String() != clients[0].LocalAddr().String() {
+		t.Fatal("the first association was accepted out of order")
+	}
+
+	err := clients[0].CloseWithError(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, servers[0].Context(), time.Second)
+	select {
+	case <-servers[1].Context().Done():
+		t.Fatalf("the other association ended too: %v", context.Cause(servers[1].Context()))
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestUnknownConnectionID(t *testing.T) {
+	password := NewPassword("password")
+	listenerConn := udpConn(t)
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
+	defer listener.Close()
+
+	attacker := udpConn(t)
+	var unknownID connectionID
+	for index := range unknownID {
+		unknownID[index] = 0x5a
+	}
+	buffer := make([]byte, maxPacketSize)
+
+	dataPacket := header{ConnectionID: unknownID, Type: packetTypeData}.appendTo(nil)
+	dataPacket = append(dataPacket, make([]byte, tagLen)...)
+	hello := header{ConnectionID: unknownID, Type: packetTypeHandshake}.appendTo(nil)
+	hello = append(hello, make([]byte, clientHelloBodyLen)...)
+	hello[headerLen] = handshakeTagClient
+	hello[headerLen+1] = byte(version >> 8)
+	hello[headerLen+2] = byte(version)
+
+	for _, packet := range [][]byte{dataPacket, hello} {
+		_, err := attacker.WriteTo(packet, listenerConn.LocalAddr())
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = attacker.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = attacker.ReadFrom(buffer)
+		if err == nil {
+			t.Fatal("the listener answered a packet it knows nothing about")
+		}
+		if !isTimeout(err) {
+			t.Fatalf("unexpected read error: %v", err)
+		}
+	}
+
+	if _, err := listener.Accept(testContext(t, 100*time.Millisecond)); err == nil {
+		t.Fatal("an association was accepted for a packet nobody authenticated")
+	}
+
+	client, err := Dial(testContext(t, 5*time.Second), udpConn(t), listenerConn.LocalAddr(), password, Options{MTU: mtuIPv4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseWithError(nil)
+	if _, err = listener.Accept(testContext(t, 5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWrongPassword(t *testing.T) {
+	listenerConn := udpConn(t)
+	listener := ListenPacket(listenerConn, testVerifier{NewPassword("password")}, Options{MTU: mtuIPv4})
+	defer listener.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, err := Dial(ctx, udpConn(t), listenerConn.LocalAddr(), NewPassword("wrong password"), Options{MTU: mtuIPv4}); err == nil {
+		t.Fatal("dialled with a password the server does not know")
+	}
+	if _, err := listener.Accept(testContext(t, 100*time.Millisecond)); err == nil {
+		t.Fatal("an association was accepted for a hello that did not authenticate")
+	}
+}
+
+func TestIdleTimeout(t *testing.T) {
+	client, server, _ := testSetup(t, Options{IdleTimeout: 100 * time.Millisecond}, Options{IdleTimeout: 100 * time.Millisecond})
+	waitDone(t, server.Context(), time.Second)
+	if cause := context.Cause(server.Context()); !errors.Is(cause, ErrIdleTimeout) {
+		t.Fatalf("server ended with %v", cause)
+	}
+	waitDone(t, client.Context(), time.Second)
+	if cause := context.Cause(client.Context()); !errors.Is(cause, ErrIdleTimeout) {
+		t.Fatalf("client ended with %v", cause)
+	}
+}
+
+func TestKeepAlive(t *testing.T) {
+	client, server, _ := testSetup(t, Options{IdleTimeout: 300 * time.Millisecond, KeepAlivePeriod: 50 * time.Millisecond}, Options{IdleTimeout: 300 * time.Millisecond})
+	select {
+	case <-client.Context().Done():
+		t.Fatalf("client ended: %v", context.Cause(client.Context()))
+	case <-server.Context().Done():
+		t.Fatalf("server ended: %v", context.Cause(server.Context()))
+	case <-time.After(600 * time.Millisecond):
+	}
+}
+
+func TestPacketTamperedOnTheWire(t *testing.T) {
+	client, server, listener := testSetup(t, Options{}, Options{})
+	clientAssociation, isAssociation := client.(*association)
+	if !isAssociation {
+		t.Fatal("client is not an association")
+	}
+	packet := mustSeal(t, &clientAssociation.sendCipher, header{ConnectionID: clientAssociation.peerConnID, Type: packetTypeData}, []byte("payload"))
+	packet[len(packet)-1] ^= 0x01
+	_, err := udpConn(t).WriteTo(packet, listener.conn.LocalAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-server.Context().Done():
+		t.Fatalf("a packet that did not authenticate ended the association: %v", context.Cause(server.Context()))
+	case <-time.After(100 * time.Millisecond):
+	}
+	_ = client.CloseWithError(nil)
+}
+
+func TestAcknowledgementOverSocket(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	clientAssociation, isAssociation := client.(*association)
+	if !isAssociation {
+		t.Fatal("client is not an association")
+	}
+	serverAssociation := server.(*association)
+
+	start := time.Now()
+	err := clientAssociation.send(appendPing(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, sampled := clientAssociation.roundTrip(); sampled {
+			break
+		}
+		if time.Now().After(deadline) {
+			clientAssociation.sendMu.Lock()
+			queued := clientAssociation.queue.len()
+			batched := len(clientAssociation.batch.pending)
+			sent := clientAssociation.sendPacket
+			clientAssociation.sendMu.Unlock()
+			t.Fatalf("the single packet was never acknowledged: queue=%d batch=%d sent=%d", queued, batched, sent)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	elapsed := time.Since(start)
+	if elapsed < maxAckDelay/2 {
+		t.Fatalf("a single packet was acknowledged after %v, before the delay expired", elapsed)
+	}
+	if elapsed > maxAckDelay+500*time.Millisecond {
+		t.Fatalf("a single packet was acknowledged after %v", elapsed)
+	}
+	roundTrip, _ := clientAssociation.roundTrip()
+	if delay := clientAssociation.ackDelay(); delay >= maxAckDelay {
+		t.Fatalf("a path with a round trip of %v waits %v for an acknowledgement", roundTrip, delay)
+	}
+
+	time.Sleep(3 * maxAckDelay)
+	roundTrip, sampled := serverAssociation.roundTrip()
+	if sampled {
+		t.Fatalf("the server measured %v from an acknowledgement of an acknowledgement", roundTrip)
+	}
+}
+
+func TestRepeatedHelloIsOneAssociation(t *testing.T) {
+	password := NewPassword("password")
+	listenerConn := udpConn(t)
+	listener := ListenPacket(listenerConn, testVerifier{password}, Options{MTU: mtuIPv4})
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+	clientConn := udpConn(t)
+	handshake, err := newClientHandshake(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readAnswer := func() []byte {
+		t.Helper()
+		buffer := make([]byte, maxPacketSize)
+		err = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, _, readErr := clientConn.ReadFrom(buffer)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		return append([]byte(nil), buffer[:n]...)
+	}
+	_, err = clientConn.WriteTo(handshake.hello(), listenerConn.LocalAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := readAnswer()
+	server, err := listener.Accept(testContext(t, 5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = server.CloseWithError(nil)
+	})
+	_, err = clientConn.WriteTo(handshake.hello(), listenerConn.LocalAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := readAnswer()
+	if !bytes.Equal(first, second) {
+		t.Fatal("the repeated hello was answered with a different answer")
+	}
+	ctx := testContext(t, 200*time.Millisecond)
+	_, err = listener.Accept(ctx)
+	if err == nil {
+		t.Fatal("the repeated hello became a second association")
+	}
+}

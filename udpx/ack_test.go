@@ -1,0 +1,415 @@
+package udpx
+
+import (
+	"bytes"
+	"encoding/binary"
+	"testing"
+	"time"
+)
+
+func fillRanges(ranges *pnRanges, from, to uint32) {
+	for pn := from; pn <= to; pn++ {
+		ranges.add(pn)
+	}
+}
+
+func TestPnRangesInOrder(t *testing.T) {
+	var ranges pnRanges
+	fillRanges(&ranges, 0, 9)
+	if len(ranges.ranges) != 1 {
+		t.Fatalf("%d ranges for a sequence of packets", len(ranges.ranges))
+	}
+	if ranges.ranges[0] != (pnRange{start: 0, end: 9}) {
+		t.Fatalf("range %+v", ranges.ranges[0])
+	}
+	if largest, loaded := ranges.largest(); !loaded || largest != 9 {
+		t.Fatalf("largest %d", largest)
+	}
+}
+
+func TestPnRangesDuplicate(t *testing.T) {
+	var ranges pnRanges
+	fillRanges(&ranges, 0, 9)
+	if ranges.add(5) {
+		t.Fatal("a duplicate packet was new")
+	}
+	if !ranges.contains(5) {
+		t.Fatal("a received packet is not contained")
+	}
+	if ranges.contains(10) {
+		t.Fatal("a packet that was not received is contained")
+	}
+	if len(ranges.ranges) != 1 {
+		t.Fatalf("%d ranges after a duplicate", len(ranges.ranges))
+	}
+}
+
+func TestPnRangesReordered(t *testing.T) {
+	var ranges pnRanges
+	fillRanges(&ranges, 0, 9)
+	if !ranges.add(20) {
+		t.Fatal("a packet above the hole was not new")
+	}
+	if len(ranges.ranges) != 2 {
+		t.Fatalf("%d ranges around a hole", len(ranges.ranges))
+	}
+	if ranges.ranges[0] != (pnRange{start: 20, end: 20}) || ranges.ranges[1] != (pnRange{start: 0, end: 9}) {
+		t.Fatalf("ranges %+v", ranges.ranges)
+	}
+	if !ranges.add(15) {
+		t.Fatal("a packet in the hole was not new")
+	}
+	if len(ranges.ranges) != 3 {
+		t.Fatalf("%d ranges with a hole inside a hole", len(ranges.ranges))
+	}
+	fillRanges(&ranges, 10, 19)
+	if len(ranges.ranges) != 1 {
+		t.Fatalf("%d ranges after the hole was filled", len(ranges.ranges))
+	}
+	if ranges.ranges[0] != (pnRange{start: 0, end: 20}) {
+		t.Fatalf("range %+v", ranges.ranges[0])
+	}
+}
+
+func TestPnRangesHugeJump(t *testing.T) {
+	var ranges pnRanges
+	fillRanges(&ranges, 0, 2)
+	if !ranges.add(1 << 30) {
+		t.Fatal("a distant packet was not new")
+	}
+	if len(ranges.ranges) != 2 {
+		t.Fatalf("%d ranges for a distant packet", len(ranges.ranges))
+	}
+	if !ranges.contains(1<<30) || ranges.contains(500) {
+		t.Fatal("the distant packet was not placed")
+	}
+	if !ranges.add((1 << 30) - 1) {
+		t.Fatal("the packet below a distant one was not new")
+	}
+	if len(ranges.ranges) != 2 {
+		t.Fatalf("%d ranges below a distant packet", len(ranges.ranges))
+	}
+	if ranges.ranges[0] != (pnRange{start: (1 << 30) - 1, end: 1 << 30}) {
+		t.Fatalf("range %+v", ranges.ranges[0])
+	}
+}
+
+func TestPnRangesLimit(t *testing.T) {
+	var ranges pnRanges
+	for index := uint32(0); index < receivedRangeLimit+10; index++ {
+		ranges.add(index * 100)
+	}
+	if len(ranges.ranges) > receivedRangeLimit {
+		t.Fatalf("%d ranges", len(ranges.ranges))
+	}
+	if largest, _ := ranges.largest(); largest != (receivedRangeLimit+9)*100 {
+		t.Fatalf("largest %d", largest)
+	}
+}
+
+func TestAckRoundTrip(t *testing.T) {
+	var ranges pnRanges
+	fillRanges(&ranges, 0, 4)
+	fillRanges(&ranges, 9, 12)
+	ranges.add(20)
+	built := ranges.ack()
+	built.delay = 7 * time.Millisecond
+	encoded := built.appendTo(nil)
+
+	parsed, err := nextFrameAck(t, encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.largest != built.largest || parsed.count != built.count || parsed.delay != built.delay {
+		t.Fatalf("parsed %+v", parsed)
+	}
+	for index := range built.count {
+		if parsed.ranges[index] != built.ranges[index] {
+			t.Fatalf("range %d is %+v, want %+v", index, parsed.ranges[index], built.ranges[index])
+		}
+	}
+}
+
+func TestAckNamesEveryRangeItRemembers(t *testing.T) {
+	var ranges pnRanges
+	for index := uint32(0); index < 2*receivedRangeLimit; index += 2 {
+		ranges.add(index)
+	}
+	built := ranges.ack()
+	if built.count != receivedRangeLimit {
+		t.Fatalf("acknowledgement of %d ranges, want %d", built.count, receivedRangeLimit)
+	}
+	parsed, err := nextFrameAck(t, built.appendTo(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.count != receivedRangeLimit {
+		t.Fatalf("parsed %d ranges, want %d", parsed.count, receivedRangeLimit)
+	}
+	if parsed.largest != ranges.ranges[0].end {
+		t.Fatalf("largest %d, want %d", parsed.largest, ranges.ranges[0].end)
+	}
+	for index := range parsed.count {
+		if parsed.ranges[index] != ranges.ranges[index] {
+			t.Fatalf("range %d is %+v, want %+v", index, parsed.ranges[index], ranges.ranges[index])
+		}
+	}
+}
+
+func TestAckOfFewRangesIsNotTruncated(t *testing.T) {
+	var scheduler ackScheduler
+	now := time.Now()
+	for pn := uint32(0); pn < 40; pn += 2 {
+		scheduler.received(pn, now)
+	}
+	built := scheduler.ranges.ack()
+	if built.count != 20 {
+		t.Fatalf("acknowledgement of %d ranges, want 20", built.count)
+	}
+	if built.count >= maxAckRanges {
+		t.Fatalf("acknowledgement of %d ranges is truncated", built.count)
+	}
+}
+
+func TestAcknowledgementCarriesNothingElse(t *testing.T) {
+	var scheduler ackScheduler
+	scheduler.received(42, time.Now())
+	encoded := scheduler.pack(time.Now())
+	if len(encoded) == 0 {
+		t.Fatal("no acknowledgement")
+	}
+	f, rest, err := nextFrame(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.frameType != frameTypeAck {
+		t.Fatalf("frame type %d", f.frameType)
+	}
+	if len(rest) != 0 {
+		t.Fatalf("an acknowledgement of %d bytes carries %d more", len(encoded), len(rest))
+	}
+}
+
+func TestAckOfManyRangesStaysSmall(t *testing.T) {
+	var ranges pnRanges
+	for index := uint32(0); index < 2*receivedRangeLimit; index += 2 {
+		ranges.add(index)
+	}
+	encoded := ranges.ack().appendTo(nil)
+	want := 12 + (receivedRangeLimit-1)*8
+	if len(encoded) != want {
+		t.Fatalf("acknowledgement of %d bytes, want %d", len(encoded), want)
+	}
+	if len(encoded) > mtuMin-headerLen-tagLen {
+		t.Fatalf("acknowledgement of %d bytes does not fit a packet", len(encoded))
+	}
+}
+
+func nextFrameAck(t *testing.T, encoded []byte) (ack, error) {
+	t.Helper()
+	f, rest, err := nextFrame(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.frameType != frameTypeAck {
+		t.Fatalf("frame of type %d", f.frameType)
+	}
+	if len(rest) != 0 {
+		t.Fatalf("%d bytes after the acknowledgement", len(rest))
+	}
+	return parseAck(f.body)
+}
+
+func TestAckParseRejects(t *testing.T) {
+	var ranges pnRanges
+	fillRanges(&ranges, 0, 4)
+	valid := ranges.ack().appendTo(nil)
+	body := valid[1:]
+
+	patched := func(patch func(body []byte) []byte) []byte {
+		return patch(bytes.Clone(body))
+	}
+	for _, test := range []struct {
+		name string
+		body []byte
+	}{
+		{"empty", nil},
+		{"truncated", body[:len(body)-1]},
+		{"no ranges", patched(func(body []byte) []byte { body[6] = 0; return body })},
+		{"too many ranges", patched(func(body []byte) []byte { body[6] = maxAckRanges + 1; return body })},
+		{"first range above largest", patched(func(body []byte) []byte { body[7] = 0xff; return body })},
+	} {
+		if _, err := parseAck(test.body); err == nil {
+			t.Fatalf("%s: parsed", test.name)
+		}
+	}
+
+	var twoRanges pnRanges
+	fillRanges(&twoRanges, 0, 1)
+	twoRanges.add(10)
+	twoRangesBody := twoRanges.ack().appendTo(nil)[1:]
+	gapOffset := 7 + 4
+	for _, test := range []struct {
+		name  string
+		patch func(body []byte)
+	}{
+		{"gap above the previous range", func(body []byte) { binary.BigEndian.PutUint32(body[gapOffset:], 100) }},
+		{"range below zero", func(body []byte) { binary.BigEndian.PutUint32(body[gapOffset+4:], 100) }},
+	} {
+		body := bytes.Clone(twoRangesBody)
+		test.patch(body)
+		if _, err := parseAck(body); err == nil {
+			t.Fatalf("%s: parsed", test.name)
+		}
+	}
+}
+
+func TestAckScheduler(t *testing.T) {
+	var scheduler ackScheduler
+	now := time.Now()
+	if scheduler.received(0, now) {
+		t.Fatal("the first packet asked for an acknowledgement at once")
+	}
+	if scheduler.pack(now) == nil {
+		t.Fatal("nothing was acknowledged")
+	}
+	if scheduler.pack(now) != nil {
+		t.Fatal("the same acknowledgement was sent twice")
+	}
+	for pn := uint32(1); pn < ackThreshold; pn++ {
+		if scheduler.received(pn, now) {
+			t.Fatalf("packet %d of %d asked for an immediate acknowledgement", pn, ackThreshold)
+		}
+	}
+	if !scheduler.received(ackThreshold, now) {
+		t.Fatalf("the %dth packet after an acknowledgement did not ask for an immediate acknowledgement", ackThreshold)
+	}
+	if scheduler.pack(now) == nil {
+		t.Fatal("nothing was acknowledged")
+	}
+
+	if scheduler.received(ackThreshold+2, now) {
+		t.Fatal("a new largest packet asked for an immediate acknowledgement")
+	}
+	if !scheduler.received(ackThreshold+1, now) {
+		t.Fatal("a packet below a hole did not ask for an immediate acknowledgement")
+	}
+
+	scheduler.pack(now)
+	if scheduler.received(ackThreshold+1, now) {
+		t.Fatal("a duplicate asked for an acknowledgement")
+	}
+	if scheduler.pack(now) != nil {
+		t.Fatal("a duplicate was acknowledged")
+	}
+}
+
+func TestAckCoalescing(t *testing.T) {
+	var scheduler ackScheduler
+	now := time.Now()
+	immediate := 0
+	for pn := uint32(0); pn < 2*ackThreshold; pn++ {
+		if scheduler.received(pn, now) {
+			immediate++
+			if body := scheduler.pack(now); body == nil {
+				t.Fatalf("packet %d was not acknowledged", pn)
+			}
+		}
+	}
+	if immediate != 2 {
+		t.Fatalf("a run of %d packets was acknowledged %d times", 2*ackThreshold, immediate)
+	}
+	body := scheduler.pack(now)
+	if body != nil {
+		t.Fatalf("the run was acknowledged again")
+	}
+	var last ackScheduler
+	for pn := uint32(0); pn < ackThreshold; pn++ {
+		last.received(pn, now)
+	}
+	packed, err := nextFrameAck(t, last.pack(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packed.largest != ackThreshold-1 || packed.count != 1 || packed.ranges[0].start != 0 || packed.ranges[0].end != ackThreshold-1 {
+		t.Fatalf("acknowledged %+v", packed)
+	}
+}
+
+func TestAckDelayBudget(t *testing.T) {
+	var scheduler ackScheduler
+	start := time.Now()
+	scheduler.received(0, start)
+	body := scheduler.pack(start.Add(time.Hour))
+	parsed, err := nextFrameAck(t, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.delay != ackDelayLimit {
+		t.Fatalf("reported delay %v", parsed.delay)
+	}
+
+	if maxAckDelay > 100*time.Millisecond {
+		t.Fatalf("a delayed acknowledgement may wait %v", maxAckDelay)
+	}
+	var second ackScheduler
+	second.received(0, start)
+	second.received(1, start)
+	if second.pack(start.Add(maxAckDelay)) == nil {
+		t.Fatal("a packet pair was not acknowledged within the delay budget")
+	}
+}
+
+func TestAckDelay(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		rtt      time.Duration
+		measured bool
+		expected time.Duration
+	}{
+		{name: "unmeasured", expected: maxAckDelay},
+		{name: "long path", rtt: 200 * time.Millisecond, measured: true, expected: maxAckDelay},
+		{name: "short path", rtt: 80 * time.Millisecond, measured: true, expected: 10 * time.Millisecond},
+		{name: "local", rtt: 200 * time.Microsecond, measured: true, expected: minAckDelay},
+	} {
+		var association association
+		association.rtt.sampled = testCase.measured
+		association.rtt.smoothed = testCase.rtt
+		delay := association.ackDelay()
+		if delay != testCase.expected {
+			t.Fatalf("%s: a round trip of %v waits %v, expected %v", testCase.name, testCase.rtt, delay, testCase.expected)
+		}
+	}
+}
+
+func TestRTTEstimator(t *testing.T) {
+	var estimator rttEstimator
+	estimator.sample(100 * time.Millisecond)
+	if estimator.smoothed != 100*time.Millisecond || estimator.min != 100*time.Millisecond {
+		t.Fatalf("first sample: %+v", estimator)
+	}
+	estimator.sample(50 * time.Millisecond)
+	if estimator.smoothed < 93*time.Millisecond || estimator.smoothed > 94*time.Millisecond {
+		t.Fatalf("smoothed %v", estimator.smoothed)
+	}
+	if estimator.min != 50*time.Millisecond {
+		t.Fatalf("minimum %v", estimator.min)
+	}
+	if estimator.rto() <= estimator.smoothed {
+		t.Fatalf("rto %v against smoothed %v", estimator.rto(), estimator.smoothed)
+	}
+	if estimator.pto() != estimator.rto()+maxAckDelay {
+		t.Fatalf("pto %v", estimator.pto())
+	}
+
+	var steady rttEstimator
+	for range 4 {
+		steady.sample(10 * time.Millisecond)
+	}
+	if steady.rto() < steady.smoothed+timerGranularity {
+		t.Fatalf("rto %v against smoothed %v", steady.rto(), steady.smoothed)
+	}
+	if steady.rto() > 100*time.Millisecond {
+		t.Fatalf("rto %v on a steady path", steady.rto())
+	}
+}
