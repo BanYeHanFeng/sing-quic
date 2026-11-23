@@ -19,3 +19,6 @@ lint_install:
 
 test:
 	go test -v ./...
+
+test_race:
+	go test -race ./...
