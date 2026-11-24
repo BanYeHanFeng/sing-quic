@@ -173,8 +173,7 @@ func (s *serverSession[U]) loopStreams() {
 			return
 		}
 		go func() {
-			err = s.handleStream(stream)
-			if err != nil {
+			if err := s.handleStream(stream); err != nil {
 				_ = stream.Close()
 				s.logger.Debug(E.Cause(err, "handle stream request"))
 			}

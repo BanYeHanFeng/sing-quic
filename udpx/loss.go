@@ -24,7 +24,7 @@ type sentPacket struct {
 	size         int
 	packetNumber uint32
 	ackEliciting bool
-	probe        bool
+	mtu          bool
 	sendState    congestion.SendState
 }
 
@@ -51,18 +51,19 @@ func (f *inFlight) oldest() *sentPacket {
 
 func (f *inFlight) ack(ranges []pnRange) []*sentPacket {
 	acked := make([]*sentPacket, 0, len(f.packets))
-	keep := f.packets[:0]
+	kept := 0
 	for _, packet := range f.packets {
 		if coversPacketNumber(ranges, packet.packetNumber) {
 			acked = append(acked, packet)
 			continue
 		}
-		keep = append(keep, packet)
+		f.packets[kept] = packet
+		kept++
 	}
-	for index := len(keep); index < len(f.packets); index++ {
+	for index := kept; index < len(f.packets); index++ {
 		f.packets[index] = nil
 	}
-	f.packets = keep
+	f.packets = f.packets[:kept]
 	f.recount()
 	return acked
 }

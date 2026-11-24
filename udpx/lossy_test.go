@@ -71,15 +71,28 @@ func (l *simulatedLink) forward(from, to net.PacketConn, destination func() net.
 			l.mu.Unlock()
 		}
 		packet := append([]byte(nil), buffer[:n]...)
-		loss := l.options.loss
-		if from == l.back {
-			loss = l.options.lossReturn
-		}
+		loss := l.currentLoss(from == l.back)
 		l.send(queue, packet, to, destination, &free, loss)
 		if l.roll(l.options.duplicate) {
 			l.send(queue, packet, to, destination, &free, loss)
 		}
 	}
+}
+
+func (l *simulatedLink) currentLoss(returning bool) float64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if returning {
+		return l.options.lossReturn
+	}
+	return l.options.loss
+}
+
+func (l *simulatedLink) setLoss(loss float64) {
+	l.mu.Lock()
+	l.options.loss = loss
+	l.options.lossReturn = loss
+	l.mu.Unlock()
 }
 
 func (l *simulatedLink) send(queue chan<- simulatedPacket, packet []byte, to net.PacketConn, destination func() net.Addr, free *time.Time, loss float64) {

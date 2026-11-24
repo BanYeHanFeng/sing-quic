@@ -12,10 +12,8 @@ func (t *txState) pack(now time.Time, maxPayload int) {
 			return
 		}
 		allowData := t.windowAllows()
-		if !allowData && len(t.ackQueue) == 0 {
-			if !t.queue[0].probe {
-				return
-			}
+		if !allowData && len(t.ackQueue) == 0 && !t.queue[0].probe && !t.queue[0].mtu {
+			return
 		}
 		frames := t.takeFrames(maxPayload, allowData)
 		if frames == nil {
@@ -35,16 +33,16 @@ func (t *txState) takeFrames(maxPayload int, allowData bool) []outFrame {
 		return nil
 	}
 	head := t.queue[0]
-	if !allowData && head.ackEliciting && !head.probe {
-		return nil
-	}
-	if head.probe {
+	if head.mtu {
 		frames := t.queue[:1:1]
 		t.queue = t.queue[1:]
 		if len(t.queue) == 0 {
 			t.queue = nil
 		}
 		return frames
+	}
+	if !allowData && head.ackEliciting && !head.probe {
+		return nil
 	}
 	if head.size() > maxPayload && head.stream != nil {
 		t.splitHead(maxPayload)
@@ -58,10 +56,10 @@ func takePrefix(queue *[]outFrame, maxPayload int, allowData bool) []outFrame {
 	size := 0
 	for count < len(frames) {
 		frame := frames[count]
-		if frame.probe {
+		if frame.mtu {
 			break
 		}
-		if !allowData && frame.ackEliciting {
+		if !allowData && frame.ackEliciting && !frame.probe {
 			break
 		}
 		if size+frame.size() > maxPayload {
@@ -106,7 +104,7 @@ func (t *txState) splitHead(maxPayload int) {
 }
 
 func (t *txState) planProbe() {
-	if t.closing || t.association.options.MTU > 0 || t.mtu.active {
+	if t.closing || t.probePending || t.association.options.MTU > 0 || t.mtu.active {
 		return
 	}
 	candidate, loaded := t.mtu.next(t.association.mtuSize())
@@ -123,7 +121,8 @@ func (t *txState) planProbe() {
 		return
 	}
 	t.probeSize = candidate
-	t.queue = append([]outFrame{{payload: probe, ackEliciting: true, probe: true}}, t.queue...)
+	t.probePending = true
+	t.queue = append([]outFrame{{payload: probe, ackEliciting: true, mtu: true}}, t.queue...)
 }
 
 func (t *txState) packPacket(now time.Time, frames []outFrame) bool {
@@ -156,14 +155,16 @@ func (t *txState) packPacket(now time.Time, frames []outFrame) bool {
 	}
 	for index := range frames {
 		sent.ackEliciting = sent.ackEliciting || frames[index].ackEliciting
-		sent.probe = sent.probe || frames[index].probe
+		sent.mtu = sent.mtu || frames[index].mtu
 	}
-	if sent.probe {
+	if sent.mtu {
+		t.probePending = false
 		t.mtu.start(t.probeSize, packetNumber, now)
 		t.probeSize = 0
 	}
 	t.sendPacket++
 	if sent.ackEliciting {
+		t.lastSentAt = now
 		priorInFlight := t.inFlight.bytes
 		t.inFlight.append(sent)
 		sent.sendState = t.cc.OnPacketSent(now, priorInFlight, congestion.PacketNumber(packetNumber), congestion.ByteCount(length))

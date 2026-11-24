@@ -10,6 +10,8 @@ import (
 type streamTable struct {
 	table map[uint32]*Stream
 
+	implicit map[uint32]struct{}
+
 	nextID uint32
 
 	openCredit uint32
@@ -32,6 +34,7 @@ func newStreamTable(isClient bool) streamTable {
 	}
 	return streamTable{
 		table:        make(map[uint32]*Stream),
+		implicit:     make(map[uint32]struct{}),
 		openCredit:   initialStreams,
 		credit:       make(chan struct{}),
 		peerLimit:    initialStreams,
@@ -49,6 +52,7 @@ func (a *association) OpenStream(ctx context.Context) (*Stream, error) {
 			stream := newStream(a, id, initialStreamWindow)
 			a.streams.table[id] = stream
 			a.streamsMu.Unlock()
+			a.queueStreamFrame(newStreamFrame(stream, 0, false, nil))
 			return stream, nil
 		}
 		credit := a.streams.credit
@@ -95,6 +99,12 @@ func (a *association) stream(id uint32) *Stream {
 	return a.streams.table[id]
 }
 
+func (a *association) activeStreams() int {
+	a.streamsMu.Lock()
+	defer a.streamsMu.Unlock()
+	return len(a.streams.table)
+}
+
 func (a *association) removeStream(id uint32) bool {
 	a.streamsMu.Lock()
 	stream, loaded := a.streams.table[id]
@@ -118,18 +128,21 @@ func (a *association) acceptOpenedStream(id uint32) (*Stream, error) {
 	a.streamsMu.Lock()
 	switch {
 	case index < a.streams.peerNext:
-		a.streamsMu.Unlock()
-		return nil, nil
+		if _, implicit := a.streams.implicit[id]; !implicit {
+			a.streamsMu.Unlock()
+			return nil, nil
+		}
+		delete(a.streams.implicit, id)
 	case index >= a.streams.peerLimit:
 		limit := a.streams.peerLimit
 		a.streamsMu.Unlock()
 		return nil, E.New("the peer opened stream ", index, " with a limit of ", limit)
-	case index > a.streams.peerNext:
-		next := a.streams.peerNext
-		a.streamsMu.Unlock()
-		return nil, E.New("the peer opened stream ", index, " after ", next-1)
+	default:
+		for skipped := a.streams.peerNext; skipped < index; skipped++ {
+			a.streams.implicit[skipped<<1|(id&streamInitiatorBit)] = struct{}{}
+		}
+		a.streams.peerNext = index + 1
 	}
-	a.streams.peerNext = index + 1
 	stream := newStream(a, id, initialStreamWindow)
 	a.streams.table[id] = stream
 	a.streamsMu.Unlock()
@@ -140,6 +153,19 @@ func (a *association) acceptOpenedStream(id uint32) (*Stream, error) {
 		return nil, E.New("accept queue is full")
 	}
 	return stream, nil
+}
+
+func (a *association) releaseImplicitStream(id uint32) {
+	a.streamsMu.Lock()
+	if _, implicit := a.streams.implicit[id]; !implicit {
+		a.streamsMu.Unlock()
+		return
+	}
+	delete(a.streams.implicit, id)
+	a.streams.peerLimit++
+	limit := a.streams.peerLimit
+	a.streamsMu.Unlock()
+	a.queueControl(appendMaxStreamsFrame(nil, limit), true)
 }
 
 func (a *association) handleMaxStreams(limit uint32) {
@@ -201,6 +227,7 @@ func (a *association) handleResetStream(body []byte) error {
 	reset := parseResetStream(body)
 	stream := a.stream(reset.streamID)
 	if stream == nil {
+		a.releaseImplicitStream(reset.streamID)
 		return nil
 	}
 	stream.resetFromPeer(reset.finalOffset, reset.code)

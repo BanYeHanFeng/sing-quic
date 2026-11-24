@@ -32,6 +32,8 @@ type outFrame struct {
 	ackEliciting bool
 
 	probe bool
+
+	mtu bool
 }
 
 func (f *outFrame) release() {
@@ -81,6 +83,7 @@ type txState struct {
 	sendPacket uint32
 	probes     int
 	probeSince time.Time
+	lastSentAt time.Time
 
 	ack   ackScheduler
 	ackAt time.Time
@@ -90,9 +93,10 @@ type txState struct {
 	statsAt     time.Time
 	statsLast   statsSnapshot
 
-	mtu       mtuState
-	probeSize int
-	closing   bool
+	mtu          mtuState
+	probeSize    int
+	probePending bool
+	closing      bool
 }
 
 func (t *txState) init(association *association) {
@@ -102,9 +106,6 @@ func (t *txState) init(association *association) {
 	t.cc.SetRTTStatsProvider(&t.rttStats)
 	t.mtu.init(association.options.MTU, association.RemoteAddr())
 	t.idleAt = time.Now().Add(association.options.IdleTimeout)
-	if association.options.KeepAlivePeriod > 0 {
-		t.keepAliveAt = time.Now().Add(association.options.KeepAlivePeriod)
-	}
 	t.statsAt = time.Now().Add(time.Second)
 }
 
@@ -145,7 +146,7 @@ func (t *txState) shouldPack(now time.Time) bool {
 	if len(t.queue) == 0 {
 		return false
 	}
-	if t.queue[0].probe {
+	if t.queue[0].probe || t.queue[0].mtu {
 		return true
 	}
 	if !t.windowAllows() {
@@ -155,8 +156,19 @@ func (t *txState) shouldPack(now time.Time) bool {
 }
 
 func (t *txState) runTimers(now time.Time) error {
+	if t.closing {
+		if !t.ackAt.IsZero() && !now.Before(t.ackAt) {
+			t.enqueueAck(now)
+		}
+		return nil
+	}
+	a := t.association
+	activeStreams := a.activeStreams()
 	if !now.Before(t.idleAt) {
-		return ErrIdleTimeout
+		if activeStreams == 0 {
+			return ErrIdleTimeout
+		}
+		t.idleAt = now.Add(a.options.IdleTimeout)
 	}
 	if !t.ackAt.IsZero() && !now.Before(t.ackAt) {
 		t.enqueueAck(now)
@@ -165,13 +177,23 @@ func (t *txState) runTimers(now time.Time) error {
 		candidate, packetNumber := t.mtu.candidate, t.mtu.packet
 		t.mtu.dropCandidate()
 		t.dropProbe(packetNumber)
-		t.association.logInfo("mtu probe of ", candidate, " unanswered, mtu stays ", t.association.mtuSize())
+		a.logInfo("mtu probe of ", candidate, " unanswered, mtu stays ", a.mtuSize())
 	}
-	if !t.keepAliveAt.IsZero() && !now.Before(t.keepAliveAt) {
-		if t.inFlight.len() == 0 && len(t.queue) == 0 {
-			t.pushControl(appendPingFrame(nil), true)
+	keepAlive := a.options.KeepAlivePeriod
+	if keepAlive <= 0 && activeStreams > 0 {
+		keepAlive = a.options.IdleTimeout / 2
+	}
+	if keepAlive > 0 {
+		if t.keepAliveAt.IsZero() {
+			t.keepAliveAt = now.Add(keepAlive)
+		} else if !now.Before(t.keepAliveAt) {
+			if t.inFlight.len() == 0 && len(t.queue) == 0 {
+				t.pushControl(appendPingFrame(nil), true)
+			}
+			t.keepAliveAt = now.Add(keepAlive)
 		}
-		t.keepAliveAt = now.Add(t.association.options.KeepAlivePeriod)
+	} else {
+		t.keepAliveAt = time.Time{}
 	}
 	if t.inFlight.len() > 0 && !now.Before(t.ptoDeadline()) {
 		if cause := t.probeLocked(now); cause != nil {
@@ -206,17 +228,34 @@ func (t *txState) probeLocked(now time.Time) error {
 		return ErrProbeTimeout
 	}
 	t.association.stats.probes.Add(1)
-	t.queue = append([]outFrame{{payload: appendPingFrame(nil), ackEliciting: true, probe: true}}, t.queue...)
+	t.inFlight.remove(oldest)
+	var retransmit []outFrame
+	for index := range oldest.frames {
+		frame := oldest.frames[index]
+		if frame.ackEliciting && retransmittable(frame.payload[0]&frameTypeMask) {
+			frame.probe = true
+			retransmit = append(retransmit, frame)
+			continue
+		}
+		frame.release()
+	}
+	if len(retransmit) == 0 {
+		retransmit = append(retransmit, outFrame{payload: appendPingFrame(nil), ackEliciting: true, probe: true})
+	}
+	t.queue = append(retransmit, t.queue...)
 	return nil
 }
 
 func (t *txState) ptoDeadline() time.Time {
-	oldest := t.inFlight.oldest()
-	if oldest == nil {
+	if t.inFlight.len() == 0 {
 		return time.Time{}
 	}
+	base := t.lastSentAt
+	if base.IsZero() {
+		base = t.inFlight.oldest().sentAt
+	}
 	backoff := min(t.probes, maxProbeBackoff)
-	return oldest.sentAt.Add(t.rtt.pto() << backoff)
+	return base.Add(t.rtt.pto() << backoff)
 }
 
 func (t *txState) enqueueAck(now time.Time) {
@@ -272,7 +311,7 @@ func (t *txState) nextDeadline(now time.Time) time.Time {
 	switch {
 	case len(t.ackQueue) > 0:
 		consider(now)
-	case len(t.queue) > 0 && (t.queue[0].probe || t.windowAllows()):
+	case len(t.queue) > 0 && (t.queue[0].probe || t.queue[0].mtu || t.windowAllows()):
 		if wait := t.cc.PacingWait(now); wait > 0 {
 			consider(now.Add(wait))
 		} else {

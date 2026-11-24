@@ -98,7 +98,7 @@ func (a *association) txWriteFailed(err error) bool {
 	failed := append([]*sentPacket(nil), t.batch.sent...)
 	var probed bool
 	for _, sent := range failed {
-		probed = probed || sent.probe
+		probed = probed || sent.mtu
 	}
 	if probed {
 		candidate := t.mtu.candidate
@@ -123,7 +123,7 @@ func (a *association) releaseFailed(failed []*sentPacket) {
 		t.inFlight.remove(sent)
 		for index := range sent.frames {
 			frame := sent.frames[index]
-			if frame.probe {
+			if frame.mtu {
 				frame.release()
 				continue
 			}
