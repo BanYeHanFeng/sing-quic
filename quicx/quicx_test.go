@@ -372,3 +372,21 @@ func readFull(conn net.Conn, p []byte) (int, error) {
 	}
 	return read, nil
 }
+
+func TestResetRedials(t *testing.T) {
+	client, handler := testSetup(t, "password")
+	ctx := testContext(t, 20*time.Second)
+	first, err := client.DialConn(ctx, M.ParseSocksaddr("example.com:80"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = handler.connection(t, ctx)
+	client.Reset()
+	second, err := client.DialConn(ctx, M.ParseSocksaddr("example.com:81"))
+	if err != nil {
+		t.Fatalf("the client did not redial after reset: %v", err)
+	}
+	defer second.Close()
+	defer first.Close()
+	_ = handler.connection(t, ctx)
+}

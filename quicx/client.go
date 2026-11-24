@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -16,6 +17,8 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/sync/singleflight"
 )
+
+var errNetworkChanged = E.New("network changed")
 
 type ClientOptions struct {
 	Context       context.Context
@@ -37,10 +40,11 @@ type Client struct {
 	transport  udpx.Options
 	logger     logger.Logger
 
-	access    sync.Mutex
-	session   *session
-	closed    bool
-	dialGroup singleflight.Group
+	access     sync.Mutex
+	session    *session
+	generation uint64
+	closed     bool
+	dialGroup  singleflight.Group
 }
 
 func NewClient(options ClientOptions) (*Client, error) {
@@ -81,13 +85,13 @@ func (c *Client) getSession(ctx context.Context) (*session, error) {
 		return nil, os.ErrClosed
 	}
 	current := c.session
+	generation := c.generation
+	c.access.Unlock()
 	if current != nil && current.live() {
-		c.access.Unlock()
 		return current, nil
 	}
-	c.access.Unlock()
-	result := c.dialGroup.DoChan("dial", func() (any, error) {
-		return c.dialSession()
+	result := c.dialGroup.DoChan(strconv.FormatUint(generation, 10), func() (any, error) {
+		return c.dialSession(generation)
 	})
 	select {
 	case outcome := <-result:
@@ -102,7 +106,7 @@ func (c *Client) getSession(ctx context.Context) (*session, error) {
 	}
 }
 
-func (c *Client) dialSession() (*session, error) {
+func (c *Client) dialSession(generation uint64) (*session, error) {
 	dialStart := time.Now()
 	udpConn, err := c.dialer.DialContext(c.ctx, "udp", c.serverAddr)
 	if err != nil {
@@ -119,14 +123,21 @@ func (c *Client) dialSession() (*session, error) {
 	c.logger.Debug("QUICX dial: stage=handshake server=", c.serverAddr, " remote=", remote, " elapsed=", dialElapsed(dialStart))
 	current := newSession(c.ctx, association, c.logger, nil)
 	c.access.Lock()
-	if c.closed {
-		c.access.Unlock()
-		current.closeWithError(os.ErrClosed)
-		_ = udpConn.Close()
-		return nil, os.ErrClosed
+	closed := c.closed
+	stale := closed || c.generation != generation
+	if !stale {
+		c.session = current
 	}
-	c.session = current
 	c.access.Unlock()
+	if stale {
+		closeErr := errNetworkChanged
+		if closed {
+			closeErr = os.ErrClosed
+		}
+		current.closeWithError(closeErr)
+		_ = udpConn.Close()
+		return nil, closeErr
+	}
 	go c.watchSession(current, udpConn, dialStart)
 	return current, nil
 }
@@ -187,13 +198,24 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 	return current.openChannel(c.ctx)
 }
 
-func (c *Client) CloseWithError(err error) error {
+func (c *Client) Reset() {
 	c.access.Lock()
-	c.closed = true
+	c.generation++
 	current := c.session
 	c.session = nil
 	c.access.Unlock()
-	c.dialGroup.Forget("dial")
+	if current != nil {
+		current.closeWithError(errNetworkChanged)
+	}
+}
+
+func (c *Client) CloseWithError(err error) error {
+	c.access.Lock()
+	c.closed = true
+	c.generation++
+	current := c.session
+	c.session = nil
+	c.access.Unlock()
 	if current != nil {
 		current.closeWithError(err)
 	}
