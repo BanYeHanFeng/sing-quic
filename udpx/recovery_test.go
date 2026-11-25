@@ -7,31 +7,31 @@ import (
 	"time"
 )
 
-func openStreamFrame(t *testing.T, a *association, index uint32, payload string) error {
+func openStreamFrame(t *testing.T, c *Conn, index uint32, payload string) error {
 	t.Helper()
 	frame := appendStreamHeader(nil, index<<1, 0, false, len(payload))
 	frame = append(frame, payload...)
-	return a.handleStreamFrame(frameTypeStream, frame[frameHeaderLen:])
+	return c.handleStreamFrame(frameTypeStream, frame[frameHeaderLen:])
 }
 
 func TestPeerOpensStreamsOutOfOrder(t *testing.T) {
 	_, server, _ := testSetup(t, Options{MTU: mtuIPv4}, Options{MTU: mtuIPv4})
-	a := server.(*association)
+	c := server
 	ctx := testContext(t, 5*time.Second)
-	if err := openStreamFrame(t, a, 0, "zero"); err != nil {
+	if err := openStreamFrame(t, c, 0, "zero"); err != nil {
 		t.Fatal(err)
 	}
-	if err := openStreamFrame(t, a, 2, "two"); err != nil {
+	if err := openStreamFrame(t, c, 2, "two"); err != nil {
 		t.Fatalf("stream 2 arrived before stream 1: %v", err)
 	}
-	a.streamsMu.Lock()
-	next := a.streams.peerNext
-	a.streamsMu.Unlock()
+	c.streamsMu.Lock()
+	next := c.streams.peerNext
+	c.streamsMu.Unlock()
 	if next != 3 {
 		t.Fatalf("the peer next stream is %d", next)
 	}
 	for _, expected := range []string{"zero", "two"} {
-		stream, err := a.AcceptStream(ctx)
+		stream, err := c.AcceptStream(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -39,22 +39,22 @@ func TestPeerOpensStreamsOutOfOrder(t *testing.T) {
 			t.Fatalf("stream read %q", read)
 		}
 	}
-	if err := openStreamFrame(t, a, 1, "one"); err != nil {
+	if err := openStreamFrame(t, c, 1, "one"); err != nil {
 		t.Fatalf("stream 1 arrived after stream 2: %v", err)
 	}
-	stream, err := a.AcceptStream(ctx)
+	stream, err := c.AcceptStream(ctx)
 	if err != nil {
 		t.Fatalf("stream 1 was dropped: %v", err)
 	}
 	if read := readAll(t, stream, 3); string(read) != "one" {
 		t.Fatalf("stream 1 read %q", read)
 	}
-	if err = openStreamFrame(t, a, 1, "one"); err != nil {
+	if err = openStreamFrame(t, c, 1, "one"); err != nil {
 		t.Fatalf("stream 1 arrived again: %v", err)
 	}
 	select {
-	case <-a.Context().Done():
-		t.Fatalf("the association ended with %v", context.Cause(a.Context()))
+	case <-c.Context().Done():
+		t.Fatalf("the conn ended with %v", context.Cause(c.Context()))
 	default:
 	}
 }
@@ -62,7 +62,7 @@ func TestPeerOpensStreamsOutOfOrder(t *testing.T) {
 func TestProbeRetransmitsWithoutAFlood(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{})
 	ctx := testContext(t, 30*time.Second)
@@ -88,9 +88,9 @@ func TestProbeRetransmitsWithoutAFlood(t *testing.T) {
 	link.setLoss(1)
 	payload := testPayload(8 * 1024)
 	mustWrite(t, stream, payload)
-	before := testSnapshot(client.(*association))
+	before := testSnapshot(client)
 	time.Sleep(2 * time.Second)
-	after := testSnapshot(client.(*association))
+	after := testSnapshot(client)
 	probes := after.probes - before.probes
 	if probes > 20 {
 		t.Fatalf("%d probes were sent in two seconds", probes)

@@ -237,7 +237,7 @@ const (
 )
 
 func (c resetCode) err() error {
-	return StreamResetError{Code: uint8(c)}
+	return ErrStreamReset
 }
 
 type closeCode uint8

@@ -21,20 +21,20 @@ type transferBounds struct {
 	connectionWindow uint64
 }
 
-func sampleBounds(association *association) transferBounds {
-	association.streamsMu.Lock()
-	streams := make([]*Stream, 0, len(association.streams.table))
-	for _, stream := range association.streams.table {
+func sampleBounds(conn *Conn) transferBounds {
+	conn.streamsMu.Lock()
+	streams := make([]*Stream, 0, len(conn.streams.table))
+	for _, stream := range conn.streams.table {
 		streams = append(streams, stream)
 	}
-	association.streamsMu.Unlock()
-	association.txMu.Lock()
-	inFlightBytes := int(association.tx.inFlight.bytes)
-	queuedFrames := len(association.tx.queue)
-	association.txMu.Unlock()
-	association.fcMu.Lock()
-	connectionWindow := association.fc.recvWindow
-	association.fcMu.Unlock()
+	conn.streamsMu.Unlock()
+	conn.sendMu.Lock()
+	inFlightBytes := int(conn.send.inFlight.bytes)
+	queuedFrames := len(conn.send.queue)
+	conn.sendMu.Unlock()
+	conn.fcMu.Lock()
+	connectionWindow := conn.fc.recvWindow
+	conn.fcMu.Unlock()
 	streamSegments := 0
 	streamWindow := uint64(0)
 	for _, stream := range streams {
@@ -62,7 +62,7 @@ type boundsSampler struct {
 	done   chan struct{}
 }
 
-func startBoundsSampler(t *testing.T, associations ...Association) *boundsSampler {
+func startBoundsSampler(t *testing.T, associations ...*Conn) *boundsSampler {
 	t.Helper()
 	sampler := &boundsSampler{
 		stopCh: make(chan struct{}),
@@ -77,7 +77,7 @@ func startBoundsSampler(t *testing.T, associations ...Association) *boundsSample
 			case <-time.After(5 * time.Millisecond):
 			}
 			for _, conn := range associations {
-				bounds := sampleBounds(conn.(*association))
+				bounds := sampleBounds(conn)
 				sampler.mu.Lock()
 				sampler.worst.streams = max(sampler.worst.streams, bounds.streams)
 				sampler.worst.inFlightBytes = max(sampler.worst.inFlightBytes, bounds.inFlightBytes)
@@ -102,12 +102,12 @@ func (s *boundsSampler) worstBounds() transferBounds {
 	return s.worst
 }
 
-func streamCount(t *testing.T, conn Association) int {
+func streamCount(t *testing.T, conn *Conn) int {
 	t.Helper()
-	a := conn.(*association)
-	a.streamsMu.Lock()
-	defer a.streamsMu.Unlock()
-	return len(a.streams.table)
+	c := conn
+	c.streamsMu.Lock()
+	defer c.streamsMu.Unlock()
+	return len(c.streams.table)
 }
 
 func otherPayload(size int) []byte {
@@ -165,7 +165,7 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	const datagramCount = 32
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
 		loss:       0.02,
@@ -190,7 +190,7 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	sampler := startBoundsSampler(t, client, server)
 	upload := testPayload(payloadSize)
 	download := otherPayload(payloadSize)
-	datagramPayload := testPayload(2 * (int(client.(*association).maxPayload.Load()) - datagramHeaderLen))
+	datagramPayload := testPayload(2 * (int(client.maxPayload.Load()) - datagramHeaderLen))
 	var wg sync.WaitGroup
 
 	wg.Add(2)
@@ -270,7 +270,7 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 				return
 			}
 			if datagram.Channel != 3 || !bytes.Equal(datagram.Data, datagramPayload) {
-				t.Errorf("a datagram on channel %d changed on the way", datagram.Channel)
+				t.Errorf("c datagram on channel %d changed on the way", datagram.Channel)
 				arrivedDatagrams <- arrived
 				return
 			}
@@ -305,13 +305,13 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 		t.Errorf("%d streams were open at once", bounds.streams)
 	}
 	if bounds.inFlightBytes > int(2*bounds.connectionWindow) {
-		t.Errorf("%d bytes were in flight at once, with a window of %d", bounds.inFlightBytes, bounds.connectionWindow)
+		t.Errorf("%d bytes were in flight at once, with c window of %d", bounds.inFlightBytes, bounds.connectionWindow)
 	}
-	if dataLen := int(client.(*association).maxPayload.Load()) - streamHeaderLen; bounds.queuedFrames > int(8*(max(bounds.streamWindow, initialStreamWindow)/uint64(dataLen))) {
-		t.Errorf("%d frames were queued at once, with a window of %d", bounds.queuedFrames, bounds.streamWindow)
+	if dataLen := int(client.maxPayload.Load()) - streamHeaderLen; bounds.queuedFrames > int(8*(max(bounds.streamWindow, initialStreamWindow)/uint64(dataLen))) {
+		t.Errorf("%d frames were queued at once, with c window of %d", bounds.queuedFrames, bounds.streamWindow)
 	}
 	if bounds.streamSegments > int(2*bounds.streamWindow) {
-		t.Errorf("%d bytes were waiting to be read on the streams at once, with a window of %d", bounds.streamSegments, bounds.streamWindow)
+		t.Errorf("%d bytes were waiting to be read on the streams at once, with c window of %d", bounds.streamSegments, bounds.streamWindow)
 	}
 	if count := streamCount(t, client); count != 0 {
 		t.Errorf("%d streams are left on the client", count)
@@ -372,7 +372,7 @@ func TestStreamBothDirectionsBlocked(t *testing.T) {
 func TestAssociationEndsUnderLoad(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{delay: 20 * time.Millisecond})
 
@@ -410,10 +410,10 @@ func TestAssociationEndsUnderLoad(t *testing.T) {
 	select {
 	case err = <-writeDone:
 		if err == nil {
-			t.Fatal("the write finished after the association ended")
+			t.Fatal("the write finished after the conn ended")
 		}
 	case <-time.After(30 * time.Second):
-		t.Fatal("the write waited for an association that ended")
+		t.Fatal("the write waited for an conn that ended")
 	}
 	select {
 	case <-client.Context().Done():
@@ -421,9 +421,9 @@ func TestAssociationEndsUnderLoad(t *testing.T) {
 		t.Fatal("the client did not notice that the peer closed")
 	}
 	if _, err = accepted.Read(make([]byte, 1)); err == nil {
-		t.Fatal("a stream of an ended association still reads")
+		t.Fatal("c stream of an ended conn still reads")
 	}
 	if _, err = stream.Write([]byte("more")); err == nil {
-		t.Fatal("a stream of an ended association still writes")
+		t.Fatal("c stream of an ended conn still writes")
 	}
 }

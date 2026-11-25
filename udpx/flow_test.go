@@ -75,7 +75,7 @@ func TestConnectionWindowIsHandedBackAfterReset(t *testing.T) {
 	if read := readAll(t, accepted, 5); string(read) != "hello" {
 		t.Fatalf("read %q", read)
 	}
-	serverAssociation := server.(*association)
+	serverAssociation := server
 	serverAssociation.fcMu.Lock()
 	received := serverAssociation.fc.recvReceived
 	read := serverAssociation.fc.recvRead

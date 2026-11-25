@@ -63,66 +63,66 @@ func nextWindow(highest, read, window, current uint64) (uint64, bool) {
 	return limit, true
 }
 
-func (a *association) handleMaxData(body []byte) error {
+func (c *Conn) handleMaxData(body []byte) error {
 	if len(body) < 8 {
 		return errShortFrame
 	}
 	limit := binary.BigEndian.Uint64(body)
-	a.fcMu.Lock()
-	moved := a.fc.sendLimit < limit
+	c.fcMu.Lock()
+	moved := c.fc.sendLimit < limit
 	if moved {
-		a.fc.sendLimit = limit
+		c.fc.sendLimit = limit
 	}
-	a.fcMu.Unlock()
+	c.fcMu.Unlock()
 	if moved {
-		a.notifyStreams()
+		c.notifyStreams()
 	}
 	return nil
 }
 
-func (a *association) dataReceived(n int) error {
+func (c *Conn) dataReceived(n int) error {
 	if n == 0 {
 		return nil
 	}
-	a.fcMu.Lock()
-	a.fc.recvReceived += uint64(n)
-	if a.fc.recvReceived > a.fc.recvLimit {
-		received := a.fc.recvReceived
-		limit := a.fc.recvLimit
-		a.fcMu.Unlock()
-		return E.New("association received ", received, " bytes beyond its window ", limit)
+	c.fcMu.Lock()
+	c.fc.recvReceived += uint64(n)
+	if c.fc.recvReceived > c.fc.recvLimit {
+		received := c.fc.recvReceived
+		limit := c.fc.recvLimit
+		c.fcMu.Unlock()
+		return E.New("connection received ", received, " bytes beyond its window ", limit)
 	}
-	limit, moved := a.fc.nextReceiveLimit()
-	a.fcMu.Unlock()
+	limit, moved := c.fc.nextReceiveLimit()
+	c.fcMu.Unlock()
 	if moved {
-		a.queueControl(appendMaxDataFrame(nil, limit), true)
+		c.queueControl(appendMaxDataFrame(nil, limit), true)
 	}
 	return nil
 }
 
-func (a *association) dataRead(n int) {
+func (c *Conn) dataRead(n int) {
 	if n == 0 {
 		return
 	}
-	a.fcMu.Lock()
-	a.fc.recvRead += uint64(n)
-	limit, moved := a.fc.nextReceiveLimit()
-	a.fcMu.Unlock()
+	c.fcMu.Lock()
+	c.fc.recvRead += uint64(n)
+	limit, moved := c.fc.nextReceiveLimit()
+	c.fcMu.Unlock()
 	if moved {
-		a.queueControl(appendMaxDataFrame(nil, limit), true)
+		c.queueControl(appendMaxDataFrame(nil, limit), true)
 	}
 }
 
-func (a *association) dataDropped(n int) {
+func (c *Conn) dataDropped(n int) {
 	if n == 0 {
 		return
 	}
-	a.fcMu.Lock()
-	a.fc.recvReceived += uint64(n)
-	a.fc.recvRead += uint64(n)
-	limit, moved := a.fc.nextReceiveLimit()
-	a.fcMu.Unlock()
+	c.fcMu.Lock()
+	c.fc.recvReceived += uint64(n)
+	c.fc.recvRead += uint64(n)
+	limit, moved := c.fc.nextReceiveLimit()
+	c.fcMu.Unlock()
 	if moved {
-		a.queueControl(appendMaxDataFrame(nil, limit), true)
+		c.queueControl(appendMaxDataFrame(nil, limit), true)
 	}
 }

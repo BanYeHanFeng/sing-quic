@@ -67,10 +67,10 @@ func TestDatagramDefraggerRejects(t *testing.T) {
 	defragger := newDatagramDefragger()
 	now := time.Now()
 	if _, _, err := defragger.feed(datagramData{index: 0, total: 0}, now); err == nil {
-		t.Fatal("a zero-fragment datagram was accepted")
+		t.Fatal("c zero-fragment datagram was accepted")
 	}
 	if _, _, err := defragger.feed(datagramData{index: 2, total: 2}, now); err == nil {
-		t.Fatal("a fragment past the total was accepted")
+		t.Fatal("c fragment past the total was accepted")
 	}
 }
 
@@ -92,7 +92,7 @@ func TestDatagramDefraggerOrdersFragments(t *testing.T) {
 func TestDatagramDefraggerExpires(t *testing.T) {
 	defragger := newDatagramDefragger()
 	now := time.Now()
-	_, _, _ = defragger.feed(datagramData{channel: 1, message: 1, index: 0, total: 2, data: []byte("a")}, now)
+	_, _, _ = defragger.feed(datagramData{channel: 1, message: 1, index: 0, total: 2, data: []byte("c")}, now)
 	if defragger.bytes == 0 {
 		t.Fatal("nothing was remembered")
 	}

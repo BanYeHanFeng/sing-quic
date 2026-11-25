@@ -64,22 +64,22 @@ func runServer(ctx context.Context, listen, password string, options udpx.Option
 	if err != nil {
 		return err
 	}
-	listener := udpx.ListenPacket(conn, passwordVerifier{credential: udpx.NewCredential(password)}, options)
+	listener := udpx.Listen(conn, passwordVerifier{credential: udpx.NewCredential(password)}, options)
 	defer listener.Close()
 	fmt.Println("listening on", conn.LocalAddr())
 	for {
-		association, acceptErr := listener.Accept(ctx)
+		conn, acceptErr := listener.Accept(ctx)
 		if acceptErr != nil {
 			return acceptErr
 		}
-		go serveAssociation(ctx, association, streamMode)
+		go serveAssociation(ctx, conn, streamMode)
 	}
 }
 
-func serveAssociation(ctx context.Context, association udpx.Association, streamMode bool) {
+func serveAssociation(ctx context.Context, conn *udpx.Conn, streamMode bool) {
 	if streamMode {
 		for {
-			stream, err := association.AcceptStream(ctx)
+			stream, err := conn.AcceptStream(ctx)
 			if err != nil {
 				return
 			}
@@ -90,11 +90,11 @@ func serveAssociation(ctx context.Context, association udpx.Association, streamM
 		}
 	}
 	for {
-		datagram, err := association.ReceiveDatagram(ctx)
+		datagram, err := conn.ReceiveDatagram(ctx)
 		if err != nil {
 			return
 		}
-		if err = association.SendDatagram(datagram.Channel, datagram.Data); err != nil {
+		if err = conn.SendDatagram(datagram.Channel, datagram.Data); err != nil {
 			return
 		}
 	}
@@ -107,20 +107,20 @@ func runClient(ctx context.Context, server, password string, options udpx.Option
 	if err != nil {
 		return err
 	}
-	conn, err := net.ListenPacket("udp", "")
+	socket, err := net.ListenPacket("udp", "")
 	if err != nil {
 		return err
 	}
-	association, err := udpx.Dial(ctx, conn, remote, udpx.NewCredential(password), options)
+	conn, err := udpx.Dial(ctx, socket, remote, udpx.NewCredential(password), options)
 	if err != nil {
 		return err
 	}
-	defer association.CloseWithError(nil)
+	defer conn.CloseWithError(nil)
 	fmt.Println("connected to", remote)
 	if streamMode {
-		return runStream(ctx, association, size, duration)
+		return runStream(ctx, conn, size, duration)
 	}
-	return runDatagrams(ctx, association, size, pps, duration)
+	return runDatagrams(ctx, conn, size, pps, duration)
 }
 
 type measurement struct {
@@ -174,7 +174,7 @@ func latencySum(latency []time.Duration) time.Duration {
 	return total
 }
 
-func runDatagrams(ctx context.Context, association udpx.Association, size, pps int, duration time.Duration) error {
+func runDatagrams(ctx context.Context, conn *udpx.Conn, size, pps int, duration time.Duration) error {
 	if size < datagramHeaderLen {
 		return fmt.Errorf("datagram size %d is below the %d byte header", size, datagramHeaderLen)
 	}
@@ -187,7 +187,7 @@ func runDatagrams(ctx context.Context, association udpx.Association, size, pps i
 
 	go func() {
 		for {
-			datagram, err := association.ReceiveDatagram(ctx)
+			datagram, err := conn.ReceiveDatagram(ctx)
 			if err != nil {
 				return
 			}
@@ -203,7 +203,7 @@ func runDatagrams(ctx context.Context, association udpx.Association, size, pps i
 		binary.BigEndian.PutUint64(payload[:8], sequence)
 		binary.BigEndian.PutUint64(payload[8:], uint64(time.Now().UnixNano()))
 		sequence++
-		if err := association.SendDatagram(1, payload); err != nil {
+		if err := conn.SendDatagram(1, payload); err != nil {
 			return err
 		}
 		measure.sent.Add(1)
@@ -219,8 +219,8 @@ func runDatagrams(ctx context.Context, association udpx.Association, size, pps i
 	return nil
 }
 
-func runStream(ctx context.Context, association udpx.Association, sizeMiB int, duration time.Duration) error {
-	stream, err := association.OpenStream(ctx)
+func runStream(ctx context.Context, conn *udpx.Conn, sizeMiB int, duration time.Duration) error {
+	stream, err := conn.OpenStream(ctx)
 	if err != nil {
 		return err
 	}

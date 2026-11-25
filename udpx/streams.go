@@ -27,9 +27,9 @@ type streamTable struct {
 	initiatorBit uint32
 }
 
-func newStreamTable(isClient bool) streamTable {
+func newStreamTable(initiator bool) streamTable {
 	var initiatorBit uint32
-	if !isClient {
+	if !initiator {
 		initiatorBit = streamInitiatorBit
 	}
 	return streamTable{
@@ -43,173 +43,173 @@ func newStreamTable(isClient bool) streamTable {
 	}
 }
 
-func (a *association) OpenStream(ctx context.Context) (*Stream, error) {
+func (c *Conn) OpenStream(ctx context.Context) (*Stream, error) {
 	for {
-		a.streamsMu.Lock()
-		if a.streams.nextID < a.streams.openCredit {
-			id := a.streams.nextID<<1 | a.streams.initiatorBit
-			a.streams.nextID++
-			stream := newStream(a, id, initialStreamWindow)
-			a.streams.table[id] = stream
-			a.streamsMu.Unlock()
-			a.queueStreamFrame(newStreamFrame(stream, 0, false, nil))
+		c.streamsMu.Lock()
+		if c.streams.nextID < c.streams.openCredit {
+			id := c.streams.nextID<<1 | c.streams.initiatorBit
+			c.streams.nextID++
+			stream := newStream(c, id, initialStreamWindow)
+			c.streams.table[id] = stream
+			c.streamsMu.Unlock()
+			c.queueStreamFrame(newStreamFrame(stream, 0, false, nil))
 			return stream, nil
 		}
-		credit := a.streams.credit
-		a.streamsMu.Unlock()
+		credit := c.streams.credit
+		c.streamsMu.Unlock()
 		select {
 		case <-credit:
 		case <-ctx.Done():
 			return nil, context.Cause(ctx)
-		case <-a.ctx.Done():
-			return nil, context.Cause(a.ctx)
+		case <-c.ctx.Done():
+			return nil, context.Cause(c.ctx)
 		}
 	}
 }
 
-func (a *association) AcceptStream(ctx context.Context) (*Stream, error) {
+func (c *Conn) AcceptStream(ctx context.Context) (*Stream, error) {
 	select {
-	case stream := <-a.streams.accept:
-		a.acceptedStream(stream)
+	case stream := <-c.streams.accept:
+		c.acceptedStream(stream)
 		return stream, nil
 	case <-ctx.Done():
 		return nil, context.Cause(ctx)
-	case <-a.ctx.Done():
-		return nil, context.Cause(a.ctx)
+	case <-c.ctx.Done():
+		return nil, context.Cause(c.ctx)
 	}
 }
 
-func (a *association) acceptedStream(stream *Stream) {
-	a.streamsMu.Lock()
+func (c *Conn) acceptedStream(stream *Stream) {
+	c.streamsMu.Lock()
 	stream.accepted = true
-	_, live := a.streams.table[stream.id]
+	_, live := c.streams.table[stream.id]
 	if live {
-		a.streamsMu.Unlock()
+		c.streamsMu.Unlock()
 		return
 	}
-	a.streams.peerLimit++
-	limit := a.streams.peerLimit
-	a.streamsMu.Unlock()
-	a.queueControl(appendMaxStreamsFrame(nil, limit), true)
+	c.streams.peerLimit++
+	limit := c.streams.peerLimit
+	c.streamsMu.Unlock()
+	c.queueControl(appendMaxStreamsFrame(nil, limit), true)
 }
 
-func (a *association) stream(id uint32) *Stream {
-	a.streamsMu.Lock()
-	defer a.streamsMu.Unlock()
-	return a.streams.table[id]
+func (c *Conn) stream(id uint32) *Stream {
+	c.streamsMu.Lock()
+	defer c.streamsMu.Unlock()
+	return c.streams.table[id]
 }
 
-func (a *association) activeStreams() int {
-	a.streamsMu.Lock()
-	defer a.streamsMu.Unlock()
-	return len(a.streams.table)
+func (c *Conn) activeStreams() int {
+	c.streamsMu.Lock()
+	defer c.streamsMu.Unlock()
+	return len(c.streams.table)
 }
 
-func (a *association) removeStream(id uint32) bool {
-	a.streamsMu.Lock()
-	stream, loaded := a.streams.table[id]
+func (c *Conn) removeStream(id uint32) bool {
+	c.streamsMu.Lock()
+	stream, loaded := c.streams.table[id]
 	if loaded {
-		delete(a.streams.table, id)
+		delete(c.streams.table, id)
 	}
-	grant := loaded && stream.accepted && id&streamInitiatorBit != a.streams.initiatorBit
+	grant := loaded && stream.accepted && id&streamInitiatorBit != c.streams.initiatorBit
 	if grant {
-		a.streams.peerLimit++
+		c.streams.peerLimit++
 	}
-	limit := a.streams.peerLimit
-	a.streamsMu.Unlock()
+	limit := c.streams.peerLimit
+	c.streamsMu.Unlock()
 	if grant {
-		a.queueControl(appendMaxStreamsFrame(nil, limit), true)
+		c.queueControl(appendMaxStreamsFrame(nil, limit), true)
 	}
 	return loaded
 }
 
-func (a *association) acceptOpenedStream(id uint32) (*Stream, error) {
+func (c *Conn) acceptOpenedStream(id uint32) (*Stream, error) {
 	index := id >> 1
-	a.streamsMu.Lock()
+	c.streamsMu.Lock()
 	switch {
-	case index < a.streams.peerNext:
-		if _, implicit := a.streams.implicit[id]; !implicit {
-			a.streamsMu.Unlock()
+	case index < c.streams.peerNext:
+		if _, implicit := c.streams.implicit[id]; !implicit {
+			c.streamsMu.Unlock()
 			return nil, nil
 		}
-		delete(a.streams.implicit, id)
-	case index >= a.streams.peerLimit:
-		limit := a.streams.peerLimit
-		a.streamsMu.Unlock()
-		return nil, E.New("the peer opened stream ", index, " with a limit of ", limit)
+		delete(c.streams.implicit, id)
+	case index >= c.streams.peerLimit:
+		limit := c.streams.peerLimit
+		c.streamsMu.Unlock()
+		return nil, E.New("the peer opened stream ", index, " with c limit of ", limit)
 	default:
-		for skipped := a.streams.peerNext; skipped < index; skipped++ {
-			a.streams.implicit[skipped<<1|(id&streamInitiatorBit)] = struct{}{}
+		for skipped := c.streams.peerNext; skipped < index; skipped++ {
+			c.streams.implicit[skipped<<1|(id&streamInitiatorBit)] = struct{}{}
 		}
-		a.streams.peerNext = index + 1
+		c.streams.peerNext = index + 1
 	}
-	stream := newStream(a, id, initialStreamWindow)
-	a.streams.table[id] = stream
-	a.streamsMu.Unlock()
+	stream := newStream(c, id, initialStreamWindow)
+	c.streams.table[id] = stream
+	c.streamsMu.Unlock()
 	select {
-	case a.streams.accept <- stream:
+	case c.streams.accept <- stream:
 	default:
-		a.removeStream(id)
+		c.removeStream(id)
 		return nil, E.New("accept queue is full")
 	}
 	return stream, nil
 }
 
-func (a *association) releaseImplicitStream(id uint32) {
-	a.streamsMu.Lock()
-	if _, implicit := a.streams.implicit[id]; !implicit {
-		a.streamsMu.Unlock()
+func (c *Conn) releaseImplicitStream(id uint32) {
+	c.streamsMu.Lock()
+	if _, implicit := c.streams.implicit[id]; !implicit {
+		c.streamsMu.Unlock()
 		return
 	}
-	delete(a.streams.implicit, id)
-	a.streams.peerLimit++
-	limit := a.streams.peerLimit
-	a.streamsMu.Unlock()
-	a.queueControl(appendMaxStreamsFrame(nil, limit), true)
+	delete(c.streams.implicit, id)
+	c.streams.peerLimit++
+	limit := c.streams.peerLimit
+	c.streamsMu.Unlock()
+	c.queueControl(appendMaxStreamsFrame(nil, limit), true)
 }
 
-func (a *association) handleMaxStreams(limit uint32) {
-	a.streamsMu.Lock()
-	if limit <= a.streams.openCredit {
-		a.streamsMu.Unlock()
+func (c *Conn) handleMaxStreams(limit uint32) {
+	c.streamsMu.Lock()
+	if limit <= c.streams.openCredit {
+		c.streamsMu.Unlock()
 		return
 	}
-	a.streams.openCredit = limit
-	close(a.streams.credit)
-	a.streams.credit = make(chan struct{})
-	a.streamsMu.Unlock()
+	c.streams.openCredit = limit
+	close(c.streams.credit)
+	c.streams.credit = make(chan struct{})
+	c.streamsMu.Unlock()
 }
 
-func (a *association) notifyStreams() {
-	a.streamsMu.Lock()
-	streams := make([]*Stream, 0, len(a.streams.table))
-	for _, stream := range a.streams.table {
+func (c *Conn) notifyStreams() {
+	c.streamsMu.Lock()
+	streams := make([]*Stream, 0, len(c.streams.table))
+	for _, stream := range c.streams.table {
 		streams = append(streams, stream)
 	}
-	a.streamsMu.Unlock()
+	c.streamsMu.Unlock()
 	for _, stream := range streams {
 		stream.signalSend()
 	}
 }
 
-func (a *association) handleStreamFrame(frameType byte, body []byte) error {
+func (c *Conn) handleStreamFrame(frameType byte, body []byte) error {
 	if len(body) < 12 {
 		return errShortFrame
 	}
 	data := parseStreamFrame(frameType, body)
-	stream := a.stream(data.streamID)
+	stream := c.stream(data.streamID)
 	if stream == nil {
-		if data.streamID&streamInitiatorBit == a.streams.initiatorBit {
-			a.dataDropped(len(data.data))
+		if data.streamID&streamInitiatorBit == c.streams.initiatorBit {
+			c.dataDropped(len(data.data))
 			return nil
 		}
 		var err error
-		stream, err = a.acceptOpenedStream(data.streamID)
+		stream, err = c.acceptOpenedStream(data.streamID)
 		if err != nil {
 			return err
 		}
 		if stream == nil {
-			a.dataDropped(len(data.data))
+			c.dataDropped(len(data.data))
 			return nil
 		}
 	}
@@ -217,31 +217,31 @@ func (a *association) handleStreamFrame(frameType byte, body []byte) error {
 	if err != nil {
 		return err
 	}
-	return a.dataReceived(received)
+	return c.dataReceived(received)
 }
 
-func (a *association) handleResetStream(body []byte) error {
+func (c *Conn) handleResetStream(body []byte) error {
 	if len(body) < 13 {
 		return errShortFrame
 	}
 	reset := parseResetStream(body)
-	stream := a.stream(reset.streamID)
+	stream := c.stream(reset.streamID)
 	if stream == nil {
-		a.releaseImplicitStream(reset.streamID)
+		c.releaseImplicitStream(reset.streamID)
 		return nil
 	}
 	stream.resetFromPeer(reset.finalOffset, reset.code)
-	a.removeStream(reset.streamID)
+	c.removeStream(reset.streamID)
 	return nil
 }
 
-func (a *association) handleMaxStreamData(body []byte) error {
+func (c *Conn) handleMaxStreamData(body []byte) error {
 	if len(body) < 12 {
 		return errShortFrame
 	}
 	streamID := binary.BigEndian.Uint32(body)
 	limit := binary.BigEndian.Uint64(body[4:])
-	stream := a.stream(streamID)
+	stream := c.stream(streamID)
 	if stream == nil {
 		return nil
 	}

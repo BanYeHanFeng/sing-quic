@@ -14,18 +14,6 @@ import (
 	"github.com/sagernet/sing/common/logger"
 )
 
-type Association interface {
-	LocalAddr() net.Addr
-	RemoteAddr() net.Addr
-	Context() context.Context
-	CloseWithError(err error) error
-	OpenStream(ctx context.Context) (*Stream, error)
-	AcceptStream(ctx context.Context) (*Stream, error)
-	KeyID() [keyIDLen]byte
-	SendDatagram(channel uint32, data []byte) error
-	ReceiveDatagram(ctx context.Context) (Datagram, error)
-}
-
 var ErrIdleTimeout = E.New("udpx: idle timeout")
 
 var ErrProbeTimeout = E.New("udpx: probe timeout")
@@ -73,19 +61,19 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
-type association struct {
-	conn     net.PacketConn
-	batchIO  udpio.Conn
-	options  Options
-	logger   logger.Logger
-	logTag   string
-	isClient bool
+type Conn struct {
+	socket    net.PacketConn
+	io        udpio.Conn
+	options   Options
+	logger    logger.Logger
+	logTag    string
+	initiator bool
 
-	localConnID connectionID
-	peerConnID  connectionID
-	keyID       [keyIDLen]byte
-	sendCipher  packetCipher
-	recvCipher  packetCipher
+	localID    connectionID
+	peerID     connectionID
+	keyID      [keyIDLen]byte
+	sendCipher packetCipher
+	recvCipher packetCipher
 
 	ctx    context.Context
 	cancel context.CancelCauseFunc
@@ -93,10 +81,10 @@ type association struct {
 	peerAddr   atomic.Pointer[net.Addr]
 	maxPayload atomic.Int32
 
-	txMu      sync.Mutex
-	tx        txState
-	txWake    chan struct{}
-	txDone    chan struct{}
+	sendMu    sync.Mutex
+	send      sender
+	sendWake  chan struct{}
+	sendDone  chan struct{}
 	closeOnce sync.Once
 
 	fcMu sync.Mutex
@@ -114,118 +102,118 @@ type association struct {
 	onClose func()
 }
 
-func newAssociation(conn net.PacketConn, batchIO udpio.Conn, result handshakeResult, peer net.Addr, options Options, isClient bool) *association {
+func newConn(conn net.PacketConn, io udpio.Conn, result handshakeResult, peer net.Addr, options Options, initiator bool) *Conn {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	if options.Logger == nil {
 		options.Logger = logger.NOP()
 	}
-	a := &association{
-		conn:        conn,
-		batchIO:     batchIO,
-		options:     options.withDefaults(),
-		logger:      options.Logger,
-		logTag:      logTagFor(result.localConnID),
-		isClient:    isClient,
-		localConnID: result.localConnID,
-		peerConnID:  result.peerConnID,
-		keyID:       result.keyID,
-		sendCipher:  result.send,
-		recvCipher:  result.recv,
-		ctx:         ctx,
-		cancel:      cancel,
-		txWake:      make(chan struct{}, 1),
-		txDone:      make(chan struct{}),
-		fc:          newFlowControl(),
-		streams:     newStreamTable(isClient),
-		defragger:   newDatagramDefragger(),
-		datagrams:   make(chan Datagram, datagramBacklog),
+	c := &Conn{
+		socket:     conn,
+		io:         io,
+		options:    options.withDefaults(),
+		logger:     options.Logger,
+		logTag:     logTagFor(result.localID),
+		initiator:  initiator,
+		localID:    result.localID,
+		peerID:     result.peerID,
+		keyID:      result.keyID,
+		sendCipher: result.send,
+		recvCipher: result.recv,
+		ctx:        ctx,
+		cancel:     cancel,
+		sendWake:   make(chan struct{}, 1),
+		sendDone:   make(chan struct{}),
+		fc:         newFlowControl(),
+		streams:    newStreamTable(initiator),
+		defragger:  newDatagramDefragger(),
+		datagrams:  make(chan Datagram, datagramBacklog),
 	}
-	a.peerAddr.Store(&peer)
+	c.peerAddr.Store(&peer)
 	mtu := mtuMin
 	if options.MTU > 0 {
 		mtu = max(mtuMin, min(options.MTU, maxPacketSize))
 	}
-	a.maxPayload.Store(int32(mtu - headerLen - tagLen))
-	a.tx.init(a)
-	a.logInfo("association up local=", a.logTag,
-		" client=", isClient, " remote=", peer, " mtu=", a.mtuSize())
-	return a
+	c.maxPayload.Store(int32(mtu - headerLen - tagLen))
+	c.send.init(c)
+	c.logInfo("connection up local=", c.logTag,
+		" client=", initiator, " remote=", peer, " mtu=", c.mtuSize())
+	return c
 }
 
-func (a *association) start() {
-	go a.writeLoop()
+func (c *Conn) start() {
+	go c.sendLoop()
 }
 
-func (a *association) LocalAddr() net.Addr {
-	return a.conn.LocalAddr()
+func (c *Conn) LocalAddr() net.Addr {
+	return c.socket.LocalAddr()
 }
 
-func (a *association) RemoteAddr() net.Addr {
-	return *a.peerAddr.Load()
+func (c *Conn) RemoteAddr() net.Addr {
+	return *c.peerAddr.Load()
 }
 
-func (a *association) Context() context.Context {
-	return a.ctx
+func (c *Conn) Context() context.Context {
+	return c.ctx
 }
 
-func (a *association) KeyID() [keyIDLen]byte {
-	return a.keyID
+func (c *Conn) KeyID() [keyIDLen]byte {
+	return c.keyID
 }
 
-func (a *association) mtuSize() int {
-	return int(a.maxPayload.Load()) + headerLen + tagLen
+func (c *Conn) mtuSize() int {
+	return int(c.maxPayload.Load()) + headerLen + tagLen
 }
 
-func (a *association) CloseWithError(err error) error {
-	a.shutdown(err, true)
+func (c *Conn) CloseWithError(err error) error {
+	c.shutdown(err, true)
 	return nil
 }
 
-func (a *association) shutdown(cause error, notifyPeer bool) {
-	a.closeOnce.Do(func() {
+func (c *Conn) shutdown(cause error, notifyPeer bool) {
+	c.closeOnce.Do(func() {
 		if cause == nil {
 			cause = net.ErrClosed
 		}
-		a.txMu.Lock()
-		a.tx.closeLocked(cause, notifyPeer)
-		a.txMu.Unlock()
-		a.wake()
+		c.sendMu.Lock()
+		c.send.closeLocked(cause, notifyPeer)
+		c.sendMu.Unlock()
+		c.wake()
 		select {
-		case <-a.txDone:
+		case <-c.sendDone:
 		case <-time.After(writeDrainTimeout):
 		}
-		a.cancel(cause)
-		if a.isClient {
-			_ = a.conn.SetReadDeadline(time.Now())
+		c.cancel(cause)
+		if c.initiator {
+			_ = c.socket.SetReadDeadline(time.Now())
 		}
-		a.closeStreams(cause)
-		if a.onClose != nil {
-			a.onClose()
+		c.closeStreams(cause)
+		if c.onClose != nil {
+			c.onClose()
 		}
 	})
 }
 
-func (a *association) closeStreams(cause error) {
-	a.streamsMu.Lock()
-	streams := make([]*Stream, 0, len(a.streams.table))
-	for _, stream := range a.streams.table {
+func (c *Conn) closeStreams(cause error) {
+	c.streamsMu.Lock()
+	streams := make([]*Stream, 0, len(c.streams.table))
+	for _, stream := range c.streams.table {
 		streams = append(streams, stream)
 	}
-	a.streams.table = make(map[uint32]*Stream)
-	a.streamsMu.Unlock()
+	c.streams.table = make(map[uint32]*Stream)
+	c.streamsMu.Unlock()
 	for _, stream := range streams {
 		stream.end(cause)
 	}
 }
 
-func (a *association) wake() {
+func (c *Conn) wake() {
 	select {
-	case a.txWake <- struct{}{}:
+	case c.sendWake <- struct{}{}:
 	default:
 	}
 }
 
-func Dial(ctx context.Context, conn net.PacketConn, remote net.Addr, credential Credential, options Options) (Association, error) {
+func Dial(ctx context.Context, conn net.PacketConn, remote net.Addr, credential Credential, options Options) (*Conn, error) {
 	if _, loaded := ctx.Deadline(); !loaded {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, defaultHandshakeTimeout)
@@ -239,11 +227,11 @@ func Dial(ctx context.Context, conn net.PacketConn, remote net.Addr, credential 
 	if err != nil {
 		return nil, err
 	}
-	batchIO := udpio.New(conn, udpio.Options{GRO: true})
-	a := newAssociation(conn, batchIO, result, remote, options, true)
-	a.start()
-	go a.readLoop()
-	return a, nil
+	io := udpio.New(conn, udpio.Options{GRO: true})
+	c := newConn(conn, io, result, remote, options, true)
+	c.start()
+	go c.recvLoop()
+	return c, nil
 }
 
 func exchangeHello(ctx context.Context, conn net.PacketConn, remote net.Addr, handshake *clientHandshake) (handshakeResult, error) {
@@ -295,25 +283,25 @@ func exchangeHello(ctx context.Context, conn net.PacketConn, remote net.Addr, ha
 	}
 }
 
-func (a *association) readLoop() {
+func (c *Conn) recvLoop() {
 	buffer := make([]byte, maxReceiveSize)
 	for {
-		packets, err := a.batchIO.ReadPackets([][]byte{buffer})
+		packets, err := c.io.ReadPackets([][]byte{buffer})
 		if err != nil {
-			if a.ctx.Err() != nil {
+			if c.ctx.Err() != nil {
 				return
 			}
 			if isClosed(err) {
-				a.shutdown(err, false)
+				c.shutdown(err, false)
 				return
 			}
 			continue
 		}
 		for _, packet := range packets {
 			packet.ForEach(func(datagram []byte) {
-				_ = a.handlePacket(datagram, packet.Addr)
+				_ = c.handlePacket(datagram, packet.Addr)
 			})
-			if a.ctx.Err() != nil {
+			if c.ctx.Err() != nil {
 				return
 			}
 		}

@@ -215,7 +215,7 @@ func TestTransferUnderLoss(t *testing.T) {
 		t.Run(testName(loss), func(t *testing.T) {
 			credential := NewCredential("password")
 			listenerConn := udpConn(t)
-			listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+			listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 			defer listener.Close()
 			link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: loss, lossReturn: loss})
 
@@ -261,10 +261,10 @@ func TestTransferUnderLoss(t *testing.T) {
 			if !bytes.Equal(read, payload) {
 				t.Fatal("the payload changed on the way")
 			}
-			serverAssociation := server.(*association)
-			serverAssociation.txMu.Lock()
-			inFlight := serverAssociation.tx.inFlight.len()
-			serverAssociation.txMu.Unlock()
+			serverAssociation := server
+			serverAssociation.sendMu.Lock()
+			inFlight := serverAssociation.send.inFlight.len()
+			serverAssociation.sendMu.Unlock()
 			if inFlight > 2*initialStreams {
 				t.Fatalf("%d packets in flight after the transfer", inFlight)
 			}
@@ -274,12 +274,12 @@ func TestTransferUnderLoss(t *testing.T) {
 
 func TestStreamOverALossyCapacityPath(t *testing.T) {
 	if testing.Short() {
-		t.Skip("a path with a capacity takes its time")
+		t.Skip("c path with c capacity takes its time")
 	}
 	const capacity = 12.5 * 1024 * 1024
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
 		loss:       0.05,
@@ -325,7 +325,7 @@ func TestStreamOverALossyCapacityPath(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 	if rate := float64(len(payload)) / elapsed.Seconds(); rate < capacity/8 {
-		t.Fatalf("%.2f MiB/s over a path of %.2f MiB/s", rate/1024/1024, capacity/1024/1024)
+		t.Fatalf("%.2f MiB/s over c path of %.2f MiB/s", rate/1024/1024, capacity/1024/1024)
 	}
 }
 
@@ -342,12 +342,12 @@ func testName(loss float64) string {
 
 func TestDownloadOverUplinkLoss(t *testing.T) {
 	if testing.Short() {
-		t.Skip("a path that loses most of one direction takes its time")
+		t.Skip("c path that loses most of one direction takes its time")
 	}
 	const payloadSize = 256 * 1024
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
 		loss:       0.4,
@@ -400,13 +400,13 @@ func TestDownloadOverUplinkLoss(t *testing.T) {
 
 func TestStreamOverABufferedPath(t *testing.T) {
 	if testing.Short() {
-		t.Skip("a path with a buffer takes its time")
+		t.Skip("c path with c buffer takes its time")
 	}
 	const capacity = 400 * 1024
 	const payloadSize = 2 * 1024 * 1024
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
 		loss:       0.006,
@@ -453,9 +453,9 @@ func TestStreamOverABufferedPath(t *testing.T) {
 	elapsed := time.Since(start)
 	rate := float64(len(payload)) / elapsed.Seconds()
 	if rate < capacity/2 {
-		t.Fatalf("%.2f KiB/s over a path of %d KiB/s", rate/1024, capacity/1024)
+		t.Fatalf("%.2f KiB/s over c path of %d KiB/s", rate/1024, capacity/1024)
 	}
-	serverAssociation := server.(*association)
+	serverAssociation := server
 	stats := testSnapshot(serverAssociation)
 	if stats.txPackets > 0 && stats.lostPackets*2 > stats.txPackets {
 		t.Fatalf("%d of %d packets declared lost", stats.lostPackets, stats.txPackets)

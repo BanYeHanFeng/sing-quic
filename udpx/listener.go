@@ -23,19 +23,19 @@ const (
 )
 
 type Listener struct {
-	conn        net.PacketConn
-	batchIO     udpio.Conn
+	socket      net.PacketConn
+	io          udpio.Conn
 	verifier    Verifier
 	options     Options
 	ctx         context.Context
 	cancel      context.CancelCauseFunc
-	accept      chan *association
+	accept      chan *Conn
 	handshaking chan struct{}
 
-	mu           sync.Mutex
-	associations map[connectionID]*association
-	hellos       map[connectionID]*helloAnswer
-	sweptAt      time.Time
+	mu      sync.Mutex
+	conns   map[connectionID]*Conn
+	hellos  map[connectionID]*helloAnswer
+	sweptAt time.Time
 
 	closeOnce sync.Once
 }
@@ -45,28 +45,28 @@ type helloAnswer struct {
 	at     time.Time
 }
 
-func ListenPacket(conn net.PacketConn, verifier Verifier, options Options) *Listener {
+func Listen(conn net.PacketConn, verifier Verifier, options Options) *Listener {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	l := &Listener{
-		conn:         conn,
-		batchIO:      udpio.New(conn, udpio.Options{GRO: true}),
-		verifier:     verifier,
-		options:      options.withDefaults(),
-		ctx:          ctx,
-		cancel:       cancel,
-		accept:       make(chan *association, acceptBacklog),
-		handshaking:  make(chan struct{}, maxConcurrentHandshakes),
-		associations: make(map[connectionID]*association),
-		hellos:       make(map[connectionID]*helloAnswer),
+		socket:      conn,
+		io:          udpio.New(conn, udpio.Options{GRO: true}),
+		verifier:    verifier,
+		options:     options.withDefaults(),
+		ctx:         ctx,
+		cancel:      cancel,
+		accept:      make(chan *Conn, acceptBacklog),
+		handshaking: make(chan struct{}, maxConcurrentHandshakes),
+		conns:       make(map[connectionID]*Conn),
+		hellos:      make(map[connectionID]*helloAnswer),
 	}
 	go l.readLoop()
 	return l
 }
 
-func (l *Listener) Accept(ctx context.Context) (Association, error) {
+func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
 	select {
-	case a := <-l.accept:
-		return a, nil
+	case c := <-l.accept:
+		return c, nil
 	case <-ctx.Done():
 		return nil, context.Cause(ctx)
 	case <-l.ctx.Done():
@@ -82,14 +82,14 @@ func (l *Listener) Close() error {
 func (l *Listener) shutdown(cause error) {
 	l.closeOnce.Do(func() {
 		l.cancel(cause)
-		_ = l.conn.SetReadDeadline(time.Now())
+		_ = l.socket.SetReadDeadline(time.Now())
 		l.mu.Lock()
-		associations := l.associations
-		l.associations = make(map[connectionID]*association)
+		conns := l.conns
+		l.conns = make(map[connectionID]*Conn)
 		l.hellos = make(map[connectionID]*helloAnswer)
 		l.mu.Unlock()
-		for _, a := range associations {
-			a.shutdown(cause, false)
+		for _, c := range conns {
+			c.shutdown(cause, false)
 		}
 	})
 }
@@ -97,7 +97,7 @@ func (l *Listener) shutdown(cause error) {
 func (l *Listener) readLoop() {
 	buffer := make([]byte, maxReceiveSize)
 	for {
-		packets, err := l.batchIO.ReadPackets([][]byte{buffer})
+		packets, err := l.io.ReadPackets([][]byte{buffer})
 		if err != nil {
 			if l.ctx.Err() != nil {
 				return
@@ -142,12 +142,12 @@ func (l *Listener) sweepHellos(now time.Time) {
 
 func (l *Listener) dispatch(packetHeader header, packet []byte, source net.Addr) {
 	l.mu.Lock()
-	a := l.associations[packetHeader.ConnectionID]
+	c := l.conns[packetHeader.ConnectionID]
 	l.mu.Unlock()
-	if a == nil {
+	if c == nil {
 		return
 	}
-	_ = a.handlePacket(packet, source)
+	_ = c.handlePacket(packet, source)
 }
 
 func (l *Listener) handleHello(clientConnID connectionID, hello []byte, source net.Addr) {
@@ -157,7 +157,7 @@ func (l *Listener) handleHello(clientConnID connectionID, hello []byte, source n
 	if loaded && now.Sub(answer.at) < helloLifetime {
 		l.mu.Unlock()
 		if answer.packet != nil {
-			_, _ = l.conn.WriteTo(answer.packet, source)
+			_, _ = l.socket.WriteTo(answer.packet, source)
 		}
 		return
 	}
@@ -195,20 +195,20 @@ func (l *Listener) completeHandshake(clientConnID connectionID, answer *helloAns
 		l.forgetHello(clientConnID, answer)
 		return
 	}
-	a := newAssociation(l.conn, l.batchIO, result, source, l.options, false)
-	a.onClose = func() {
-		l.remove(a.localConnID)
+	c := newConn(l.socket, l.io, result, source, l.options, false)
+	c.onClose = func() {
+		l.remove(c.localID)
 	}
-	a.start()
-	if !l.add(a) {
-		a.shutdown(net.ErrClosed, false)
+	c.start()
+	if !l.add(c) {
+		c.shutdown(net.ErrClosed, false)
 		l.forgetHello(clientConnID, answer)
 		return
 	}
 	serverHello := bytes.Clone(handshake.hello())
-	_, err = l.conn.WriteTo(serverHello, source)
+	_, err = l.socket.WriteTo(serverHello, source)
 	if err != nil {
-		a.shutdown(err, false)
+		c.shutdown(err, false)
 		l.forgetHello(clientConnID, answer)
 		return
 	}
@@ -219,13 +219,13 @@ func (l *Listener) completeHandshake(clientConnID connectionID, answer *helloAns
 	}
 	l.mu.Unlock()
 	select {
-	case l.accept <- a:
+	case l.accept <- c:
 	default:
-		a.shutdown(E.New("accept queue is full"), true)
+		c.shutdown(E.New("accept queue is full"), true)
 	}
 }
 
-func (l *Listener) add(a *association) bool {
+func (l *Listener) add(c *Conn) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	select {
@@ -233,17 +233,17 @@ func (l *Listener) add(a *association) bool {
 		return false
 	default:
 	}
-	if _, loaded := l.associations[a.localConnID]; loaded {
+	if _, loaded := l.conns[c.localID]; loaded {
 		return false
 	}
-	l.associations[a.localConnID] = a
+	l.conns[c.localID] = c
 	return true
 }
 
 func (l *Listener) remove(connID connectionID) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if a, loaded := l.associations[connID]; loaded && a.localConnID == connID {
-		delete(l.associations, connID)
+	if c, loaded := l.conns[connID]; loaded && c.localID == connID {
+		delete(l.conns, connID)
 	}
 }

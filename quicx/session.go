@@ -10,9 +10,9 @@ import (
 )
 
 type session struct {
-	context     context.Context
-	association udpx.Association
-	logger      logger.Logger
+	context context.Context
+	conn    *udpx.Conn
+	logger  logger.Logger
 
 	onUnknownChannel func(channel uint32, message udpMessage)
 
@@ -24,10 +24,10 @@ type session struct {
 	done        chan struct{}
 }
 
-func newSession(ctx context.Context, association udpx.Association, sessionLogger logger.Logger, onUnknownChannel func(channel uint32, message udpMessage)) *session {
+func newSession(ctx context.Context, conn *udpx.Conn, sessionLogger logger.Logger, onUnknownChannel func(channel uint32, message udpMessage)) *session {
 	return &session{
 		context:          ctx,
-		association:      association,
+		conn:             conn,
 		logger:           sessionLogger,
 		onUnknownChannel: onUnknownChannel,
 		channels:         make(map[uint32]*channelConn),
@@ -37,7 +37,7 @@ func newSession(ctx context.Context, association udpx.Association, sessionLogger
 
 func (s *session) run() {
 	for {
-		datagram, err := s.association.ReceiveDatagram(s.association.Context())
+		datagram, err := s.conn.ReceiveDatagram(s.conn.Context())
 		if err != nil {
 			s.closeWithError(err)
 			return
@@ -146,6 +146,6 @@ func (s *session) closeWithError(err error) {
 		for _, conn := range channels {
 			conn.closeWithError(err)
 		}
-		_ = s.association.CloseWithError(err)
+		_ = s.conn.CloseWithError(err)
 	})
 }

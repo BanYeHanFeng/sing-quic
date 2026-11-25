@@ -37,11 +37,11 @@ var (
 )
 
 type handshakeResult struct {
-	localConnID connectionID
-	peerConnID  connectionID
-	keyID       [keyIDLen]byte
-	send        packetCipher
-	recv        packetCipher
+	localID connectionID
+	peerID  connectionID
+	keyID   [keyIDLen]byte
+	send    packetCipher
+	recv    packetCipher
 }
 
 type clientHandshake struct {
@@ -126,11 +126,11 @@ func (h *clientHandshake) handleResponse(packet []byte) (handshakeResult, error)
 		return handshakeResult{}, err
 	}
 	return handshakeResult{
-		localConnID: h.connID,
-		peerConnID:  packetHeader.ConnectionID,
-		keyID:       h.keyID,
-		send:        send,
-		recv:        recv,
+		localID: h.connID,
+		peerID:  packetHeader.ConnectionID,
+		keyID:   h.keyID,
+		send:    send,
+		recv:    recv,
 	}, nil
 }
 
@@ -226,11 +226,11 @@ func (h *serverHandshake) keys() (handshakeResult, error) {
 		return handshakeResult{}, err
 	}
 	return handshakeResult{
-		localConnID: h.connID,
-		peerConnID:  h.clientConnID,
-		keyID:       h.keyID,
-		send:        send,
-		recv:        recv,
+		localID: h.connID,
+		peerID:  h.clientConnID,
+		keyID:   h.keyID,
+		send:    send,
+		recv:    recv,
 	}, nil
 }
 
@@ -253,7 +253,7 @@ func trafficKeys(sharedSecret, clientRandom, serverRandom, transcript []byte) (c
 	return clientToServer, serverToClient, nil
 }
 
-func directionalCiphers(clientToServer, serverToClient []byte, isClient bool) (send, recv packetCipher, err error) {
+func directionalCiphers(clientToServer, serverToClient []byte, initiator bool) (send, recv packetCipher, err error) {
 	toServer, err := newPacketCipher(clientToServer)
 	if err != nil {
 		return packetCipher{}, packetCipher{}, err
@@ -262,7 +262,7 @@ func directionalCiphers(clientToServer, serverToClient []byte, isClient bool) (s
 	if err != nil {
 		return packetCipher{}, packetCipher{}, err
 	}
-	if isClient {
+	if initiator {
 		return toServer, toClient, nil
 	}
 	return toClient, toServer, nil

@@ -113,7 +113,7 @@ func (s *Service[U]) lookupUser(keyID [8]byte) (U, bool) {
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
-	s.listener = udpx.ListenPacket(conn, s, s.transport)
+	s.listener = udpx.Listen(conn, s, s.transport)
 	go s.loopSessions()
 	return nil
 }
@@ -124,7 +124,7 @@ func (s *Service[U]) Close() error {
 
 func (s *Service[U]) loopSessions() {
 	for {
-		association, err := s.listener.Accept(s.ctx)
+		conn, err := s.listener.Accept(s.ctx)
 		if err != nil {
 			if E.IsClosedOrCanceled(err) {
 				s.logger.Debug(E.Cause(err, "listener closed"))
@@ -133,17 +133,17 @@ func (s *Service[U]) loopSessions() {
 			}
 			return
 		}
-		user, loaded := s.lookupUser(association.KeyID())
+		user, loaded := s.lookupUser(conn.KeyID())
 		if !loaded {
-			_ = association.CloseWithError(net.ErrClosed)
+			_ = conn.CloseWithError(net.ErrClosed)
 			continue
 		}
 		current := &serverSession[U]{
 			Service:    s,
-			requestCtx: auth.ContextWithUser(association.Context(), user),
+			requestCtx: auth.ContextWithUser(conn.Context(), user),
 		}
-		current.session = newSession(current.requestCtx, association, s.logger, current.onUnknownChannel)
-		current.source = M.SocksaddrFromNet(association.RemoteAddr())
+		current.session = newSession(current.requestCtx, conn, s.logger, current.onUnknownChannel)
+		current.source = M.SocksaddrFromNet(conn.RemoteAddr())
 		go current.run()
 	}
 }
@@ -158,7 +158,7 @@ type serverSession[U comparable] struct {
 func (s *serverSession[U]) run() {
 	go s.loopStreams()
 	s.session.run()
-	cause := context.Cause(s.session.association.Context())
+	cause := context.Cause(s.session.conn.Context())
 	if udpx.IsNormalClose(cause) {
 		s.logger.Debug("session from ", s.source, " closed: ", cause)
 	} else {
@@ -168,7 +168,7 @@ func (s *serverSession[U]) run() {
 
 func (s *serverSession[U]) loopStreams() {
 	for {
-		stream, err := s.session.association.AcceptStream(s.session.association.Context())
+		stream, err := s.session.conn.AcceptStream(s.session.conn.Context())
 		if err != nil {
 			return
 		}

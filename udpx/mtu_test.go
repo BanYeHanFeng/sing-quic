@@ -37,7 +37,7 @@ func TestMTUFixed(t *testing.T) {
 	var state mtuState
 	state.init(1280, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if _, loaded := state.next(1200); loaded {
-		t.Fatal("a fixed mtu was probed")
+		t.Fatal("c fixed mtu was probed")
 	}
 }
 
@@ -54,27 +54,27 @@ func TestMTUProbeRaisesTheSize(t *testing.T) {
 	client, server, _ := testSetup(t, Options{}, Options{})
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if client.(*association).mtuSize() == mtuIPv4 {
+		if client.mtuSize() == mtuIPv4 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if size := client.(*association).mtuSize(); size != mtuIPv4 {
+	if size := client.mtuSize(); size != mtuIPv4 {
 		t.Fatalf("the client settled on %d", size)
 	}
-	if size := server.(*association).mtuSize(); size != mtuIPv4 {
+	if size := server.mtuSize(); size != mtuIPv4 {
 		t.Fatalf("the server settled on %d", size)
 	}
 }
 
 func TestMTUProbeIsSentAlone(t *testing.T) {
 	client, _, _ := testSetup(t, Options{MTU: 0}, Options{})
-	a := client.(*association)
+	c := client
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		a.txMu.Lock()
-		probing := a.tx.mtu.active || len(a.tx.mtu.candidates) > 0
-		a.txMu.Unlock()
+		c.sendMu.Lock()
+		probing := c.send.mtu.active || len(c.send.mtu.candidates) > 0
+		c.sendMu.Unlock()
 		if !probing {
 			return
 		}

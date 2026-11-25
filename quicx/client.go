@@ -114,14 +114,14 @@ func (c *Client) dialSession(generation uint64) (*session, error) {
 		return nil, err
 	}
 	remote := udpConn.RemoteAddr()
-	association, err := udpx.Dial(c.ctx, bindPacketConn(udpConn), remote, c.credential, c.transport)
+	conn, err := udpx.Dial(c.ctx, bindPacketConn(udpConn), remote, c.credential, c.transport)
 	if err != nil {
 		_ = udpConn.Close()
 		c.logger.Error("QUICX dial failed: stage=handshake server=", c.serverAddr, " remote=", remote, " elapsed=", dialElapsed(dialStart), " error=", err)
 		return nil, E.Cause(err, "open session")
 	}
 	c.logger.Debug("QUICX dial: stage=handshake server=", c.serverAddr, " remote=", remote, " elapsed=", dialElapsed(dialStart))
-	current := newSession(c.ctx, association, c.logger, nil)
+	current := newSession(c.ctx, conn, c.logger, nil)
 	c.access.Lock()
 	closed := c.closed
 	stale := closed || c.generation != generation
@@ -144,8 +144,8 @@ func (c *Client) dialSession(generation uint64) (*session, error) {
 
 func (c *Client) watchSession(current *session, udpConn net.Conn, dialStart time.Time) {
 	go current.run()
-	<-current.association.Context().Done()
-	cause := context.Cause(current.association.Context())
+	<-current.conn.Context().Done()
+	cause := context.Cause(current.conn.Context())
 	current.closeWithError(cause)
 	_ = udpConn.Close()
 	c.access.Lock()
@@ -169,7 +169,7 @@ func (c *Client) DialConn(ctx context.Context, destination M.Socksaddr) (net.Con
 	if err != nil {
 		return nil, err
 	}
-	stream, err := current.association.OpenStream(ctx)
+	stream, err := current.conn.OpenStream(ctx)
 	if err != nil {
 		return nil, E.Cause(err, "open stream")
 	}

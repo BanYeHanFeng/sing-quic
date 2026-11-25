@@ -57,7 +57,7 @@ func TestStreamHalfClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err = stream.Write([]byte("more")); err == nil {
-		t.Fatal("a closed write side accepted data")
+		t.Fatal("c closed write side accepted data")
 	}
 	accepted, err := server.AcceptStream(ctx)
 	if err != nil {
@@ -204,7 +204,7 @@ func TestStreamEndsWithAssociation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err = accepted.Read(make([]byte, 1)); err == nil {
-		t.Fatal("a stream of an ended association still reads")
+		t.Fatal("c stream of an ended conn still reads")
 	}
 	select {
 	case <-stream.Context().Done():
@@ -212,12 +212,12 @@ func TestStreamEndsWithAssociation(t *testing.T) {
 		t.Fatal("the client did not notice that the peer closed")
 	}
 	if _, err = stream.Write([]byte("more")); err == nil {
-		t.Fatal("a stream of an ended association still writes")
+		t.Fatal("c stream of an ended conn still writes")
 	}
 }
 
 func (s *Stream) Context() context.Context {
-	return s.association.Context()
+	return s.conn.Context()
 }
 
 func TestStreamResetByClose(t *testing.T) {
@@ -242,11 +242,10 @@ func TestStreamResetByClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(50 * time.Millisecond)
-	var reset StreamResetError
-	if _, err = accepted.Read(make([]byte, 1)); err != io.EOF && !errors.As(err, &reset) {
+	if _, err = accepted.Read(make([]byte, 1)); err != io.EOF && !errors.Is(err, ErrStreamReset) {
 		t.Fatalf("the peer's read ended with %v", err)
 	}
-	if _, err = accepted.Write([]byte("x")); !errors.As(err, &reset) && !errors.Is(err, net.ErrClosed) {
+	if _, err = accepted.Write([]byte("x")); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("the peer's write ended with %v", err)
 	}
 }
@@ -269,7 +268,6 @@ func TestStreamCloseDeliversWhatWasWritten(t *testing.T) {
 	if err = stream.Close(); err != nil {
 		t.Fatal(err)
 	}
-	var reset StreamResetError
 	buffer := make([]byte, 4096)
 	read := make([]byte, 0, len(payload))
 	for {
@@ -278,7 +276,7 @@ func TestStreamCloseDeliversWhatWasWritten(t *testing.T) {
 		if readErr == nil {
 			continue
 		}
-		if readErr != io.EOF && !errors.As(readErr, &reset) {
+		if readErr != io.EOF && !errors.Is(readErr, ErrStreamReset) {
 			t.Fatalf("the peer's read ended with %v", readErr)
 		}
 		break
@@ -383,7 +381,7 @@ func TestStreamSlotIsHeldUntilAccepted(t *testing.T) {
 	_ = accepted.Close()
 	late, err := client.OpenStream(ctx)
 	if err != nil {
-		t.Fatalf("the peer never gave a slot back: %v", err)
+		t.Fatalf("the peer never gave c slot back: %v", err)
 	}
 	_ = late.Close()
 }

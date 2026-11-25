@@ -124,16 +124,16 @@ func (d *datagramDefragger) remove(key datagramKey) {
 	delete(d.entries, key)
 }
 
-func (a *association) SendDatagram(channel uint32, data []byte) error {
+func (c *Conn) SendDatagram(channel uint32, data []byte) error {
 	select {
-	case <-a.ctx.Done():
-		return context.Cause(a.ctx)
+	case <-c.ctx.Done():
+		return context.Cause(c.ctx)
 	default:
 	}
 	if len(data) > maxDatagramSize {
 		return E.New("datagram of ", len(data), " bytes is larger than ", maxDatagramSize)
 	}
-	fragmentLen := int(a.maxPayload.Load()) - datagramHeaderLen
+	fragmentLen := int(c.maxPayload.Load()) - datagramHeaderLen
 	fragmentCount := (len(data) + fragmentLen - 1) / fragmentLen
 	if fragmentCount == 0 {
 		fragmentCount = 1
@@ -141,34 +141,34 @@ func (a *association) SendDatagram(channel uint32, data []byte) error {
 	if fragmentCount > maxDatagramFragments {
 		return E.New("datagram of ", len(data), " bytes does not fit in ", maxDatagramFragments, " fragments")
 	}
-	message := uint16(a.datagramMessage.Add(1))
+	message := uint16(c.datagramMessage.Add(1))
 	for index := range fragmentCount {
 		start := index * fragmentLen
 		end := min(start+fragmentLen, len(data))
 		payload := appendDatagramHeader(nil, channel, message, uint8(index), uint8(fragmentCount), end-start)
 		payload = append(payload, data[start:end]...)
-		a.queueControl(payload, true)
+		c.queueControl(payload, true)
 	}
 	return nil
 }
 
-func (a *association) ReceiveDatagram(ctx context.Context) (Datagram, error) {
+func (c *Conn) ReceiveDatagram(ctx context.Context) (Datagram, error) {
 	select {
-	case datagram := <-a.datagrams:
+	case datagram := <-c.datagrams:
 		return datagram, nil
 	case <-ctx.Done():
 		return Datagram{}, context.Cause(ctx)
-	case <-a.ctx.Done():
-		return Datagram{}, context.Cause(a.ctx)
+	case <-c.ctx.Done():
+		return Datagram{}, context.Cause(c.ctx)
 	}
 }
 
-func (a *association) handleDatagram(body []byte) error {
+func (c *Conn) handleDatagram(body []byte) error {
 	if len(body) < 8 {
 		return errShortFrame
 	}
 	data := parseDatagram(body)
-	message, complete, err := a.defragger.feed(data, time.Now())
+	message, complete, err := c.defragger.feed(data, time.Now())
 	if err != nil {
 		return err
 	}
@@ -176,9 +176,9 @@ func (a *association) handleDatagram(body []byte) error {
 		return nil
 	}
 	select {
-	case a.datagrams <- Datagram{Channel: data.channel, Data: message}:
+	case c.datagrams <- Datagram{Channel: data.channel, Data: message}:
 	default:
-		a.stats.droppedDatagrams.Add(1)
+		c.stats.droppedDatagrams.Add(1)
 	}
 	return nil
 }

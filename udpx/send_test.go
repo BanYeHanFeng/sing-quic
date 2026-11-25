@@ -62,7 +62,7 @@ func TestInFlightKeepsUnacknowledged(t *testing.T) {
 	var flight inFlight
 	flight.append(testSentPacket(5, 100))
 	if lost := flight.lost(time.Now(), 4, time.Millisecond, false); lost != nil {
-		t.Fatal("a packet was declared lost without evidence")
+		t.Fatal("c packet was declared lost without evidence")
 	}
 }
 
@@ -102,7 +102,7 @@ func TestTakePrefixWithoutDataTakesOnlyAcknowledgements(t *testing.T) {
 		t.Fatal("data was taken while the congestion window was closed")
 	}
 	if len(queue) != 1 {
-		t.Fatal("the queue lost a frame")
+		t.Fatal("the queue lost c frame")
 	}
 }
 
@@ -111,19 +111,19 @@ func maxPayload() int {
 }
 
 func TestSplitHeadCutsAnOversizedFrame(t *testing.T) {
-	a, _, _ := testSetup(t, Options{MTU: mtuIPv4}, Options{MTU: mtuIPv4})
-	association := a.(*association)
-	stream := newStream(association, 1, initialStreamWindow)
+	c, _, _ := testSetup(t, Options{MTU: mtuIPv4}, Options{MTU: mtuIPv4})
+	conn := c
+	stream := newStream(conn, 1, initialStreamWindow)
 	data := testPayload(1000)
 	frame := newStreamFrame(stream, 0, true, data)
-	tx := &txState{association: association}
-	tx.queue = []outFrame{frame}
-	tx.splitHead(streamHeaderLen + 400)
-	if len(tx.queue) != 2 {
-		t.Fatalf("%d frames after the split", len(tx.queue))
+	send := &sender{conn: conn}
+	send.queue = []outFrame{frame}
+	send.splitHead(streamHeaderLen + 400)
+	if len(send.queue) != 2 {
+		t.Fatalf("%d frames after the split", len(send.queue))
 	}
-	first := parseStreamFrame(tx.queue[0].payload[0], tx.queue[0].payload[frameHeaderLen:])
-	second := parseStreamFrame(tx.queue[1].payload[0], tx.queue[1].payload[frameHeaderLen:])
+	first := parseStreamFrame(send.queue[0].payload[0], send.queue[0].payload[frameHeaderLen:])
+	second := parseStreamFrame(send.queue[1].payload[0], send.queue[1].payload[frameHeaderLen:])
 	if len(first.data) != 400 || first.fin {
 		t.Fatalf("the first half has %d bytes and fin=%v", len(first.data), first.fin)
 	}
@@ -137,21 +137,21 @@ func TestSplitHeadCutsAnOversizedFrame(t *testing.T) {
 	if string(combined) != string(data) {
 		t.Fatal("the halves do not add up")
 	}
-	releaseFrames(tx.queue)
+	releaseFrames(send.queue)
 }
 
 func TestSplitHeadLeavesFittingFramesAlone(t *testing.T) {
-	a, _, _ := testSetup(t, Options{MTU: mtuIPv4}, Options{MTU: mtuIPv4})
-	association := a.(*association)
-	stream := newStream(association, 1, initialStreamWindow)
+	c, _, _ := testSetup(t, Options{MTU: mtuIPv4}, Options{MTU: mtuIPv4})
+	conn := c
+	stream := newStream(conn, 1, initialStreamWindow)
 	frame := newStreamFrame(stream, 0, false, testPayload(10))
-	tx := &txState{association: association}
-	tx.queue = []outFrame{frame}
-	tx.splitHead(streamHeaderLen + 100)
-	if len(tx.queue) != 1 {
-		t.Fatalf("%d frames", len(tx.queue))
+	send := &sender{conn: conn}
+	send.queue = []outFrame{frame}
+	send.splitHead(streamHeaderLen + 100)
+	if len(send.queue) != 1 {
+		t.Fatalf("%d frames", len(send.queue))
 	}
-	releaseFrames(tx.queue)
+	releaseFrames(send.queue)
 }
 
 func TestRetransmittable(t *testing.T) {

@@ -32,9 +32,9 @@ type statsSnapshot struct {
 	cwnd         int64
 }
 
-func (a *association) logStats(snapshot *statsSnapshot) {
-	a.logger.Debug(a.logPrefix(),
-		"1s tx=", snapshot.txPackets, "pkt/", snapshot.txBytes, "B",
+func (c *Conn) logStats(snapshot *statsSnapshot) {
+	c.logger.Debug(c.logPrefix(),
+		"1s send=", snapshot.txPackets, "pkt/", snapshot.txBytes, "B",
 		" rx=", snapshot.rxPackets, "pkt/", snapshot.rxBytes, "B",
 		" lost=", snapshot.lostPackets,
 		" retx=", snapshot.retransmits,
@@ -45,32 +45,32 @@ func (a *association) logStats(snapshot *statsSnapshot) {
 		" cwnd=", snapshot.cwnd)
 }
 
-func (a *association) logPrefix() string {
-	return "udpx[" + a.logTag + "]: "
+func (c *Conn) logPrefix() string {
+	return "udpx[" + c.logTag + "]: "
 }
 
-func (a *association) logInfo(args ...any) {
-	a.logger.Info(append([]any{a.logPrefix()}, args...)...)
+func (c *Conn) logInfo(args ...any) {
+	c.logger.Info(append([]any{c.logPrefix()}, args...)...)
 }
 
-func logTagFor(localConnID connectionID) string {
-	return hex.EncodeToString(localConnID[:2])
+func logTagFor(localID connectionID) string {
+	return hex.EncodeToString(localID[:2])
 }
 
-func (t *txState) snapshotIfDue(now time.Time) *statsSnapshot {
+func (t *sender) snapshotIfDue(now time.Time) *statsSnapshot {
 	if now.Before(t.statsAt) {
 		return nil
 	}
 	t.statsAt = now.Add(time.Second)
 	current := statsSnapshot{
-		txPackets:    t.association.stats.sentPackets.Load(),
-		txBytes:      t.association.stats.sentBytes.Load(),
-		rxPackets:    t.association.stats.recvPackets.Load(),
-		rxBytes:      t.association.stats.recvBytes.Load(),
-		lostPackets:  t.association.stats.lostPackets.Load(),
-		retransmits:  t.association.stats.retransmits.Load(),
-		probes:       t.association.stats.probes.Load(),
-		dropped:      t.association.stats.droppedDatagrams.Load(),
+		txPackets:    t.conn.stats.sentPackets.Load(),
+		txBytes:      t.conn.stats.sentBytes.Load(),
+		rxPackets:    t.conn.stats.recvPackets.Load(),
+		rxBytes:      t.conn.stats.recvBytes.Load(),
+		lostPackets:  t.conn.stats.lostPackets.Load(),
+		retransmits:  t.conn.stats.retransmits.Load(),
+		probes:       t.conn.stats.probes.Load(),
+		dropped:      t.conn.stats.droppedDatagrams.Load(),
 		inFlight:     t.inFlight.len(),
 		inFlightSize: int(t.inFlight.bytes),
 		queued:       len(t.queue),
@@ -98,16 +98,16 @@ func (t *txState) snapshotIfDue(now time.Time) *statsSnapshot {
 	return &delta
 }
 
-func (t *txState) snapshot() *statsSnapshot {
+func (t *sender) snapshot() *statsSnapshot {
 	current := statsSnapshot{
-		txPackets:    t.association.stats.sentPackets.Load(),
-		txBytes:      t.association.stats.sentBytes.Load(),
-		rxPackets:    t.association.stats.recvPackets.Load(),
-		rxBytes:      t.association.stats.recvBytes.Load(),
-		lostPackets:  t.association.stats.lostPackets.Load(),
-		retransmits:  t.association.stats.retransmits.Load(),
-		probes:       t.association.stats.probes.Load(),
-		dropped:      t.association.stats.droppedDatagrams.Load(),
+		txPackets:    t.conn.stats.sentPackets.Load(),
+		txBytes:      t.conn.stats.sentBytes.Load(),
+		rxPackets:    t.conn.stats.recvPackets.Load(),
+		rxBytes:      t.conn.stats.recvBytes.Load(),
+		lostPackets:  t.conn.stats.lostPackets.Load(),
+		retransmits:  t.conn.stats.retransmits.Load(),
+		probes:       t.conn.stats.probes.Load(),
+		dropped:      t.conn.stats.droppedDatagrams.Load(),
 		inFlight:     t.inFlight.len(),
 		inFlightSize: int(t.inFlight.bytes),
 		queued:       len(t.queue),

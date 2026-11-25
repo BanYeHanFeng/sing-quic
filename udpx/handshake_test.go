@@ -14,17 +14,17 @@ func TestCredential(t *testing.T) {
 	credential := NewCredential("password")
 	other := NewCredential("password ")
 	if credential.KeyID() == other.KeyID() {
-		t.Fatal("two passwords share a key id")
+		t.Fatal("two passwords share c key id")
 	}
 	signature := credential.Sign([]byte("transcript"))
 	if !credential.Verify([]byte("transcript"), signature) {
-		t.Fatal("a signature did not verify")
+		t.Fatal("c signature did not verify")
 	}
 	if credential.Verify([]byte("transcript "), signature) {
-		t.Fatal("a signature verified another transcript")
+		t.Fatal("c signature verified another transcript")
 	}
 	if credential.Verify([]byte("transcript"), []byte("forged")) {
-		t.Fatal("a forged signature verified")
+		t.Fatal("c forged signature verified")
 	}
 	if again := NewCredential("password"); again.KeyID() != credential.KeyID() {
 		t.Fatal("key id is not deterministic")
@@ -51,11 +51,11 @@ func exchange(t *testing.T, clientCredential Credential, verifier Verifier) (han
 		t.Fatal(err)
 	}
 	return handshakeResult{
-		localConnID: clientResult.localConnID,
-		peerConnID:  clientResult.peerConnID,
-		keyID:       clientResult.keyID,
-		send:        clientResult.send,
-		recv:        serverResult.send,
+		localID: clientResult.localID,
+		peerID:  clientResult.peerID,
+		keyID:   clientResult.keyID,
+		send:    clientResult.send,
+		recv:    serverResult.send,
 	}, nil
 }
 
@@ -68,7 +68,7 @@ func TestHandshake(t *testing.T) {
 	if result.keyID != credential.KeyID() {
 		t.Fatal("the key id changed")
 	}
-	if result.peerConnID == (connectionID{}) || result.localConnID == (connectionID{}) {
+	if result.peerID == (connectionID{}) || result.localID == (connectionID{}) {
 		t.Fatal("the handshake produced no connection ids")
 	}
 }
@@ -89,7 +89,7 @@ func TestHandshakeTamperedHello(t *testing.T) {
 	hello := bytes.Clone(handshake.hello())
 	hello[headerLen+3+keyIDLen+randomLen] ^= 0xff
 	if _, err = newServerHandshake(hello, testVerifier{credential: credential}); err == nil {
-		t.Fatal("a tampered hello was accepted")
+		t.Fatal("c tampered hello was accepted")
 	}
 }
 
@@ -106,7 +106,7 @@ func TestHandshakeTamperedAnswer(t *testing.T) {
 	answer := bytes.Clone(server.hello())
 	answer[headerLen+3+randomLen] ^= 0xff
 	if _, err = handshake.handleResponse(answer); err == nil {
-		t.Fatal("a tampered answer was accepted")
+		t.Fatal("c tampered answer was accepted")
 	}
 }
 
@@ -120,7 +120,7 @@ func TestHandshakeVersion(t *testing.T) {
 	hello[headerLen+1] = 0xff
 	_, err = newServerHandshake(hello, testVerifier{credential: credential})
 	if !errors.Is(err, errUnsupportedVersion) {
-		t.Fatalf("a hello of another version ended with %v", err)
+		t.Fatalf("c hello of another version ended with %v", err)
 	}
 }
 
@@ -133,7 +133,7 @@ func TestHandshakePacketType(t *testing.T) {
 	hello := bytes.Clone(handshake.hello())
 	hello[connectionIDLen] = packetTypeData
 	if _, err = newServerHandshake(hello, testVerifier{credential: credential}); err == nil {
-		t.Fatal("a data packet was taken for a hello")
+		t.Fatal("c data packet was taken for c hello")
 	}
 }
 
@@ -147,10 +147,10 @@ func TestKeyIDIsNotThePassword(t *testing.T) {
 
 func TestHandshakeOverSocket(t *testing.T) {
 	client, server, listener := testSetup(t, Options{}, Options{})
-	if client.RemoteAddr().String() != listener.conn.LocalAddr().String() {
+	if client.RemoteAddr().String() != listener.socket.LocalAddr().String() {
 		t.Fatalf("client peer is %v", client.RemoteAddr())
 	}
-	if server.LocalAddr().String() != listener.conn.LocalAddr().String() {
+	if server.LocalAddr().String() != listener.socket.LocalAddr().String() {
 		t.Fatalf("server local address is %v", server.LocalAddr())
 	}
 	if client.LocalAddr().String() != server.RemoteAddr().String() {
@@ -174,7 +174,7 @@ func TestHandshakeOverSocket(t *testing.T) {
 func TestWrongPasswordOverSocket(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	ctx := testContext(t, 2*time.Second)
 	_, err := Dial(ctx, udpConn(t), listenerConn.LocalAddr(), NewCredential("other"), Options{MTU: mtuIPv4})
@@ -186,7 +186,7 @@ func TestWrongPasswordOverSocket(t *testing.T) {
 func TestUnknownConnectionID(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	client := udpConn(t)
 	packet := header{ConnectionID: connectionID{1, 2, 3, 4, 5, 6, 7, 8}, Type: packetTypeData, PacketNumber: 1}.appendTo(nil)
@@ -197,7 +197,7 @@ func TestUnknownConnectionID(t *testing.T) {
 	}
 	select {
 	case <-listener.ctx.Done():
-		t.Fatal("the listener ended on a stray packet")
+		t.Fatal("the listener ended on c stray packet")
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -229,7 +229,7 @@ func TestKeepAlive(t *testing.T) {
 func TestRepeatedHelloIsOneAssociation(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	handshake, err := newClientHandshake(credential)
 	if err != nil {
@@ -260,14 +260,14 @@ func TestRepeatedHelloIsOneAssociation(t *testing.T) {
 	if answers == 0 {
 		t.Fatal("not one answer arrived")
 	}
-	association, err := listener.Accept(ctx)
+	conn, err := listener.Accept(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = association.CloseWithError(nil)
+	_ = conn.CloseWithError(nil)
 	select {
 	case extra := <-listener.accept:
-		t.Fatalf("a repeated hello created another association: %v", extra)
+		t.Fatalf("c repeated hello created another conn: %v", extra)
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -275,10 +275,10 @@ func TestRepeatedHelloIsOneAssociation(t *testing.T) {
 func TestDemux(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	ctx := testContext(t, 5*time.Second)
-	var clients []Association
+	var clients []*Conn
 	for range 2 {
 		client, err := Dial(ctx, udpConn(t), listenerConn.LocalAddr(), credential, Options{MTU: mtuIPv4})
 		if err != nil {
@@ -287,7 +287,7 @@ func TestDemux(t *testing.T) {
 		defer client.CloseWithError(nil)
 		clients = append(clients, client)
 	}
-	servers := make([]Association, 0, len(clients))
+	servers := make([]*Conn, 0, len(clients))
 	for range clients {
 		server, err := listener.Accept(ctx)
 		if err != nil {
@@ -300,7 +300,7 @@ func TestDemux(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		marker := []byte{byte('a' + index)}
+		marker := []byte{byte('c' + index)}
 		if _, err = stream.Write(marker); err != nil {
 			t.Fatal(err)
 		}
@@ -314,7 +314,7 @@ func TestDemux(t *testing.T) {
 			t.Fatal(err)
 		}
 		read := readAll(t, stream, 1)
-		if !bytes.Equal(read, []byte{byte('a' + index)}) {
+		if !bytes.Equal(read, []byte{byte('c' + index)}) {
 			t.Fatalf("server %d read %q", index, read)
 		}
 	}
@@ -323,7 +323,7 @@ func TestDemux(t *testing.T) {
 func TestPacketTamperedOnTheWire(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	tamper := udpConn(t)
 	client, err := Dial(testContext(t, 5*time.Second), tamper, listenerConn.LocalAddr(), credential, Options{MTU: mtuIPv4})
@@ -349,7 +349,7 @@ func TestPacketTamperedOnTheWire(t *testing.T) {
 	}
 	select {
 	case <-server.Context().Done():
-		t.Fatal("a tampered packet ended the association")
+		t.Fatal("c tampered packet ended the conn")
 	case <-time.After(100 * time.Millisecond):
 	}
 	if _, err = stream.Write([]byte("still here")); err != nil {

@@ -31,7 +31,7 @@ func waitDone(t *testing.T, ctx context.Context, timeout time.Duration) {
 	select {
 	case <-ctx.Done():
 	case <-time.After(timeout):
-		t.Fatal("association did not end")
+		t.Fatal("conn did not end")
 	}
 }
 
@@ -46,7 +46,7 @@ func (v testVerifier) Lookup(keyID [keyIDLen]byte) (Credential, bool) {
 	return v.credential, true
 }
 
-func testSetup(t *testing.T, clientOptions, serverOptions Options) (Association, Association, *Listener) {
+func testSetup(t *testing.T, clientOptions, serverOptions Options) (*Conn, *Conn, *Listener) {
 	t.Helper()
 	if clientOptions.MTU == 0 {
 		clientOptions.MTU = mtuIPv4
@@ -56,7 +56,7 @@ func testSetup(t *testing.T, clientOptions, serverOptions Options) (Association,
 	}
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := ListenPacket(listenerConn, testVerifier{credential: credential}, serverOptions)
+	listener := Listen(listenerConn, testVerifier{credential: credential}, serverOptions)
 	t.Cleanup(func() {
 		_ = listener.Close()
 	})
@@ -74,10 +74,10 @@ func testSetup(t *testing.T, clientOptions, serverOptions Options) (Association,
 	return client, server, listener
 }
 
-func testSnapshot(a *association) statsSnapshot {
-	a.txMu.Lock()
-	defer a.txMu.Unlock()
-	return *a.tx.snapshot()
+func testSnapshot(c *Conn) statsSnapshot {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	return *c.send.snapshot()
 }
 
 func testPayload(size int) []byte {

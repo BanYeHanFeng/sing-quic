@@ -6,36 +6,36 @@ import (
 	"time"
 )
 
-func (a *association) rxDone(packetNumber uint32, ackEliciting bool, now time.Time) {
-	a.txMu.Lock()
-	a.tx.rxPacket(packetNumber, ackEliciting, now)
-	a.txMu.Unlock()
-	a.wake()
+func (c *Conn) rxDone(packetNumber uint32, ackEliciting bool, now time.Time) {
+	c.sendMu.Lock()
+	c.send.rxPacket(packetNumber, ackEliciting, now)
+	c.sendMu.Unlock()
+	c.wake()
 }
 
-func (a *association) handlePacket(packet []byte, source net.Addr) error {
+func (c *Conn) handlePacket(packet []byte, source net.Addr) error {
 	packetHeader, err := parseHeader(packet)
 	if err != nil {
 		return err
 	}
-	a.stats.recvPackets.Add(1)
-	a.stats.recvBytes.Add(int64(len(packet)))
-	if packetHeader.ConnectionID != a.localConnID {
+	c.stats.recvPackets.Add(1)
+	c.stats.recvBytes.Add(int64(len(packet)))
+	if packetHeader.ConnectionID != c.localID {
 		return errAuthentication
 	}
-	_, payload, err := a.recvCipher.open(packet)
+	_, payload, err := c.recvCipher.open(packet)
 	if err != nil {
 		return err
 	}
-	a.peerAddr.Store(&source)
-	err = a.handlePayload(packetHeader.PacketNumber, payload, time.Now())
+	c.peerAddr.Store(&source)
+	err = c.handlePayload(packetHeader.PacketNumber, payload, time.Now())
 	if err != nil {
-		a.shutdown(err, true)
+		c.shutdown(err, true)
 	}
 	return err
 }
 
-func (a *association) handlePayload(packetNumber uint32, payload []byte, now time.Time) error {
+func (c *Conn) handlePayload(packetNumber uint32, payload []byte, now time.Time) error {
 	ackEliciting := false
 	for len(payload) > 0 {
 		if len(payload) < frameHeaderLen {
@@ -58,33 +58,33 @@ func (a *association) handlePayload(packetNumber uint32, payload []byte, now tim
 			if len(body) > 0 {
 				code = closeCode(body[0])
 			}
-			a.rxDone(packetNumber, ackEliciting, now)
-			a.shutdown(code.err(), false)
+			c.rxDone(packetNumber, ackEliciting, now)
+			c.shutdown(code.err(), false)
 			return nil
 		case frameTypeAck:
-			err = a.handleAck(body, now)
+			err = c.handleAck(body, now)
 		case frameTypeStream:
 			ackEliciting = true
-			err = a.handleStreamFrame(frameType, body)
+			err = c.handleStreamFrame(frameType, body)
 		case frameTypeMaxData:
 			ackEliciting = true
-			err = a.handleMaxData(body)
+			err = c.handleMaxData(body)
 		case frameTypeMaxStreamData:
 			ackEliciting = true
-			err = a.handleMaxStreamData(body)
+			err = c.handleMaxStreamData(body)
 		case frameTypeResetStream:
 			ackEliciting = true
-			err = a.handleResetStream(body)
+			err = c.handleResetStream(body)
 		case frameTypeDatagram:
 			ackEliciting = true
-			err = a.handleDatagram(body)
+			err = c.handleDatagram(body)
 		case frameTypeMaxStreams:
 			ackEliciting = true
 			if len(body) < 4 {
 				err = errShortFrame
 				break
 			}
-			a.handleMaxStreams(binary.BigEndian.Uint32(body))
+			c.handleMaxStreams(binary.BigEndian.Uint32(body))
 		default:
 			return errUnknownFrame
 		}
@@ -92,18 +92,18 @@ func (a *association) handlePayload(packetNumber uint32, payload []byte, now tim
 			return err
 		}
 	}
-	a.rxDone(packetNumber, ackEliciting, now)
+	c.rxDone(packetNumber, ackEliciting, now)
 	return nil
 }
 
-func (a *association) handleAck(body []byte, now time.Time) error {
+func (c *Conn) handleAck(body []byte, now time.Time) error {
 	acknowledgement, err := parseAckFrame(body)
 	if err != nil {
 		return err
 	}
-	a.txMu.Lock()
-	a.tx.handleAck(acknowledgement, now)
-	a.txMu.Unlock()
-	a.wake()
+	c.sendMu.Lock()
+	c.send.handleAck(acknowledgement, now)
+	c.sendMu.Unlock()
+	c.wake()
 	return nil
 }

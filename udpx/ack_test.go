@@ -74,16 +74,16 @@ func TestAckSchedulerImmediateOnReorder(t *testing.T) {
 }
 
 func TestAckDelayFollowsRTT(t *testing.T) {
-	tx := &txState{}
-	if delay := tx.ackDelay(); delay != maxAckDelay {
+	s := &sender{}
+	if delay := s.ackDelay(); delay != maxAckDelay {
 		t.Fatalf("%v before a sample", delay)
 	}
-	tx.rtt.sample(400 * time.Millisecond)
-	if delay := tx.ackDelay(); delay != 50*time.Millisecond && delay != maxAckDelay {
+	s.rtt.sample(400 * time.Millisecond)
+	if delay := s.ackDelay(); delay != 50*time.Millisecond && delay != maxAckDelay {
 		t.Fatalf("%v at 400ms", delay)
 	}
-	tx.rtt.sample(8 * time.Millisecond)
-	if delay := tx.ackDelay(); delay < minAckDelay || delay > maxAckDelay {
+	s.rtt.sample(8 * time.Millisecond)
+	if delay := s.ackDelay(); delay < minAckDelay || delay > maxAckDelay {
 		t.Fatalf("%v at 8ms", delay)
 	}
 }

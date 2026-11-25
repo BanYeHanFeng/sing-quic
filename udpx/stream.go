@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,21 +17,21 @@ import (
 
 const streamInitiatorBit = 0x01
 
-type StreamResetError struct {
-	Code uint8
+var ErrStreamReset error = streamResetError{}
+
+type streamResetError struct{}
+
+func (streamResetError) Error() string {
+	return "udpx: stream reset by the peer"
 }
 
-func (e StreamResetError) Error() string {
-	return "udpx: stream reset with code " + strconv.Itoa(int(e.Code))
-}
-
-func (e StreamResetError) Is(target error) bool {
+func (streamResetError) Is(target error) bool {
 	return target == net.ErrClosed
 }
 
 type Stream struct {
-	association *association
-	id          uint32
+	conn *Conn
+	id   uint32
 
 	reset atomic.Bool
 
@@ -66,9 +65,9 @@ type Stream struct {
 	recvNotify chan struct{}
 }
 
-func newStream(association *association, id uint32, sendLimit uint64) *Stream {
+func newStream(conn *Conn, id uint32, sendLimit uint64) *Stream {
 	return &Stream{
-		association:   association,
+		conn:          conn,
 		id:            id,
 		sendLimit:     sendLimit,
 		recvLimit:     initialStreamWindow,
@@ -86,11 +85,11 @@ func (s *Stream) ID() uint32 {
 }
 
 func (s *Stream) LocalAddr() net.Addr {
-	return s.association.LocalAddr()
+	return s.conn.LocalAddr()
 }
 
 func (s *Stream) RemoteAddr() net.Addr {
-	return s.association.RemoteAddr()
+	return s.conn.RemoteAddr()
 }
 
 func (s *Stream) SetDeadline(deadline time.Time) error {
@@ -127,15 +126,15 @@ func (s *Stream) Write(p []byte) (int, error) {
 }
 
 func (s *Stream) writeSome(p []byte) (int, error) {
-	a := s.association
+	c := s.conn
 	select {
-	case <-a.ctx.Done():
-		return 0, context.Cause(a.ctx)
+	case <-c.ctx.Done():
+		return 0, context.Cause(c.ctx)
 	case <-s.done:
 		return 0, s.endCause()
 	default:
 	}
-	maxPayload := int(a.maxPayload.Load())
+	maxPayload := int(c.maxPayload.Load())
 	s.sendMu.Lock()
 	if s.reset.Load() || s.closeWrite {
 		s.sendMu.Unlock()
@@ -145,15 +144,15 @@ func (s *Stream) writeSome(p []byte) (int, error) {
 	if available := s.sendLimit - s.sendUsed; available < uint64(length) {
 		length = int(available)
 	}
-	a.fcMu.Lock()
-	if available := a.fc.available(); available < uint64(length) {
+	c.fcMu.Lock()
+	if available := c.fc.available(); available < uint64(length) {
 		length = int(available)
 	}
 	if length > 0 {
 		s.sendUsed += uint64(length)
-		a.fc.sendUsed += uint64(length)
+		c.fc.sendUsed += uint64(length)
 	}
-	a.fcMu.Unlock()
+	c.fcMu.Unlock()
 	if length == 0 {
 		s.sendMu.Unlock()
 		return 0, nil
@@ -161,7 +160,7 @@ func (s *Stream) writeSome(p []byte) (int, error) {
 	offset := s.sendOffset
 	s.sendOffset += uint64(length)
 	s.sendMu.Unlock()
-	a.queueStreamFrame(newStreamFrame(s, offset, false, p[:length]))
+	c.queueStreamFrame(newStreamFrame(s, offset, false, p[:length]))
 	return length, nil
 }
 
@@ -173,8 +172,8 @@ func (s *Stream) waitSend() error {
 		return nil
 	case <-s.writeDeadline.Wait():
 		return os.ErrDeadlineExceeded
-	case <-s.association.ctx.Done():
-		return context.Cause(s.association.ctx)
+	case <-s.conn.ctx.Done():
+		return context.Cause(s.conn.ctx)
 	}
 }
 
@@ -187,7 +186,7 @@ func (s *Stream) CloseWrite() error {
 	s.closeWrite = true
 	offset := s.sendOffset
 	s.sendMu.Unlock()
-	s.association.queueStreamFrame(newStreamFrame(s, offset, true, nil))
+	s.conn.queueStreamFrame(newStreamFrame(s, offset, true, nil))
 	s.endIfDone()
 	return nil
 }
@@ -201,18 +200,18 @@ func (s *Stream) Close() error {
 	sendOffset := s.sendOffset
 	s.closeWrite = true
 	s.sendMu.Unlock()
-	a := s.association
+	c := s.conn
 	if !closeWrite {
-		a.queueStreamFrame(newStreamFrame(s, sendOffset, true, nil))
+		c.queueStreamFrame(newStreamFrame(s, sendOffset, true, nil))
 	}
 	s.recvMu.Lock()
 	readSideEnded := (s.finReceived && s.readOffset >= s.finOffset) || s.resetReceived
 	s.recvMu.Unlock()
 	if !readSideEnded {
-		a.queueControl(appendResetStreamFrame(nil, s.id, sendOffset, resetCodeNormal), true)
+		c.queueControl(appendResetStreamFrame(nil, s.id, sendOffset, resetCodeNormal), true)
 	}
 	s.end(net.ErrClosed)
-	a.removeStream(s.id)
+	c.removeStream(s.id)
 	return nil
 }
 
@@ -236,7 +235,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 			}
 			s.readOffset += uint64(read)
 			s.recvMu.Unlock()
-			s.association.dataRead(read)
+			s.conn.dataRead(read)
 			s.endIfDone()
 			s.moveWindow()
 			return read, nil
@@ -256,8 +255,8 @@ func (s *Stream) Read(p []byte) (int, error) {
 		case <-s.recvNotify:
 		case <-s.readDeadline.Wait():
 			return 0, os.ErrDeadlineExceeded
-		case <-s.association.ctx.Done():
-			return 0, context.Cause(s.association.ctx)
+		case <-s.conn.ctx.Done():
+			return 0, context.Cause(s.conn.ctx)
 		}
 	}
 }
@@ -267,8 +266,7 @@ func (s *Stream) end(cause error) {
 		s.endMu.Lock()
 		s.endErr = cause
 		s.endMu.Unlock()
-		var reset StreamResetError
-		if !errors.As(cause, &reset) {
+		if !errors.Is(cause, ErrStreamReset) {
 			s.discardUnread()
 		}
 		close(s.done)
@@ -293,7 +291,7 @@ func (s *Stream) discardUnread() {
 	s.segments = nil
 	s.recvMu.Unlock()
 	if dropped > 0 {
-		s.association.dataRead(dropped)
+		s.conn.dataRead(dropped)
 	}
 }
 
@@ -337,7 +335,7 @@ func (s *Stream) resetFromPeer(finalOffset uint64, code resetCode) {
 	s.resetOffset = finalOffset
 	s.recvMu.Unlock()
 	if dropped > 0 {
-		s.association.dataRead(dropped)
+		s.conn.dataRead(dropped)
 	}
 	s.end(code.err())
 }
@@ -350,7 +348,7 @@ func (s *Stream) endIfDone() {
 	sendDone := s.closeWrite || s.reset.Load()
 	s.sendMu.Unlock()
 	if recvDone && sendDone {
-		s.association.removeStream(s.id)
+		s.conn.removeStream(s.id)
 	}
 }
 
@@ -362,7 +360,7 @@ func (s *Stream) moveWindow() {
 	}
 	s.recvMu.Unlock()
 	if moved {
-		s.association.queueControl(appendMaxStreamDataFrame(nil, s.id, limit), true)
+		s.conn.queueControl(appendMaxStreamDataFrame(nil, s.id, limit), true)
 	}
 }
 

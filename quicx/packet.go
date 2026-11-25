@@ -24,11 +24,11 @@ var (
 )
 
 type channelConn struct {
-	context     context.Context
-	cancel      context.CancelCauseFunc
-	session     *session
-	association udpx.Association
-	channel     uint32
+	context context.Context
+	cancel  context.CancelCauseFunc
+	session *session
+	conn    *udpx.Conn
+	channel uint32
 
 	messages     chan udpMessage
 	closeOnce    sync.Once
@@ -42,7 +42,7 @@ func newChannelConn(ctx context.Context, current *session, id uint32) *channelCo
 		context:      ctx,
 		cancel:       cancel,
 		session:      current,
-		association:  current.association,
+		conn:         current.conn,
 		channel:      id,
 		messages:     make(chan udpMessage, channelBacklog),
 		readDeadline: pipe.MakeDeadline(),
@@ -134,7 +134,7 @@ func (c *channelConn) write(destination M.Socksaddr, payload []byte) error {
 		return E.New("invalid destination address")
 	}
 	message := udpMessage{destination: destination, data: payload}
-	err := c.association.SendDatagram(c.channel, message.pack())
+	err := c.conn.SendDatagram(c.channel, message.pack())
 	if err != nil {
 		return E.Cause(err, "send message")
 	}
@@ -156,7 +156,7 @@ func (c *channelConn) Close() error {
 		}
 		c.session.access.Unlock()
 		c.closeWithError(os.ErrClosed)
-		_ = c.association.SendDatagram(c.channel, []byte{CommandDissociate})
+		_ = c.conn.SendDatagram(c.channel, []byte{CommandDissociate})
 	})
 	return nil
 }
@@ -166,7 +166,7 @@ func (c *channelConn) closeWithError(err error) {
 }
 
 func (c *channelConn) LocalAddr() net.Addr {
-	return c.association.LocalAddr()
+	return c.conn.LocalAddr()
 }
 
 func (c *channelConn) SetDeadline(deadline time.Time) error {
