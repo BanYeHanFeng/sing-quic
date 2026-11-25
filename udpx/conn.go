@@ -50,6 +50,10 @@ type Options struct {
 	MTU int
 
 	Logger logger.Logger
+
+	// NewHandler 必填：每条连接在握手成功之后、收发循环启动之前被调用一次。
+	// 返回 nil 表示拒绝这条连接。
+	NewHandler func(conn *Conn) Handler
 }
 
 func (o Options) withDefaults() Options {
@@ -59,16 +63,32 @@ func (o Options) withDefaults() Options {
 	if o.KeepAlivePeriod < 0 {
 		o.KeepAlivePeriod = 0
 	}
+	if o.Logger == nil {
+		o.Logger = logger.NOP()
+	}
 	return o
 }
 
+// Handler 接收连接上发生的事件。
+//
+// OnDatagram 在接收循环上调用，data 的所有权转移给 handler，不得阻塞。
+// OnStream 每条入站流在新 goroutine 上调用。
+// OnClose 在连接结束后恰好调用一次，可能与上面两者并发。
+type Handler interface {
+	OnDatagram(conn *Conn, data []byte)
+	OnStream(conn *Conn, stream *Stream)
+	OnClose(conn *Conn, cause error)
+}
+
 type Conn struct {
-	socket    net.PacketConn
-	io        udpio.Conn
-	options   Options
-	logger    logger.Logger
-	logTag    string
-	initiator bool
+	socket     net.PacketConn
+	io         udpio.Conn
+	ownsSocket bool
+	options    Options
+	logger     logger.Logger
+	logTag     string
+	handler    Handler
+	initiator  bool
 
 	localID    connectionID
 	peerID     connectionID
@@ -76,39 +96,34 @@ type Conn struct {
 	sendCipher packetCipher
 	recvCipher packetCipher
 
-	ctx    context.Context
-	cancel context.CancelCauseFunc
+	ctx       context.Context
+	cancel    context.CancelCauseFunc
+	closeOnce sync.Once
+	sendDone  chan struct{}
+	sendWake  chan struct{}
 
 	peerAddr    atomic.Pointer[net.Addr]
 	openStreams atomic.Int32 // 供发送循环的空闲判定读取
 
-	sendMu    sync.Mutex
-	send      sender
-	sendWake  chan struct{}
-	sendDone  chan struct{}
-	closeOnce sync.Once
+	sendMu sync.Mutex
+	send   sender
 
 	streamsMu sync.Mutex
 	streams   streamTable
 
-	datagramMessage atomic.Uint32
-	defragger       datagramDefragger
-	datagrams       chan []byte
+	defragger datagramDefragger // 只有接收循环访问
 
-	onClose func()
+	onClose func() // 内部收尾钩子，供 Listener 把连接移出表
 }
 
-func newConn(conn net.PacketConn, io udpio.Conn, result handshakeResult, peer net.Addr, options Options, initiator bool) *Conn {
+func newConn(socket net.PacketConn, io udpio.Conn, result handshakeResult, peer net.Addr, options Options, initiator bool) *Conn {
 	ctx, cancel := context.WithCancelCause(context.Background())
-	if options.Logger == nil {
-		options.Logger = logger.NOP()
-	}
 	c := &Conn{
 		logTag:     hex.EncodeToString(result.localID[:2]),
-		socket:     conn,
+		socket:     socket,
 		io:         io,
 		options:    options.withDefaults(),
-		logger:     options.Logger,
+		logger:     options.withDefaults().Logger,
 		initiator:  initiator,
 		localID:    result.localID,
 		peerID:     result.peerID,
@@ -121,7 +136,6 @@ func newConn(conn net.PacketConn, io udpio.Conn, result handshakeResult, peer ne
 		sendDone:   make(chan struct{}),
 		streams:    newStreamTable(),
 		defragger:  newDatagramDefragger(),
-		datagrams:  make(chan []byte, datagramBacklog),
 	}
 	c.peerAddr.Store(&peer)
 	mtu := mtuMin
@@ -136,10 +150,6 @@ func newConn(conn net.PacketConn, io udpio.Conn, result handshakeResult, peer ne
 
 func (c *Conn) logDebug(args ...any) {
 	c.logger.Debug(append([]any{"udpx[" + c.logTag + "]: "}, args...)...)
-}
-
-func (c *Conn) start() {
-	go c.sendLoop()
 }
 
 func (c *Conn) LocalAddr() net.Addr {
@@ -183,19 +193,22 @@ func (c *Conn) cause() error {
 	return net.ErrClosed
 }
 
-// finish 取消 ctx、结束所有流、释放 socket、通知关闭，恰好执行一次。
+// finish 取消 ctx、结束所有流、释放 socket、通知 handler，恰好执行一次。
 func (c *Conn) finish(cause error) {
 	c.closeOnce.Do(func() {
 		if cause == nil {
 			cause = net.ErrClosed
 		}
 		c.cancel(cause)
-		if c.initiator {
-			_ = c.socket.SetReadDeadline(time.Now())
-		}
 		c.closeStreams(cause)
+		if c.ownsSocket {
+			_ = c.socket.Close()
+		}
 		if c.onClose != nil {
 			c.onClose()
+		}
+		if c.handler != nil {
+			c.handler.OnClose(c, cause)
 		}
 	})
 }
@@ -235,7 +248,10 @@ func (c *Conn) wake() {
 	}
 }
 
-func Dial(ctx context.Context, conn net.PacketConn, remote net.Addr, credential Credential, options Options) (*Conn, error) {
+func Dial(ctx context.Context, socket net.PacketConn, remote net.Addr, credential Credential, options Options) (*Conn, error) {
+	if options.NewHandler == nil {
+		return nil, E.New("missing NewHandler")
+	}
 	if _, loaded := ctx.Deadline(); !loaded {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, defaultHandshakeTimeout)
@@ -245,22 +261,27 @@ func Dial(ctx context.Context, conn net.PacketConn, remote net.Addr, credential 
 	if err != nil {
 		return nil, err
 	}
-	result, err := exchangeHello(ctx, conn, remote, handshake)
+	result, err := exchangeHello(ctx, socket, remote, handshake)
 	if err != nil {
 		return nil, err
 	}
-	io := udpio.New(conn)
-	c := newConn(conn, io, result, remote, options, true)
-	c.start()
+	c := newConn(socket, udpio.New(socket), result, remote, options, true)
+	c.ownsSocket = true
+	c.handler = options.NewHandler(c)
+	if c.handler == nil {
+		_ = socket.Close()
+		return nil, E.New("the handler rejected the connection")
+	}
+	go c.sendLoop()
 	go c.recvLoop()
 	return c, nil
 }
 
-func exchangeHello(ctx context.Context, conn net.PacketConn, remote net.Addr, handshake *clientHandshake) (handshakeResult, error) {
+func exchangeHello(ctx context.Context, socket net.PacketConn, remote net.Addr, handshake *clientHandshake) (handshakeResult, error) {
 	buffer := make([]byte, maxPacketSize)
 	hello := handshake.hello()
 	for {
-		_, err := conn.WriteTo(hello, remote)
+		_, err := socket.WriteTo(hello, remote)
 		if err != nil {
 			return handshakeResult{}, E.Cause(err, "write hello")
 		}
@@ -268,12 +289,12 @@ func exchangeHello(ctx context.Context, conn net.PacketConn, remote net.Addr, ha
 		if contextDeadline, loaded := ctx.Deadline(); loaded && contextDeadline.Before(deadline) {
 			deadline = contextDeadline
 		}
-		err = conn.SetReadDeadline(deadline)
+		err = socket.SetReadDeadline(deadline)
 		if err != nil {
 			return handshakeResult{}, E.Cause(err, "set read deadline")
 		}
 		for {
-			n, source, readErr := conn.ReadFrom(buffer)
+			n, source, readErr := socket.ReadFrom(buffer)
 			if readErr != nil {
 				select {
 				case <-ctx.Done():
@@ -296,7 +317,7 @@ func exchangeHello(ctx context.Context, conn net.PacketConn, remote net.Addr, ha
 			if handleErr != nil {
 				continue
 			}
-			err = conn.SetReadDeadline(time.Time{})
+			err = socket.SetReadDeadline(time.Time{})
 			if err != nil {
 				return handshakeResult{}, E.Cause(err, "clear read deadline")
 			}

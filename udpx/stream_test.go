@@ -433,7 +433,7 @@ func TestStreamBeyondThePeerLimitIsAnError(t *testing.T) {
 	if _, err = server.AcceptStream(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err = openStreamFrame(t, server, initialStreams, "beyond"); err == nil {
+	if err = openStreamFrame(t, server.Conn, initialStreams, "beyond"); err == nil {
 		t.Fatal("a stream beyond the limit was accepted")
 	}
 	select {

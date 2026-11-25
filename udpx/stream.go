@@ -55,8 +55,6 @@ type Stream struct {
 	endErr  error // 在 close(done) 之前写入，只在其后读取
 	done    chan struct{}
 
-	accepted bool
-
 	sendNotify chan struct{}
 	recvNotify chan struct{}
 }

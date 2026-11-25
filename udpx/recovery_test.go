@@ -14,9 +14,23 @@ func openStreamFrame(t *testing.T, c *Conn, index uint32, payload string) error 
 	return c.handleStreamFrame(frameTypeStream, frame[frameHeaderLen:])
 }
 
+// acceptStreams 收下 n 条流，按 ID 索引：OnStream 每条流一个新 goroutine，到达顺序不保证。
+func acceptStreams(t *testing.T, ctx context.Context, peer *testPeer, count int) map[uint32]*Stream {
+	t.Helper()
+	streams := make(map[uint32]*Stream, count)
+	for len(streams) < count {
+		stream, err := peer.AcceptStream(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		streams[stream.ID()] = stream
+	}
+	return streams
+}
+
 func TestPeerOpensStreamsOutOfOrder(t *testing.T) {
 	_, server, _ := testSetup(t, Options{MTU: mtuIPv4}, Options{MTU: mtuIPv4})
-	c := server
+	c := server.Conn
 	ctx := testContext(t, 5*time.Second)
 	if err := openStreamFrame(t, c, 0, "zero"); err != nil {
 		t.Fatal(err)
@@ -30,26 +44,23 @@ func TestPeerOpensStreamsOutOfOrder(t *testing.T) {
 	if next != 3 {
 		t.Fatalf("the peer next stream is %d", next)
 	}
-	for _, expected := range []string{"zero", "two"} {
-		stream, err := c.AcceptStream(ctx)
-		if err != nil {
-			t.Fatal(err)
+	streams := acceptStreams(t, ctx, server, 2)
+	for id, expected := range map[uint32]string{0: "zero", 2: "two"} {
+		stream, loaded := streams[id]
+		if !loaded {
+			t.Fatalf("stream %d was not accepted", id)
 		}
 		if read := readAll(t, stream, len(expected)); string(read) != expected {
-			t.Fatalf("stream read %q", read)
+			t.Fatalf("stream %d read %q", id, read)
 		}
 	}
 	if err := openStreamFrame(t, c, 1, "one"); err != nil {
 		t.Fatalf("stream 1 arrived after stream 2: %v", err)
 	}
-	stream, err := c.AcceptStream(ctx)
-	if err != nil {
-		t.Fatalf("stream 1 was dropped: %v", err)
-	}
-	if read := readAll(t, stream, 3); string(read) != "one" {
+	if read := readAll(t, acceptStreams(t, ctx, server, 1)[1], 3); string(read) != "one" {
 		t.Fatalf("stream 1 read %q", read)
 	}
-	if err = openStreamFrame(t, c, 1, "one"); err != nil {
+	if err := openStreamFrame(t, c, 1, "one"); err != nil {
 		t.Fatalf("stream 1 arrived again: %v", err)
 	}
 	select {
@@ -62,19 +73,13 @@ func TestPeerOpensStreamsOutOfOrder(t *testing.T) {
 func TestProbeRetransmitsWithoutAFlood(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener, peers := testListen(t, listenerConn, credential, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{})
 	ctx := testContext(t, 30*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := testDial(t, ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
 	defer client.CloseWithError(nil)
-	server, err := listener.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	server := testAccept(t, ctx, peers)
 	stream, err := client.OpenStream(ctx)
 	if err != nil {
 		t.Fatal(err)

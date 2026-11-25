@@ -18,8 +18,6 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-var errNetworkChanged = E.New("network changed")
-
 type ClientOptions struct {
 	Context       context.Context
 	Dialer        N.Dialer
@@ -37,7 +35,7 @@ type Client struct {
 	dialer     N.Dialer
 	serverAddr M.Socksaddr
 	credential udpx.Credential
-	transport  udpx.Options
+	options    udpx.Options
 	logger     logger.Logger
 
 	access     sync.Mutex
@@ -68,7 +66,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		dialer:     options.Dialer,
 		serverAddr: options.ServerAddress,
 		credential: udpx.NewCredential(options.Password),
-		transport: udpx.Options{
+		options: udpx.Options{
 			IdleTimeout:     options.IdleTimeout,
 			KeepAlivePeriod: options.Heartbeat,
 			MTU:             options.MTU,
@@ -114,14 +112,19 @@ func (c *Client) dialSession(generation uint64) (*session, error) {
 		return nil, err
 	}
 	remote := udpConn.RemoteAddr()
-	conn, err := udpx.Dial(c.ctx, bindPacketConn(udpConn), remote, c.credential, c.transport)
+	options := c.options
+	var current *session
+	options.NewHandler = func(conn *udpx.Conn) udpx.Handler {
+		current = newSession(c.ctx, conn, c.logger, "to "+c.serverAddr.String(), c.forgetSession, nil)
+		return current
+	}
+	_, err = udpx.Dial(c.ctx, bindPacketConn(udpConn), remote, c.credential, options)
 	if err != nil {
 		_ = udpConn.Close()
 		c.logger.Error("QUICX dial failed: stage=handshake server=", c.serverAddr, " remote=", remote, " elapsed=", dialElapsed(dialStart), " error=", err)
 		return nil, E.Cause(err, "open session")
 	}
 	c.logger.Debug("QUICX dial: stage=handshake server=", c.serverAddr, " remote=", remote, " elapsed=", dialElapsed(dialStart))
-	current := newSession(c.ctx, conn, c.logger, nil)
 	c.access.Lock()
 	closed := c.closed
 	stale := closed || c.generation != generation
@@ -130,34 +133,22 @@ func (c *Client) dialSession(generation uint64) (*session, error) {
 	}
 	c.access.Unlock()
 	if stale {
-		closeErr := errNetworkChanged
+		closeErr := net.ErrClosed
 		if closed {
 			closeErr = os.ErrClosed
 		}
 		current.closeWithError(closeErr)
-		_ = udpConn.Close()
 		return nil, closeErr
 	}
-	go c.watchSession(current, udpConn, dialStart)
 	return current, nil
 }
 
-func (c *Client) watchSession(current *session, udpConn net.Conn, dialStart time.Time) {
-	go current.run()
-	<-current.conn.Context().Done()
-	cause := context.Cause(current.conn.Context())
-	current.closeWithError(cause)
-	_ = udpConn.Close()
+func (c *Client) forgetSession(current *session) {
 	c.access.Lock()
 	if c.session == current {
 		c.session = nil
 	}
 	c.access.Unlock()
-	if udpx.IsNormalClose(cause) {
-		c.logger.Debug("QUICX session closed: server=", c.serverAddr, " elapsed=", dialElapsed(dialStart), " error=", cause)
-	} else {
-		c.logger.Error("QUICX session failed: server=", c.serverAddr, " elapsed=", dialElapsed(dialStart), " error=", cause)
-	}
 }
 
 func dialElapsed(start time.Time) time.Duration {
@@ -205,7 +196,8 @@ func (c *Client) Reset() {
 	c.session = nil
 	c.access.Unlock()
 	if current != nil {
-		current.closeWithError(errNetworkChanged)
+		c.logger.Debug("QUICX network changed: server=", c.serverAddr)
+		current.closeWithError(net.ErrClosed)
 	}
 }
 

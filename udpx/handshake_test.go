@@ -174,7 +174,7 @@ func TestHandshakeOverSocket(t *testing.T) {
 func TestWrongPasswordOverSocket(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener, _ := testListen(t, listenerConn, credential, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	ctx := testContext(t, 2*time.Second)
 	_, err := Dial(ctx, udpConn(t), listenerConn.LocalAddr(), NewCredential("other"), Options{MTU: mtuIPv4})
@@ -186,7 +186,7 @@ func TestWrongPasswordOverSocket(t *testing.T) {
 func TestUnknownConnectionID(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener, _ := testListen(t, listenerConn, credential, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	client := udpConn(t)
 	packet := header{ConnectionID: connectionID{1, 2, 3, 4, 5, 6, 7, 8}, Type: packetTypeData, PacketNumber: 1}.appendTo(nil)
@@ -229,7 +229,7 @@ func TestKeepAlive(t *testing.T) {
 func TestRepeatedHelloIsOneAssociation(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener, peers := testListen(t, listenerConn, credential, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	handshake, err := newClientHandshake(credential)
 	if err != nil {
@@ -260,39 +260,29 @@ func TestRepeatedHelloIsOneAssociation(t *testing.T) {
 	if answers == 0 {
 		t.Fatal("not one answer arrived")
 	}
-	conn, err := listener.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
+	conn := testAccept(t, ctx, peers)
+	listener.mu.Lock()
+	conns := len(listener.conns)
+	listener.mu.Unlock()
+	if conns != 1 {
+		t.Fatalf("a repeated hello created %d connections", conns)
 	}
 	_ = conn.CloseWithError(nil)
-	select {
-	case extra := <-listener.accept:
-		t.Fatalf("a repeated hello created another connection: %v", extra)
-	case <-time.After(100 * time.Millisecond):
-	}
 }
 
 func TestDemux(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener, peers := testListen(t, listenerConn, credential, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	ctx := testContext(t, 5*time.Second)
-	var clients []*Conn
+	var clients []*testPeer
 	for range 2 {
-		client, err := Dial(ctx, udpConn(t), listenerConn.LocalAddr(), credential, Options{MTU: mtuIPv4})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer client.CloseWithError(nil)
-		clients = append(clients, client)
+		clients = append(clients, testDial(t, ctx, udpConn(t), listenerConn.LocalAddr(), credential, Options{MTU: mtuIPv4}))
 	}
-	servers := make([]*Conn, 0, len(clients))
+	servers := make([]*testPeer, 0, len(clients))
 	for range clients {
-		server, err := listener.Accept(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
+		server := testAccept(t, ctx, peers)
 		servers = append(servers, server)
 	}
 	for index, client := range clients {
@@ -323,18 +313,11 @@ func TestDemux(t *testing.T) {
 func TestPacketTamperedOnTheWire(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener, peers := testListen(t, listenerConn, credential, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	tamper := udpConn(t)
-	client, err := Dial(testContext(t, 5*time.Second), tamper, listenerConn.LocalAddr(), credential, Options{MTU: mtuIPv4})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.CloseWithError(nil)
-	server, err := listener.Accept(testContext(t, 5*time.Second))
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := testDial(t, testContext(t, 5*time.Second), tamper, listenerConn.LocalAddr(), credential, Options{MTU: mtuIPv4})
+	server := testAccept(t, testContext(t, 5*time.Second), peers)
 	stream, err := client.OpenStream(testContext(t, 5*time.Second))
 	if err != nil {
 		t.Fatal(err)

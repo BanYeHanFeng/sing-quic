@@ -241,20 +241,14 @@ func TestTransferUnderLoss(t *testing.T) {
 		t.Run(testName(loss), func(t *testing.T) {
 			credential := NewCredential("password")
 			listenerConn := udpConn(t)
-			listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+			listener, peers := testListen(t, listenerConn, credential, Options{MTU: mtuIPv4})
 			defer listener.Close()
 			link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{loss: loss, lossReturn: loss})
 
 			ctx := testContext(t, 60*time.Second)
-			client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
-			if err != nil {
-				t.Fatal(err)
-			}
+			client := testDial(t, ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
 			defer client.CloseWithError(nil)
-			server, err := listener.Accept(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
+			server := testAccept(t, ctx, peers)
 
 			payload := testPayload(256 * 1024)
 			stream, err := client.OpenStream(ctx)
@@ -298,7 +292,7 @@ func TestStreamOverALossyCapacityPath(t *testing.T) {
 	const capacity = 12.5 * 1024 * 1024
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener, peers := testListen(t, listenerConn, credential, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
 		loss:       0.05,
@@ -309,15 +303,9 @@ func TestStreamOverALossyCapacityPath(t *testing.T) {
 	})
 
 	ctx := testContext(t, 60*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := testDial(t, ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
 	defer client.CloseWithError(nil)
-	server, err := listener.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	server := testAccept(t, ctx, peers)
 	stream, err := client.OpenStream(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -366,7 +354,7 @@ func TestDownloadOverUplinkLoss(t *testing.T) {
 	const payloadSize = 256 * 1024
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener, peers := testListen(t, listenerConn, credential, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
 		loss:       0.4,
@@ -375,15 +363,9 @@ func TestDownloadOverUplinkLoss(t *testing.T) {
 	})
 
 	ctx := testContext(t, 120*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := testDial(t, ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
 	defer client.CloseWithError(nil)
-	server, err := listener.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	server := testAccept(t, ctx, peers)
 	defer server.CloseWithError(nil)
 
 	payload := testPayload(payloadSize)
@@ -433,7 +415,7 @@ func TestStreamOverABufferedPath(t *testing.T) {
 	const payloadSize = 2 * 1024 * 1024
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener, peers := testListen(t, listenerConn, credential, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
 		loss:       0.006,
@@ -444,15 +426,9 @@ func TestStreamOverABufferedPath(t *testing.T) {
 		queueLimit: 25 * 1024,
 	})
 	ctx := testContext(t, 300*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := testDial(t, ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
 	defer client.CloseWithError(nil)
-	server, err := listener.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	server := testAccept(t, ctx, peers)
 	payload := testPayload(payloadSize)
 	start := time.Now()
 	go func() {

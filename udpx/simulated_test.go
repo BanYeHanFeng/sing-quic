@@ -66,7 +66,7 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	const datagramCount = 32
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener, peers := testListen(t, listenerConn, credential, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{
 		loss:       0.02,
@@ -77,15 +77,9 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	})
 
 	ctx := testContext(t, 240*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := testDial(t, ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
 	defer client.CloseWithError(nil)
-	server, err := listener.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	server := testAccept(t, ctx, peers)
 	defer server.CloseWithError(nil)
 
 	upload := testPayload(payloadSize)
@@ -263,20 +257,14 @@ func TestStreamBothDirectionsBlocked(t *testing.T) {
 func TestAssociationEndsUnderLoad(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{MTU: mtuIPv4})
+	listener, peers := testListen(t, listenerConn, credential, Options{MTU: mtuIPv4})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{delay: 20 * time.Millisecond})
 
 	ctx := testContext(t, 60*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := testDial(t, ctx, udpConn(t), link.clientAddr(), credential, Options{MTU: mtuIPv4})
 	defer client.CloseWithError(nil)
-	server, err := listener.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	server := testAccept(t, ctx, peers)
 
 	stream, err := client.OpenStream(ctx)
 	if err != nil {

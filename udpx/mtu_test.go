@@ -54,19 +54,13 @@ func TestMTUCandidatesForTheAddressFamily(t *testing.T) {
 func TestMTUProbeRaisesTheSize(t *testing.T) {
 	credential := NewCredential("password")
 	listenerConn := udpConn(t)
-	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{})
+	listener, peers := testListen(t, listenerConn, credential, Options{})
 	defer listener.Close()
 	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{})
 	ctx := testContext(t, 20*time.Second)
-	client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := testDial(t, ctx, udpConn(t), link.clientAddr(), credential, Options{})
 	defer client.CloseWithError(nil)
-	server, err := listener.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	server := testAccept(t, ctx, peers)
 	stream, err := client.OpenStream(ctx)
 	if err != nil {
 		t.Fatal(err)

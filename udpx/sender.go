@@ -98,11 +98,12 @@ type sender struct {
 	idleAt      time.Time
 	keepAliveAt time.Time
 
-	mtu       mtuState
-	probeSize int
-	mtuQueued bool
-	closing   bool
-	cause     error
+	mtu             mtuState
+	probeSize       int
+	mtuQueued       bool
+	datagramMessage uint16
+	closing         bool
+	cause           error
 }
 
 func (s *sender) init(conn *Conn, mtu int) {

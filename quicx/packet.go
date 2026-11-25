@@ -150,11 +150,11 @@ func (c *channelConn) input(message udpMessage) {
 
 func (c *channelConn) Close() error {
 	c.closeOnce.Do(func() {
-		c.session.access.Lock()
+		c.session.mu.Lock()
 		if c.session.channels[c.channel] == c {
 			delete(c.session.channels, c.channel)
 		}
-		c.session.access.Unlock()
+		c.session.mu.Unlock()
 		c.closeWithError(os.ErrClosed)
 		_ = c.conn.SendDatagram(packChannel(c.channel, CommandDissociate))
 	})

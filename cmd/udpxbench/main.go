@@ -60,45 +60,37 @@ func run() error {
 }
 
 func runServer(ctx context.Context, listen, password string, options udpx.Options, streamMode bool) error {
-	conn, err := net.ListenPacket("udp", listen)
+	socket, err := net.ListenPacket("udp", listen)
 	if err != nil {
 		return err
 	}
-	listener := udpx.Listen(conn, passwordVerifier{credential: udpx.NewCredential(password)}, options)
-	defer listener.Close()
-	fmt.Println("listening on", conn.LocalAddr())
-	for {
-		conn, acceptErr := listener.Accept(ctx)
-		if acceptErr != nil {
-			return acceptErr
-		}
-		go serveAssociation(ctx, conn, streamMode)
+	options.NewHandler = func(conn *udpx.Conn) udpx.Handler {
+		return &echoHandler{streamMode: streamMode}
 	}
+	listener := udpx.Listen(socket, passwordVerifier{credential: udpx.NewCredential(password)}, options)
+	defer listener.Close()
+	fmt.Println("listening on", socket.LocalAddr())
+	<-ctx.Done()
+	return context.Cause(ctx)
 }
 
-func serveAssociation(ctx context.Context, conn *udpx.Conn, streamMode bool) {
-	if streamMode {
-		for {
-			stream, err := conn.AcceptStream(ctx)
-			if err != nil {
-				return
-			}
-			go func() {
-				_, _ = io.Copy(io.Discard, stream)
-				_ = stream.Close()
-			}()
-		}
-	}
-	for {
-		datagram, err := conn.ReceiveDatagram(ctx)
-		if err != nil {
-			return
-		}
-		if err = conn.SendDatagram(datagram); err != nil {
-			return
-		}
-	}
+// echoHandler 把收到的数据报原样送回；stream 模式下丢弃流数据。
+type echoHandler struct {
+	streamMode bool
 }
+
+func (h *echoHandler) OnStream(conn *udpx.Conn, stream *udpx.Stream) {
+	go func() {
+		_, _ = io.Copy(io.Discard, stream)
+		_ = stream.Close()
+	}()
+}
+
+func (h *echoHandler) OnDatagram(conn *udpx.Conn, data []byte) {
+	_ = conn.SendDatagram(data)
+}
+
+func (h *echoHandler) OnClose(conn *udpx.Conn, cause error) {}
 
 const datagramHeaderLen = 8 + 8
 
@@ -111,6 +103,10 @@ func runClient(ctx context.Context, server, password string, options udpx.Option
 	if err != nil {
 		return err
 	}
+	sink := &datagramSink{arrived: make(chan []byte, 4096)}
+	options.NewHandler = func(conn *udpx.Conn) udpx.Handler {
+		return sink
+	}
 	conn, err := udpx.Dial(ctx, socket, remote, udpx.NewCredential(password), options)
 	if err != nil {
 		return err
@@ -120,7 +116,27 @@ func runClient(ctx context.Context, server, password string, options udpx.Option
 	if streamMode {
 		return runStream(ctx, conn, size, duration)
 	}
-	return runDatagrams(ctx, conn, size, pps, duration)
+	return runDatagrams(ctx, conn, sink, size, pps, duration)
+}
+
+// datagramSink 把收到的数据报交回接收循环之外的 goroutine。
+type datagramSink struct {
+	arrived chan []byte
+}
+
+func (s *datagramSink) OnDatagram(conn *udpx.Conn, data []byte) {
+	select {
+	case s.arrived <- data:
+	default:
+	}
+}
+
+func (s *datagramSink) OnStream(conn *udpx.Conn, stream *udpx.Stream) {
+	_ = stream.Close()
+}
+
+func (s *datagramSink) OnClose(conn *udpx.Conn, cause error) {
+	close(s.arrived)
 }
 
 type measurement struct {
@@ -174,7 +190,7 @@ func latencySum(latency []time.Duration) time.Duration {
 	return total
 }
 
-func runDatagrams(ctx context.Context, conn *udpx.Conn, size, pps int, duration time.Duration) error {
+func runDatagrams(ctx context.Context, conn *udpx.Conn, sink *datagramSink, size, pps int, duration time.Duration) error {
 	if size < datagramHeaderLen {
 		return fmt.Errorf("datagram size %d is below the %d byte header", size, datagramHeaderLen)
 	}
@@ -186,11 +202,7 @@ func runDatagrams(ctx context.Context, conn *udpx.Conn, size, pps int, duration 
 	var sequence uint64
 
 	go func() {
-		for {
-			datagram, err := conn.ReceiveDatagram(ctx)
-			if err != nil {
-				return
-			}
+		for datagram := range sink.arrived {
 			if len(datagram) < datagramHeaderLen {
 				continue
 			}

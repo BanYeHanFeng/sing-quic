@@ -3,6 +3,7 @@ package quicx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -27,6 +28,7 @@ type testPacketConnection struct {
 	conn        N.PacketConn
 	source      M.Socksaddr
 	destination M.Socksaddr
+	closed      chan error
 }
 
 func newTestHandler() *testHandler {
@@ -41,7 +43,12 @@ func (h *testHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source
 }
 
 func (h *testHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	h.packets <- testPacketConnection{conn: conn, source: source, destination: destination}
+	closed := make(chan error, 1)
+	go func() {
+		<-ctx.Done()
+		closed <- context.Cause(ctx)
+	}()
+	h.packets <- testPacketConnection{conn: conn, source: source, destination: destination, closed: closed}
 }
 
 func (h *testHandler) connection(t *testing.T, ctx context.Context) testConnection {
@@ -126,7 +133,7 @@ func testContext(t *testing.T, timeout time.Duration) context.Context {
 }
 
 func TestClientSessionsAreShared(t *testing.T) {
-	client, _ := testSetup(t, "password")
+	client, handler := testSetup(t, "password")
 	ctx := testContext(t, 20*time.Second)
 	first, err := client.DialConn(ctx, M.ParseSocksaddr("example.com:80"))
 	if err != nil {
@@ -138,14 +145,10 @@ func TestClientSessionsAreShared(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	client.access.Lock()
-	sessions := 0
-	if client.session != nil {
-		sessions = 1
-	}
-	client.access.Unlock()
-	if sessions != 1 {
-		t.Fatal("the client opened more than one session")
+	firstServer := handler.connection(t, ctx)
+	secondServer := handler.connection(t, ctx)
+	if firstServer.source.String() != secondServer.source.String() {
+		t.Fatalf("the connections came from %v and %v", firstServer.source, secondServer.source)
 	}
 }
 
@@ -389,4 +392,28 @@ func TestResetRedials(t *testing.T) {
 	defer second.Close()
 	defer first.Close()
 	_ = handler.connection(t, ctx)
+}
+
+// 客户端换网卡只是本地事件：服务端看到的应当是正常关闭。
+func TestResetIsANormalClose(t *testing.T) {
+	client, handler := testSetup(t, "password")
+	ctx := testContext(t, 20*time.Second)
+	packetConn, err := client.ListenPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packetConn.Close()
+	if _, err = packetConn.WriteTo([]byte("query"), M.ParseSocksaddr("1.1.1.1:53")); err != nil {
+		t.Fatal(err)
+	}
+	serverConn := handler.packetConnection(t, ctx)
+	client.Reset()
+	select {
+	case cause := <-serverConn.closed:
+		if cause == nil || !errors.Is(cause, net.ErrClosed) {
+			t.Fatalf("the server saw %v", cause)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the server did not notice the reset")
+	}
 }

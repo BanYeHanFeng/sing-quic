@@ -36,7 +36,7 @@ type Service[U comparable] struct {
 	logger     logger.Logger
 	handler    ServiceHandler
 	udpTimeout time.Duration
-	transport  udpx.Options
+	options    udpx.Options
 
 	usersAccess sync.RWMutex
 	userMap     map[[8]byte]userEntry[U]
@@ -67,7 +67,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		logger:     options.Logger,
 		handler:    options.Handler,
 		udpTimeout: options.UDPTimeout,
-		transport: udpx.Options{
+		options: udpx.Options{
 			IdleTimeout:     options.IdleTimeout,
 			KeepAlivePeriod: options.Heartbeat,
 			MTU:             options.MTU,
@@ -113,8 +113,9 @@ func (s *Service[U]) lookupUser(keyID [8]byte) (U, bool) {
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
-	s.listener = udpx.Listen(conn, s, s.transport)
-	go s.loopSessions()
+	options := s.options
+	options.NewHandler = s.newHandler()
+	s.listener = udpx.Listen(conn, s, options)
 	return nil
 }
 
@@ -122,62 +123,33 @@ func (s *Service[U]) Close() error {
 	return common.Close(common.PtrOrNil(s.listener))
 }
 
-func (s *Service[U]) loopSessions() {
-	for {
-		conn, err := s.listener.Accept(s.ctx)
-		if err != nil {
-			if E.IsClosedOrCanceled(err) {
-				s.logger.Debug(E.Cause(err, "listener closed"))
-			} else {
-				s.logger.Error(E.Cause(err, "listener closed"))
-			}
-			return
-		}
+func (s *Service[U]) newHandler() func(conn *udpx.Conn) udpx.Handler {
+	return func(conn *udpx.Conn) udpx.Handler {
 		user, loaded := s.lookupUser(conn.KeyID())
 		if !loaded {
-			_ = conn.CloseWithError(net.ErrClosed)
-			continue
+			return nil
 		}
 		current := &serverSession[U]{
 			Service:    s,
 			requestCtx: auth.ContextWithUser(conn.Context(), user),
+			source:     M.SocksaddrFromNet(conn.RemoteAddr()),
 		}
-		current.session = newSession(current.requestCtx, conn, s.logger, current.onUnknownChannel)
-		current.source = M.SocksaddrFromNet(conn.RemoteAddr())
-		go current.run()
+		current.session = newSession(current.requestCtx, conn, s.logger, "from "+current.source.String(), nil, current.onUnknownChannel)
+		return current
 	}
 }
 
 type serverSession[U comparable] struct {
 	*Service[U]
-	session    *session
+	*session
 	requestCtx context.Context
 	source     M.Socksaddr
 }
 
-func (s *serverSession[U]) run() {
-	go s.loopStreams()
-	s.session.run()
-	cause := context.Cause(s.session.conn.Context())
-	if udpx.IsNormalClose(cause) {
-		s.logger.Debug("session from ", s.source, " closed: ", cause)
-	} else {
-		s.logger.Error("session from ", s.source, " failed: ", cause)
-	}
-}
-
-func (s *serverSession[U]) loopStreams() {
-	for {
-		stream, err := s.session.conn.AcceptStream(s.session.conn.Context())
-		if err != nil {
-			return
-		}
-		go func() {
-			if err := s.handleStream(stream); err != nil {
-				_ = stream.Close()
-				s.logger.Debug(E.Cause(err, "handle stream request"))
-			}
-		}()
+func (s *serverSession[U]) OnStream(conn *udpx.Conn, stream *udpx.Stream) {
+	if err := s.handleStream(stream); err != nil {
+		_ = stream.Close()
+		s.Service.logger.Debug(E.Cause(err, "handle stream request"))
 	}
 }
 

@@ -12,8 +12,6 @@ const (
 
 	maxDatagramSize = 0xffff
 
-	datagramBacklog = 1024
-
 	maxDatagramReassemblyCount = 64
 	maxDatagramReassemblyBytes = 256 * 1024
 
@@ -125,8 +123,9 @@ func (c *Conn) SendDatagram(data []byte) error {
 	if len(data) > maxDatagramSize {
 		return E.New("datagram of ", len(data), " bytes is larger than ", maxDatagramSize)
 	}
-	message := uint16(c.datagramMessage.Add(1))
 	c.sendMu.Lock()
+	message := c.send.datagramMessage
+	c.send.datagramMessage++
 	fragmentLen := c.send.payloadSize() - datagramHeaderLen
 	fragmentCount := max((len(data)+fragmentLen-1)/fragmentLen, 1)
 	if fragmentCount > maxDatagramFragments {
@@ -145,17 +144,6 @@ func (c *Conn) SendDatagram(data []byte) error {
 	return nil
 }
 
-func (c *Conn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
-	select {
-	case datagram := <-c.datagrams:
-		return datagram, nil
-	case <-ctx.Done():
-		return nil, context.Cause(ctx)
-	case <-c.ctx.Done():
-		return nil, context.Cause(c.ctx)
-	}
-}
-
 func (c *Conn) handleDatagram(body []byte) error {
 	if len(body) < 4 {
 		return errShortFrame
@@ -168,9 +156,6 @@ func (c *Conn) handleDatagram(body []byte) error {
 	if !complete {
 		return nil
 	}
-	select {
-	case c.datagrams <- message:
-	default:
-	}
+	c.handler.OnDatagram(c, message)
 	return nil
 }

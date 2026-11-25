@@ -9,13 +9,13 @@ import (
 
 	"github.com/sagernet/sing-quic/udpx/internal/udpio"
 
-	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 )
 
 const (
 	maxConcurrentHandshakes = 8
 
-	acceptBacklog = 16
+	maxHelloCache = 1024
 
 	helloLifetime = 10 * time.Second
 
@@ -27,9 +27,9 @@ type Listener struct {
 	io          udpio.Conn
 	verifier    Verifier
 	options     Options
+	logger      logger.Logger
 	ctx         context.Context
 	cancel      context.CancelCauseFunc
-	accept      chan *Conn
 	handshaking chan struct{}
 
 	mu      sync.Mutex
@@ -45,33 +45,24 @@ type helloAnswer struct {
 	at     time.Time
 }
 
-func Listen(conn net.PacketConn, verifier Verifier, options Options) *Listener {
+// Listen 在共享的 socket 上服务连接。每条连接握手成功后在 options.NewHandler 里交给上层决定是否接受。
+func Listen(socket net.PacketConn, verifier Verifier, options Options) *Listener {
 	ctx, cancel := context.WithCancelCause(context.Background())
+	options = options.withDefaults()
 	l := &Listener{
-		socket:      conn,
-		io:          udpio.New(conn),
+		socket:      socket,
+		io:          udpio.New(socket),
 		verifier:    verifier,
-		options:     options.withDefaults(),
+		options:     options,
+		logger:      options.Logger,
 		ctx:         ctx,
 		cancel:      cancel,
-		accept:      make(chan *Conn, acceptBacklog),
 		handshaking: make(chan struct{}, maxConcurrentHandshakes),
 		conns:       make(map[connectionID]*Conn),
 		hellos:      make(map[connectionID]*helloAnswer),
 	}
 	go l.readLoop()
 	return l
-}
-
-func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
-	select {
-	case c := <-l.accept:
-		return c, nil
-	case <-ctx.Done():
-		return nil, context.Cause(ctx)
-	case <-l.ctx.Done():
-		return nil, context.Cause(l.ctx)
-	}
 }
 
 func (l *Listener) Close() error {
@@ -159,6 +150,10 @@ func (l *Listener) handleHello(clientConnID connectionID, hello []byte, source n
 		}
 		return
 	}
+	if !loaded && len(l.hellos) >= maxHelloCache {
+		l.mu.Unlock()
+		return
+	}
 	answer = &helloAnswer{at: now}
 	l.hellos[clientConnID] = answer
 	l.mu.Unlock()
@@ -197,7 +192,12 @@ func (l *Listener) completeHandshake(clientConnID connectionID, answer *helloAns
 	c.onClose = func() {
 		l.remove(c.localID)
 	}
-	c.start()
+	c.handler = l.options.NewHandler(c)
+	if c.handler == nil {
+		l.forgetHello(clientConnID, answer)
+		return
+	}
+	go c.sendLoop()
 	if !l.add(c) {
 		c.shutdown(net.ErrClosed, false)
 		l.forgetHello(clientConnID, answer)
@@ -216,11 +216,6 @@ func (l *Listener) completeHandshake(clientConnID connectionID, answer *helloAns
 		answer.at = time.Now()
 	}
 	l.mu.Unlock()
-	select {
-	case l.accept <- c:
-	default:
-		c.shutdown(E.New("accept queue is full"), true)
-	}
 }
 
 func (l *Listener) add(c *Conn) bool {
