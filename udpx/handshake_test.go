@@ -10,6 +10,10 @@ import (
 	"time"
 )
 
+func listenerDone(listener *Listener) <-chan struct{} {
+	return listener.ctx.Done()
+}
+
 func TestCredential(t *testing.T) {
 	credential := NewCredential("password")
 	other := NewCredential("password ")
@@ -146,12 +150,9 @@ func TestKeyIDIsNotThePassword(t *testing.T) {
 }
 
 func TestHandshakeOverSocket(t *testing.T) {
-	client, server, listener := testSetup(t, Options{}, Options{})
-	if client.RemoteAddr().String() != listener.socket.LocalAddr().String() {
-		t.Fatalf("client peer is %v", client.RemoteAddr())
-	}
-	if server.LocalAddr().String() != listener.socket.LocalAddr().String() {
-		t.Fatalf("server local address is %v", server.LocalAddr())
+	client, server, _ := testSetup(t, Options{}, Options{})
+	if client.RemoteAddr().String() != server.LocalAddr().String() {
+		t.Fatalf("client peer is %v, server local address is %v", client.RemoteAddr(), server.LocalAddr())
 	}
 	if client.LocalAddr().String() != server.RemoteAddr().String() {
 		t.Fatalf("server peer is %v, client local address is %v", server.RemoteAddr(), client.LocalAddr())
@@ -196,7 +197,7 @@ func TestUnknownConnectionID(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case <-listener.ctx.Done():
+	case <-listenerDone(listener):
 		t.Fatal("the listener ended on a stray packet")
 	case <-time.After(100 * time.Millisecond):
 	}
@@ -261,11 +262,10 @@ func TestRepeatedHelloIsOneAssociation(t *testing.T) {
 		t.Fatal("not one answer arrived")
 	}
 	conn := testAccept(t, ctx, peers)
-	listener.mu.Lock()
-	conns := len(listener.conns)
-	listener.mu.Unlock()
-	if conns != 1 {
-		t.Fatalf("a repeated hello created %d connections", conns)
+	select {
+	case extra := <-peers:
+		t.Fatalf("a repeated hello created another connection: %v", extra)
+	case <-time.After(100 * time.Millisecond):
 	}
 	_ = conn.CloseWithError(nil)
 }

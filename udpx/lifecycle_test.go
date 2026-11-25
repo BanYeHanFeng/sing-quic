@@ -107,15 +107,21 @@ func TestIdleTimeoutIsSentToThePeer(t *testing.T) {
 	waitGoroutines(t, baseline, 5*time.Second)
 }
 
+// forgePacket 用本端发送密钥伪造一个带指定帧的包，冒充对端发过去。
+func forgePacket(c *Conn, frame []byte) []byte {
+	packet := header{ConnectionID: c.peerID, Type: packetTypeData}.appendTo(make([]byte, 0, headerLen+len(frame)+tagLen))
+	packet = append(packet, frame...)
+	packet = append(packet, make([]byte, tagLen)...)
+	c.sendCipher.seal(packet, headerLen, 0)
+	return packet
+}
+
 // 接收循环遇到致命错误时收尾，并且尽力告诉对端。
 func TestReceiveErrorEndsTheConnection(t *testing.T) {
 	baseline := runtime.NumGoroutine()
 	client, server, listener := testSetup(t, Options{}, Options{})
-	packet := header{ConnectionID: server.localID, Type: packetTypeData}.appendTo(make([]byte, 0, 32))
-	packet = append(packet, 0x7e, 0, 0)
-	packet = append(packet, make([]byte, tagLen)...)
-	client.sendCipher.seal(packet, headerLen, 0)
-	if _, err := client.socket.WriteTo(packet, listener.socket.LocalAddr()); err != nil {
+	packet := forgePacket(client.Conn, []byte{0x7e, 0, 0})
+	if _, err := client.socket.WriteTo(packet, server.LocalAddr()); err != nil {
 		t.Fatal(err)
 	}
 	waitDone(t, server.Context(), 3*time.Second)

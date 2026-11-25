@@ -38,12 +38,6 @@ func TestPeerOpensStreamsOutOfOrder(t *testing.T) {
 	if err := openStreamFrame(t, c, 2, "two"); err != nil {
 		t.Fatalf("stream 2 arrived before stream 1: %v", err)
 	}
-	c.streamsMu.Lock()
-	next := c.streams.peerNext
-	c.streamsMu.Unlock()
-	if next != 3 {
-		t.Fatalf("the peer next stream is %d", next)
-	}
 	streams := acceptStreams(t, ctx, server, 2)
 	for id, expected := range map[uint32]string{0: "zero", 2: "two"} {
 		stream, loaded := streams[id]

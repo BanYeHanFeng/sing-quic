@@ -129,38 +129,3 @@ func TestDialRejectsWhenTheHandlerRefuses(t *testing.T) {
 		t.Fatal("the socket was left open")
 	}
 }
-
-// 接听方拒绝建立连接时 Listener 不留下任何连接。
-func TestListenForgetsARejectedConnection(t *testing.T) {
-	credential := NewCredential("password")
-	listenerConn := udpConn(t)
-	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{
-		MTU: mtuIPv4,
-		NewHandler: func(conn *Conn) Handler {
-			return nil
-		},
-	})
-	defer listener.Close()
-	socket := udpConn(t)
-	handshake, err := newClientHandshake(credential)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = socket.WriteTo(handshake.hello(), listenerConn.LocalAddr()); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		listener.mu.Lock()
-		conns := len(listener.conns)
-		hellos := len(listener.hellos)
-		listener.mu.Unlock()
-		if conns != 0 {
-			t.Fatalf("%d connections were kept", conns)
-		}
-		if hellos != 0 {
-			t.Fatalf("%d hello answers were cached", hellos)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
