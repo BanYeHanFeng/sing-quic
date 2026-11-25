@@ -244,10 +244,10 @@ func (c closeCode) err() error {
 
 func closeCodeOf(err error) closeCode {
 	switch {
-	case err == nil, errors.Is(err, net.ErrClosed):
-		return closeCodeNormal
 	case errors.Is(err, ErrIdleTimeout):
 		return closeCodeIdleTimeout
+	case IsNormalClose(err):
+		return closeCodeNormal
 	default:
 		return closeCodeError
 	}

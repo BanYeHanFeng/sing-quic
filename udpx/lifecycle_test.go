@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"runtime"
 	"testing"
 	"time"
@@ -134,4 +135,22 @@ func TestReceiveErrorEndsTheConnection(t *testing.T) {
 	}
 	_ = listener.Close()
 	waitGoroutines(t, baseline, 5*time.Second)
+}
+
+func TestCloseCodeTable(t *testing.T) {
+	for _, testCase := range []struct {
+		err  error
+		code closeCode
+	}{
+		{nil, closeCodeNormal},
+		{net.ErrClosed, closeCodeNormal},
+		{os.ErrClosed, closeCodeNormal},
+		{ErrIdleTimeout, closeCodeIdleTimeout},
+		{ErrProbeTimeout, closeCodeNormal},
+		{errUnknownFrame, closeCodeError},
+	} {
+		if code := closeCodeOf(testCase.err); code != testCase.code {
+			t.Fatalf("%v maps to %d", testCase.err, code)
+		}
+	}
 }
