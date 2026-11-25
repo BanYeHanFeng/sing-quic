@@ -90,3 +90,42 @@ func TestPeerCloseEndsTheAssociation(t *testing.T) {
 		t.Fatalf("the server ended with %v", cause)
 	}
 }
+
+// 空闲超时由发送循环自己发现：它必须先把 CLOSE 发出去，再收尾。
+func TestIdleTimeoutIsSentToThePeer(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+	client, server, listener := testSetup(t, Options{IdleTimeout: 150 * time.Millisecond}, Options{IdleTimeout: 10 * time.Second})
+	waitDone(t, client.Context(), 3*time.Second)
+	if cause := context.Cause(client.Context()); !errors.Is(cause, ErrIdleTimeout) {
+		t.Fatalf("the client ended with %v", cause)
+	}
+	waitDone(t, server.Context(), 2*time.Second)
+	if cause := context.Cause(server.Context()); !errors.Is(cause, ErrIdleTimeout) {
+		t.Fatalf("the server ended with %v", cause)
+	}
+	_ = listener.Close()
+	waitGoroutines(t, baseline, 5*time.Second)
+}
+
+// 接收循环遇到致命错误时收尾，并且尽力告诉对端。
+func TestReceiveErrorEndsTheConnection(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+	client, server, listener := testSetup(t, Options{}, Options{})
+	packet := header{ConnectionID: server.localID, Type: packetTypeData}.appendTo(make([]byte, 0, 32))
+	packet = append(packet, 0x7e, 0, 0)
+	packet = append(packet, make([]byte, tagLen)...)
+	client.sendCipher.seal(packet, headerLen, 0)
+	if _, err := client.socket.WriteTo(packet, listener.socket.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, server.Context(), 3*time.Second)
+	if cause := context.Cause(server.Context()); !errors.Is(cause, errUnknownFrame) {
+		t.Fatalf("the server ended with %v", cause)
+	}
+	waitDone(t, client.Context(), 2*time.Second)
+	if cause := context.Cause(client.Context()); IsNormalClose(cause) {
+		t.Fatalf("the client ended with %v", cause)
+	}
+	_ = listener.Close()
+	waitGoroutines(t, baseline, 5*time.Second)
+}

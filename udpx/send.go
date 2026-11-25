@@ -3,69 +3,60 @@ package udpx
 import (
 	"encoding/binary"
 	"errors"
+	"slices"
 	"syscall"
 	"time"
 
-	"github.com/sagernet/sing-quic/udpx/internal/udpio"
-
 	"github.com/sagernet/sing-quic/udpx/internal/congestion"
-
-	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing-quic/udpx/internal/udpio"
 )
 
-type sendOutcome struct {
+type stepOutcome struct {
 	packets []udpio.Packet
+	wait    time.Duration
 	cause   error
+	done    bool
 }
 
-func (c *Conn) sendStep(now time.Time) sendOutcome {
+// step 一次加锁内完成：定时器、探测规划、打包、算下一次唤醒。
+func (c *Conn) step(now time.Time) stepOutcome {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 	s := &c.send
-	var outcome sendOutcome
-	if cause := s.runTimers(now); cause != nil {
-		outcome.cause = cause
-		return outcome
+	var outcome stepOutcome
+	outcome.cause = s.runTimers(now)
+	if outcome.cause == nil {
+		s.batch.reset()
+		s.planProbe()
+		s.take(now)
+		outcome.packets = s.packets()
 	}
-	s.batch.reset()
-	maxPayload := s.payloadSize()
-	s.planProbe()
-	if s.shouldPack(now) {
-		s.pack(now, maxPayload)
+	outcome.done = s.idle()
+	if wait := time.Until(s.nextDeadline(now)); wait > 0 {
+		outcome.wait = wait
 	}
-	s.batch.packets = s.batch.packets[:0]
-	remote := *c.peerAddr.Load()
-	for _, sent := range s.batch.sent {
-		s.batch.packets = append(s.batch.packets, udpio.Packet{Data: sent.data, Addr: remote})
-	}
-	outcome.packets = s.batch.packets
 	return outcome
 }
 
 func (c *Conn) sendLoop() {
+	defer c.finishFromLoop()
 	defer close(c.sendDone)
 	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
 	for {
-		outcome := c.sendStep(time.Now())
+		outcome := c.step(time.Now())
 		if len(outcome.packets) > 0 {
-			err := c.io.WritePackets(outcome.packets)
-			if err != nil {
-				if c.sendWriteFailed(err) {
-					continue
-				}
-				c.shutdown(E.Cause(err, "write packets"), false)
-				return
+			if err := c.write(outcome.packets); err != nil {
+				c.fail(err, false)
 			}
 		}
 		if outcome.cause != nil {
-			c.shutdown(outcome.cause, true)
+			c.fail(outcome.cause, true)
+		}
+		if outcome.done {
 			return
 		}
-		if c.sendIdle() {
-			return
-		}
-		timer.Reset(c.sendWait())
+		timer.Reset(outcome.wait)
 		select {
 		case <-c.sendWake:
 		case <-timer.C:
@@ -75,65 +66,61 @@ func (c *Conn) sendLoop() {
 	}
 }
 
-func (c *Conn) sendWait() time.Duration {
-	c.sendMu.Lock()
-	deadline := c.send.nextDeadline(time.Now())
-	c.sendMu.Unlock()
-	wait := time.Until(deadline)
-	if wait < 0 {
-		return 0
-	}
-	return wait
-}
-
-func (c *Conn) sendWriteFailed(err error) bool {
+// write 发出本批包。EMSGSIZE 说明路径装不下：丢弃探测候选或下调 MTU，帧放回队列重发。
+func (c *Conn) write(packets []udpio.Packet) error {
+	err := c.io.WritePackets(packets)
 	if !isMessageTooLong(err) {
-		return false
+		return err
 	}
+	var tooLarge int
 	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
 	s := &c.send
 	failed := append([]*sentPacket(nil), s.batch.sent...)
-	var probed bool
-	for _, sent := range failed {
-		probed = probed || sent.mtu
-	}
-	if probed {
-		candidate := s.mtu.candidate
+	probed := slices.ContainsFunc(failed, func(packet *sentPacket) bool { return packet.mtu })
+	switch {
+	case probed:
+		tooLarge = s.mtu.candidate
 		s.mtu.dropCandidate()
-		c.logDebug("mtu ", candidate, " too large for the path")
 		s.releaseFailed(failed)
-		return true
+	case s.stepDown():
+		tooLarge = s.mtu.size
+		s.releaseFailed(failed)
 	}
-	if !s.stepDown() {
-		c.logDebug("mtu ", s.mtu.size, " refused by the socket and no candidate is left")
-		return false
+	mtu := s.mtu.size
+	c.sendMu.Unlock()
+	if probed {
+		c.logDebug("mtu ", tooLarge, " too large for the path")
+		return nil
 	}
-	c.logDebug("mtu refused by the socket, mtu now ", s.mtu.size)
-	s.releaseFailed(failed)
-	return true
+	if tooLarge == 0 {
+		return err
+	}
+	c.logDebug("mtu ", tooLarge, " refused by the socket, mtu now ", mtu)
+	return nil
 }
 
+func isMessageTooLong(err error) bool {
+	return errors.Is(err, syscall.EMSGSIZE)
+}
+
+// releaseFailed 把写失败的包里的帧放回队列，由累计确认重发。
 func (s *sender) releaseFailed(failed []*sentPacket) {
 	var retransmit []outFrame
 	for _, sent := range failed {
 		s.inFlight.remove(sent)
 		for index := range sent.frames {
 			frame := sent.frames[index]
-			if frame.mtu {
+			if frame.kind == frameMTU {
 				frame.release()
 				continue
 			}
+			frame.kind = frameData
 			retransmit = append(retransmit, frame)
 		}
 	}
 	if len(retransmit) > 0 {
-		s.queue = append(retransmit, s.queue...)
+		s.data = append(retransmit, s.data...)
 	}
-}
-
-func isMessageTooLong(err error) bool {
-	return errors.Is(err, syscall.EMSGSIZE)
 }
 
 func (c *Conn) queueData(frame outFrame) {
@@ -150,21 +137,13 @@ func (c *Conn) queueControl(payload []byte) {
 	c.wake()
 }
 
-func (c *Conn) sendIdle() bool {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-	return c.send.idle()
-}
-func (s *sender) pack(now time.Time, maxPayload int) {
+// take 把尽可能多的帧打成包：是否开批由 sendable 决定，批内只再受拥塞窗口限制。
+func (s *sender) take(now time.Time) {
+	if !s.sendable(now) {
+		return
+	}
 	for len(s.batch.sent) < maxSendBatch {
-		if !s.hasPending() {
-			return
-		}
-		allowData := s.windowAllows()
-		if !allowData && len(s.ackQueue) == 0 && !s.queue[0].probe && !s.queue[0].mtu {
-			return
-		}
-		frames, ackEliciting := s.takeFrames(s.payloadSize(), allowData)
+		frames, ackEliciting := s.takeFrames()
 		if frames == nil {
 			return
 		}
@@ -174,42 +153,45 @@ func (s *sender) pack(now time.Time, maxPayload int) {
 	}
 }
 
-// takeFrames 取下一包的帧；第二个返回值说明这些帧是否需要对端确认。
-func (s *sender) takeFrames(maxPayload int, allowData bool) ([]outFrame, bool) {
-	if len(s.ackQueue) > 0 {
-		return takePrefix(&s.ackQueue, maxPayload, true), false
+// takeFrames 按固定顺序取下一包的帧：控制帧单独成包、MTU 探测独占一包、其余受窗口限制。
+func (s *sender) takeFrames() ([]outFrame, bool) {
+	if len(s.control) > 0 {
+		return takePrefix(&s.control, s.payloadSize(), nil), false
 	}
-	if len(s.queue) == 0 {
+	if len(s.data) == 0 {
 		return nil, false
 	}
-	head := s.queue[0]
-	if head.mtu {
-		frames := s.queue[:1:1]
-		s.queue = s.queue[1:]
-		if len(s.queue) == 0 {
-			s.queue = nil
+	if s.data[0].kind == frameMTU {
+		frames := s.data[:1:1]
+		s.data = s.data[1:]
+		if len(s.data) == 0 {
+			s.data = nil
 		}
 		return frames, true
 	}
-	if !allowData && !head.probe {
+	windowOpen := s.cc.CanSend(s.inFlight.bytes)
+	if !windowOpen && s.data[0].kind != frameProbe {
 		return nil, false
 	}
-	if head.size() > maxPayload && head.stream != nil {
-		s.splitHead(maxPayload)
+	if s.data[0].size() > s.payloadSize() && s.data[0].stream != nil {
+		s.splitHead(s.payloadSize())
 	}
-	return takePrefix(&s.queue, maxPayload, allowData), true
+	return takePrefix(&s.data, s.payloadSize(), func(frame outFrame) bool {
+		return windowOpen || frame.kind != frameData
+	}), true
 }
 
-func takePrefix(queue *[]outFrame, maxPayload int, allowData bool) []outFrame {
+// takePrefix 从队首取帧组成一个包；遇到 MTU 探测、不允许取的帧或装不下时停下。
+func takePrefix(queue *[]outFrame, maxPayload int, allow func(outFrame) bool) []outFrame {
 	frames := *queue
 	count := 0
 	size := 0
 	for count < len(frames) {
 		frame := frames[count]
-		if frame.mtu {
+		if frame.kind == frameMTU {
 			break
 		}
-		if !allowData && !frame.probe {
+		if allow != nil && !allow(frame) {
 			break
 		}
 		if size+frame.size() > maxPayload {
@@ -229,8 +211,9 @@ func takePrefix(queue *[]outFrame, maxPayload int, allowData bool) []outFrame {
 	return taken
 }
 
+// splitHead 把队首放不下的流帧就地切成两帧。
 func (s *sender) splitHead(maxPayload int) {
-	head := s.queue[0]
+	head := s.data[0]
 	if len(head.payload) <= streamHeaderLen {
 		return
 	}
@@ -244,14 +227,15 @@ func (s *sender) splitHead(maxPayload int) {
 	first := newStreamFrame(head.stream, offset, false, data[:firstLen])
 	second := newStreamFrame(head.stream, offset+uint64(firstLen), fin, data[firstLen:])
 	head.release()
-	s.queue[0] = first
-	s.queue = append(s.queue, outFrame{})
-	copy(s.queue[2:], s.queue[1:])
-	s.queue[1] = second
+	s.data[0] = first
+	s.data = append(s.data, outFrame{})
+	copy(s.data[2:], s.data[1:])
+	s.data[1] = second
 }
 
+// planProbe 规划一次 MTU 探测：探测帧追加到队尾，独占一个包。
 func (s *sender) planProbe() {
-	if s.closing || s.probePending || s.conn.options.MTU > 0 || s.mtu.active {
+	if s.closing || s.mtuQueued || s.mtu.active {
 		return
 	}
 	candidate, loaded := s.mtu.next(s.mtu.size)
@@ -268,8 +252,8 @@ func (s *sender) planProbe() {
 		return
 	}
 	s.probeSize = candidate
-	s.probePending = true
-	s.queue = append([]outFrame{{payload: probe, mtu: true}}, s.queue...)
+	s.mtuQueued = true
+	s.data = append(s.data, outFrame{kind: frameMTU, payload: probe})
 }
 
 func (s *sender) packPacket(now time.Time, frames []outFrame, ackEliciting bool) bool {
@@ -287,9 +271,11 @@ func (s *sender) packPacket(now time.Time, frames []outFrame, ackEliciting bool)
 	packet := s.batch.buffer[start : start+length]
 	h.appendTo(packet[:0])
 	offset := headerLen
+	mtu := false
 	for _, frame := range frames {
 		copy(packet[offset:], frame.payload)
 		offset += len(frame.payload)
+		mtu = mtu || frame.kind == frameMTU
 	}
 	s.conn.sendCipher.seal(packet, headerLen, packetNumber)
 	s.batch.buffer = s.batch.buffer[:start+length]
@@ -299,19 +285,16 @@ func (s *sender) packPacket(now time.Time, frames []outFrame, ackEliciting bool)
 		data:         packet,
 		size:         length,
 		packetNumber: packetNumber,
+		ackEliciting: ackEliciting,
+		mtu:          mtu,
 	}
-	for index := range frames {
-		sent.mtu = sent.mtu || frames[index].mtu
-	}
-	sent.ackEliciting = ackEliciting
-	if sent.mtu {
-		s.probePending = false
+	if mtu {
+		s.mtuQueued = false
 		s.mtu.start(s.probeSize, packetNumber, now)
 		s.probeSize = 0
 	}
 	s.sendPacket++
 	if ackEliciting {
-		sent.ackEliciting = true
 		s.lastSentAt = now
 		priorInFlight := s.inFlight.bytes
 		s.inFlight.append(sent)
@@ -319,4 +302,14 @@ func (s *sender) packPacket(now time.Time, frames []outFrame, ackEliciting bool)
 	}
 	s.batch.sent = append(s.batch.sent, sent)
 	return true
+}
+
+// packets 把本批已发出的包交给发送循环。
+func (s *sender) packets() []udpio.Packet {
+	s.batch.packets = s.batch.packets[:0]
+	remote := *s.conn.peerAddr.Load()
+	for _, sent := range s.batch.sent {
+		s.batch.packets = append(s.batch.packets, udpio.Packet{Data: sent.data, Addr: remote})
+	}
+	return s.batch.packets
 }

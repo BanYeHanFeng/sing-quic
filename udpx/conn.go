@@ -163,18 +163,31 @@ func (c *Conn) CloseWithError(err error) error {
 	return nil
 }
 
-func (c *Conn) shutdown(cause error, notifyPeer bool) {
+// fail 记录致命原因并可选地通知对端。幂等，不等待。
+func (c *Conn) fail(cause error, notifyPeer bool) {
+	c.sendMu.Lock()
+	changed := c.send.fail(cause, notifyPeer)
+	c.sendMu.Unlock()
+	if changed {
+		c.wake()
+	}
+}
+
+// cause 本次连接结束的原因。
+func (c *Conn) cause() error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	if c.send.cause != nil {
+		return c.send.cause
+	}
+	return net.ErrClosed
+}
+
+// finish 取消 ctx、结束所有流、释放 socket、通知关闭，恰好执行一次。
+func (c *Conn) finish(cause error) {
 	c.closeOnce.Do(func() {
 		if cause == nil {
 			cause = net.ErrClosed
-		}
-		c.sendMu.Lock()
-		c.send.closeLocked(cause, notifyPeer)
-		c.sendMu.Unlock()
-		c.wake()
-		select {
-		case <-c.sendDone:
-		case <-time.After(writeDrainTimeout):
 		}
 		c.cancel(cause)
 		if c.initiator {
@@ -185,6 +198,21 @@ func (c *Conn) shutdown(cause error, notifyPeer bool) {
 			c.onClose()
 		}
 	})
+}
+
+// finishFromLoop 发送循环排空自己的队列后收尾。
+func (c *Conn) finishFromLoop() {
+	c.finish(c.cause())
+}
+
+// shutdown 外部关闭：先通知对端，给它一点时间发出 CLOSE，然后收尾。
+func (c *Conn) shutdown(cause error, notifyPeer bool) {
+	c.fail(cause, notifyPeer)
+	select {
+	case <-c.sendDone:
+	case <-time.After(writeDrainTimeout):
+	}
+	c.finish(c.cause())
 }
 
 func (c *Conn) closeStreams(cause error) {

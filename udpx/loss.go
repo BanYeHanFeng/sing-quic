@@ -192,6 +192,7 @@ func (s *sender) handleAck(ack ack, now time.Time) {
 		for index := range packet.frames {
 			frame := packet.frames[index]
 			if retransmittable(frame.payload[0] & frameTypeMask) {
+				frame.kind = frameData
 				retransmit = append(retransmit, frame)
 				continue
 			}
@@ -199,7 +200,7 @@ func (s *sender) handleAck(ack ack, now time.Time) {
 		}
 	}
 	if len(retransmit) > 0 {
-		s.queue = append(retransmit, s.queue...)
+		s.data = append(retransmit, s.data...)
 	}
 	if len(acked) > 0 || len(lost) > 0 {
 		ackedInfo := make([]congestion.AckedPacketInfo, 0, len(acked))

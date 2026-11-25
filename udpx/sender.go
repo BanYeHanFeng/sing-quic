@@ -1,6 +1,7 @@
 package udpx
 
 import (
+	"net"
 	"sync"
 	"time"
 
@@ -22,16 +23,23 @@ var frameBufferPool = sync.Pool{
 	},
 }
 
+// frameKind 说明一帧在发送调度中的待遇。
+type frameKind uint8
+
+const (
+	frameData  frameKind = iota // 受拥塞窗口与 pacing 约束
+	frameProbe                  // PTO 重传：绕过拥塞窗口
+	frameMTU                    // MTU 探测：独占一个包
+)
+
 type outFrame struct {
+	kind frameKind
+
 	payload []byte
 
 	buffer *[]byte
 
 	stream *Stream
-
-	probe bool
-
-	mtu bool
 }
 
 func (f *outFrame) release() {
@@ -68,8 +76,8 @@ func newStreamFrame(stream *Stream, offset uint64, fin bool, data []byte) outFra
 type sender struct {
 	conn *Conn
 
-	queue    []outFrame // 需要对端确认的帧
-	ackQueue []outFrame // ACK 与 CLOSE，不需要对端确认，不受拥塞窗口限制
+	control []outFrame // ACK、CLOSE：不需要对端确认，不受拥塞窗口限制
+	data    []outFrame // 其余帧：一律需要对端确认
 
 	inFlight inFlight
 	batch    batch
@@ -90,10 +98,11 @@ type sender struct {
 	idleAt      time.Time
 	keepAliveAt time.Time
 
-	mtu          mtuState
-	probeSize    int
-	probePending bool
-	closing      bool
+	mtu       mtuState
+	probeSize int
+	mtuQueued bool
+	closing   bool
+	cause     error
 }
 
 func (s *sender) init(conn *Conn, mtu int) {
@@ -116,59 +125,66 @@ func (s *sender) queueData(frame outFrame) {
 		frame.release()
 		return
 	}
-	s.queue = append(s.queue, frame)
+	s.data = append(s.data, frame)
 }
 
-// queueControl 入队一个需要对端确认的控制帧；连接已 closing 时丢弃。
+// queueControl 入队一个需要对端确认的控制帧（流控、RESET_STREAM）；连接已 closing 时丢弃。
 func (s *sender) queueControl(payload []byte) {
 	if s.closing {
 		return
 	}
-	s.queue = append(s.queue, outFrame{payload: payload})
+	s.data = append(s.data, outFrame{payload: payload})
 }
 
-func (s *sender) closeLocked(cause error, notifyPeer bool) {
+// fail 记录致命原因，通知对端（可选），丢弃排队与在途的帧。幂等，不等待。
+func (s *sender) fail(cause error, notifyPeer bool) bool {
+	if s.closing {
+		return false
+	}
+	if cause == nil {
+		cause = net.ErrClosed
+	}
 	s.closing = true
-	releaseFrames(s.queue)
-	s.queue = nil
-	releaseFrames(s.ackQueue)
-	s.ackQueue = nil
+	s.cause = cause
+	releaseFrames(s.data)
+	s.data = nil
+	releaseFrames(s.control)
+	s.control = nil
 	for _, packet := range s.inFlight.clear() {
 		releaseFrames(packet.frames)
 	}
 	if notifyPeer {
-		s.ackQueue = append(s.ackQueue, outFrame{payload: appendCloseFrame(nil, closeCodeOf(cause))})
+		s.control = append(s.control, outFrame{payload: appendCloseFrame(nil, closeCodeOf(cause))})
 	}
+	return true
 }
 
+// idle 队列已排空，发送循环可以退出。
 func (s *sender) idle() bool {
-	return s.closing && len(s.ackQueue) == 0 && len(s.queue) == 0
+	return s.closing && len(s.control) == 0 && len(s.data) == 0
 }
 
-func (s *sender) pushControl(payload []byte) {
-	s.queue = append(s.queue, outFrame{payload: payload})
-}
-
-func (s *sender) windowAllows() bool {
+// pending 队首有可以发的帧，此时只差 pacing。
+func (s *sender) pending() bool {
+	if len(s.control) > 0 {
+		return true
+	}
+	if len(s.data) == 0 {
+		return false
+	}
+	if s.data[0].kind != frameData {
+		return true
+	}
 	return s.cc.CanSend(s.inFlight.bytes)
 }
 
-func (s *sender) hasPending() bool {
-	return len(s.ackQueue) > 0 || len(s.queue) > 0
-}
-
-func (s *sender) shouldPack(now time.Time) bool {
-	if len(s.ackQueue) > 0 {
-		return true
-	}
-	if len(s.queue) == 0 {
+// sendable 现在能不能发：取帧与唤醒计算共用这一处判定。
+func (s *sender) sendable(now time.Time) bool {
+	if !s.pending() {
 		return false
 	}
-	if s.queue[0].probe || s.queue[0].mtu {
+	if len(s.control) > 0 || s.data[0].kind != frameData {
 		return true
-	}
-	if !s.windowAllows() {
-		return false
 	}
 	return s.cc.PacingWait(now) <= 0
 }
@@ -205,8 +221,8 @@ func (s *sender) runTimers(now time.Time) error {
 		if s.keepAliveAt.IsZero() {
 			s.keepAliveAt = now.Add(keepAlive)
 		} else if !now.Before(s.keepAliveAt) {
-			if s.inFlight.len() == 0 && len(s.queue) == 0 {
-				s.pushControl(appendPingFrame(nil))
+			if s.inFlight.len() == 0 && len(s.data) == 0 {
+				s.queueData(outFrame{payload: appendPingFrame(nil)})
 			}
 			s.keepAliveAt = now.Add(keepAlive)
 		}
@@ -250,16 +266,16 @@ func (s *sender) probeLocked(now time.Time) error {
 	for index := range oldest.frames {
 		frame := oldest.frames[index]
 		if retransmittable(frame.payload[0] & frameTypeMask) {
-			frame.probe = true
+			frame.kind = frameProbe
 			retransmit = append(retransmit, frame)
 			continue
 		}
 		frame.release()
 	}
 	if len(retransmit) == 0 {
-		retransmit = append(retransmit, outFrame{payload: appendPingFrame(nil), probe: true})
+		retransmit = append(retransmit, outFrame{kind: frameProbe, payload: appendPingFrame(nil)})
 	}
-	s.queue = append(retransmit, s.queue...)
+	s.data = append(retransmit, s.data...)
 	return nil
 }
 
@@ -281,7 +297,7 @@ func (s *sender) enqueueAck(now time.Time) {
 	if len(payload) == 0 {
 		return
 	}
-	s.ackQueue = append(s.ackQueue, outFrame{payload: payload})
+	s.control = append(s.control, outFrame{payload: payload})
 }
 
 func (s *sender) rxPacket(packetNumber uint32, ackEliciting bool, now time.Time) {
@@ -306,6 +322,7 @@ func (s *sender) ackDelay() time.Duration {
 	return min(maxAckDelay, max(minAckDelay, s.rtt.smoothed/8))
 }
 
+// nextDeadline 下一次需要醒来的时刻：定时器，加上“现在就能发”时的 pacing 等待。
 func (s *sender) nextDeadline(now time.Time) time.Time {
 	deadline := s.idleAt
 	consider := func(at time.Time) {
@@ -324,10 +341,7 @@ func (s *sender) nextDeadline(now time.Time) time.Time {
 	if s.inFlight.len() > 0 {
 		consider(s.ptoDeadline())
 	}
-	switch {
-	case len(s.ackQueue) > 0:
-		consider(now)
-	case len(s.queue) > 0 && (s.queue[0].probe || s.queue[0].mtu || s.windowAllows()):
+	if s.pending() {
 		if wait := s.cc.PacingWait(now); wait > 0 {
 			consider(now.Add(wait))
 		} else {
@@ -338,8 +352,7 @@ func (s *sender) nextDeadline(now time.Time) time.Time {
 }
 
 func (s *sender) stepDown() bool {
-	current := s.mtu.size
-	next, loaded := s.mtu.nextBelow(current)
+	next, loaded := s.mtu.nextBelow(s.mtu.size)
 	if !loaded {
 		return false
 	}
