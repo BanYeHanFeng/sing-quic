@@ -49,10 +49,11 @@ func (c *Conn) OpenStream(ctx context.Context) (*Stream, error) {
 		if c.streams.nextID < c.streams.openCredit {
 			id := c.streams.nextID<<1 | c.streams.initiatorBit
 			c.streams.nextID++
-			stream := newStream(c, id, initialStreamWindow)
+			stream := newStream(c, id)
 			c.streams.table[id] = stream
 			c.streamsMu.Unlock()
-			c.queueStreamFrame(newStreamFrame(stream, 0, false, nil))
+			c.openStreams.Add(1)
+			c.queueData(newStreamFrame(stream, 0, false, nil))
 			return stream, nil
 		}
 		credit := c.streams.credit
@@ -100,9 +101,7 @@ func (c *Conn) stream(id uint32) *Stream {
 }
 
 func (c *Conn) activeStreams() int {
-	c.streamsMu.Lock()
-	defer c.streamsMu.Unlock()
-	return len(c.streams.table)
+	return int(c.openStreams.Load())
 }
 
 func (c *Conn) removeStream(id uint32) bool {
@@ -117,6 +116,9 @@ func (c *Conn) removeStream(id uint32) bool {
 	}
 	limit := c.streams.peerLimit
 	c.streamsMu.Unlock()
+	if loaded {
+		c.openStreams.Add(-1)
+	}
 	if grant {
 		c.queueControl(appendMaxStreamsFrame(nil, limit))
 	}
@@ -143,9 +145,10 @@ func (c *Conn) acceptOpenedStream(id uint32) (*Stream, error) {
 		}
 		c.streams.peerNext = index + 1
 	}
-	stream := newStream(c, id, initialStreamWindow)
+	stream := newStream(c, id)
 	c.streams.table[id] = stream
 	c.streamsMu.Unlock()
+	c.openStreams.Add(1)
 	select {
 	case c.streams.accept <- stream:
 	default:

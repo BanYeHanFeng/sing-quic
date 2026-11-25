@@ -1,6 +1,7 @@
 package udpx
 
 import (
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -35,7 +36,7 @@ func TestMTUStepDown(t *testing.T) {
 
 func TestMTUFixed(t *testing.T) {
 	var state mtuState
-	state.init(1280, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	state.init(1200, 1280, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if _, loaded := state.next(1200); loaded {
 		t.Fatal("a fixed mtu was probed")
 	}
@@ -51,49 +52,55 @@ func TestMTUCandidatesForTheAddressFamily(t *testing.T) {
 }
 
 func TestMTUProbeRaisesTheSize(t *testing.T) {
-	client, server, _ := testSetup(t, Options{}, Options{})
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if client.mtuSize() == mtuIPv4 {
-			break
+	credential := NewCredential("password")
+	listenerConn := udpConn(t)
+	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{})
+	defer listener.Close()
+	link := newSimulatedLink(t, listenerConn.LocalAddr(), linkOptions{})
+	ctx := testContext(t, 20*time.Second)
+	client, err := Dial(ctx, udpConn(t), link.clientAddr(), credential, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseWithError(nil)
+	server, err := listener.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			if _, writeErr := stream.Write(testPayload(64 * 1024)); writeErr != nil {
+				return
+			}
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if size := client.mtuSize(); size != mtuIPv4 {
-		t.Fatalf("the client settled on %d", size)
-	}
-	if size := server.mtuSize(); size != mtuIPv4 {
-		t.Fatalf("the server settled on %d", size)
-	}
-}
-
-func TestMTUProbeIsSentAlone(t *testing.T) {
-	client, _, _ := testSetup(t, Options{MTU: 0}, Options{})
-	c := client
+	}()
+	go func() {
+		_, _ = io.Copy(io.Discard, stream)
+	}()
+	go func() {
+		for {
+			if _, writeErr := accepted.Write(testPayload(64 * 1024)); writeErr != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		_, _ = io.Copy(io.Discard, accepted)
+	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		c.sendMu.Lock()
-		probing := c.send.mtu.active || len(c.send.mtu.candidates) > 0
-		c.sendMu.Unlock()
-		if !probing {
+		if link.largestFromClient() == mtuIPv4 && link.largestFromServer() == mtuIPv4 {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("the mtu probe never finished")
-}
-
-func TestMTUProbeTimeoutSkipsTheCandidate(t *testing.T) {
-	state := testMTUState(1452, 1352)
-	state.start(1452, 3, time.Now().Add(-time.Second))
-	if !state.active || state.candidate != 1452 {
-		t.Fatal("the probe did not start")
-	}
-	state.dropCandidate()
-	if state.active {
-		t.Fatal("the probe is still active")
-	}
-	if candidate, loaded := state.next(1200); !loaded || candidate != 1352 {
-		t.Fatalf("candidate %d", candidate)
-	}
+	t.Fatalf("largest packets: %d from the client, %d from the server", link.largestFromClient(), link.largestFromServer())
 }

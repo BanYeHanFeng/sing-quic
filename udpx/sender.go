@@ -64,14 +64,17 @@ func newStreamFrame(stream *Stream, offset uint64, fin bool, data []byte) outFra
 	}
 }
 
+// sender 的全部字段由 conn.sendMu 保护。
 type sender struct {
 	conn *Conn
 
-	queue    []outFrame
-	ackQueue []outFrame
+	queue    []outFrame // 需要对端确认的帧
+	ackQueue []outFrame // ACK 与 CLOSE，不需要对端确认，不受拥塞窗口限制
 
 	inFlight inFlight
 	batch    batch
+
+	fc flowControl
 
 	rtt rttEstimator
 	cc  congestion.Controller
@@ -93,13 +96,35 @@ type sender struct {
 	closing      bool
 }
 
-func (s *sender) init(conn *Conn) {
+func (s *sender) init(conn *Conn, mtu int) {
 	s.conn = conn
+	s.mtu.init(mtu, conn.options.MTU, conn.RemoteAddr())
 	s.batch = newBatch()
+	s.fc = newFlowControl()
 	s.cc = newCongestionController()
 	s.cc.SetMinRTTProvider(&s.rtt)
-	s.mtu.init(conn.options.MTU, conn.RemoteAddr())
 	s.idleAt = time.Now().Add(conn.options.IdleTimeout)
+}
+
+func (s *sender) payloadSize() int {
+	return s.mtu.size - headerLen - tagLen
+}
+
+// queueData 入队一个需要对端确认的帧；连接已 closing 时丢弃。
+func (s *sender) queueData(frame outFrame) {
+	if s.closing {
+		frame.release()
+		return
+	}
+	s.queue = append(s.queue, frame)
+}
+
+// queueControl 入队一个需要对端确认的控制帧；连接已 closing 时丢弃。
+func (s *sender) queueControl(payload []byte) {
+	if s.closing {
+		return
+	}
+	s.queue = append(s.queue, outFrame{payload: payload})
 }
 
 func (s *sender) closeLocked(cause error, notifyPeer bool) {
@@ -170,7 +195,7 @@ func (s *sender) runTimers(now time.Time) error {
 		candidate, packetNumber := s.mtu.candidate, s.mtu.packet
 		s.mtu.dropCandidate()
 		s.dropProbe(packetNumber)
-		c.logDebug("mtu probe of ", candidate, " unanswered, mtu stays ", c.mtuSize())
+		c.logDebug("mtu probe of ", candidate, " unanswered, mtu stays ", s.mtu.size)
 	}
 	keepAlive := c.options.KeepAlivePeriod
 	if keepAlive <= 0 && activeStreams > 0 {
@@ -313,11 +338,11 @@ func (s *sender) nextDeadline(now time.Time) time.Time {
 }
 
 func (s *sender) stepDown() bool {
-	current := s.conn.mtuSize()
+	current := s.mtu.size
 	next, loaded := s.mtu.nextBelow(current)
 	if !loaded {
 		return false
 	}
-	s.conn.maxPayload.Store(int32(next - headerLen - tagLen))
+	s.mtu.size = next
 	return true
 }

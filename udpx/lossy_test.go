@@ -25,6 +25,8 @@ type simulatedLink struct {
 	closing   chan struct{}
 
 	sentFromClient atomic.Int64
+	// largest[0] 是客户端发出、largest[1] 是服务端发出的最大包长
+	largest [2]atomic.Int64
 }
 
 type linkOptions struct {
@@ -73,6 +75,10 @@ func (l *simulatedLink) forward(from, to net.PacketConn, destination func() net.
 			l.mu.Lock()
 			l.client = source
 			l.mu.Unlock()
+		}
+		largest := &l.largest[boolIndex(from == l.back)]
+		if int64(n) > largest.Load() {
+			largest.Store(int64(n))
 		}
 		packet := append([]byte(nil), buffer[:n]...)
 		loss := l.currentLoss(from == l.back)
@@ -200,6 +206,21 @@ func (l *simulatedLink) randomValue() float64 {
 	l.randomMu.Lock()
 	defer l.randomMu.Unlock()
 	return l.random.Float64()
+}
+
+func (l *simulatedLink) largestFromClient() int {
+	return int(l.largest[0].Load())
+}
+
+func (l *simulatedLink) largestFromServer() int {
+	return int(l.largest[1].Load())
+}
+
+func boolIndex(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (l *simulatedLink) clientAddr() net.Addr {

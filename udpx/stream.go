@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing/common/pipe"
@@ -29,13 +28,13 @@ func (streamResetError) Is(target error) bool {
 	return target == net.ErrClosed
 }
 
+// Stream 的发送侧字段 reset、sendOffset、sendUsed、sendLimit、closeWrite 由 conn.sendMu 保护，
+// 接收侧字段由 recvMu 保护。
 type Stream struct {
 	conn *Conn
 	id   uint32
 
-	reset atomic.Bool
-
-	sendMu        sync.Mutex
+	reset         bool // 本端已 Close
 	sendOffset    uint64
 	sendLimit     uint64
 	sendUsed      uint64
@@ -64,11 +63,11 @@ type Stream struct {
 	recvNotify chan struct{}
 }
 
-func newStream(conn *Conn, id uint32, sendLimit uint64) *Stream {
+func newStream(conn *Conn, id uint32) *Stream {
 	return &Stream{
 		conn:          conn,
 		id:            id,
-		sendLimit:     sendLimit,
+		sendLimit:     initialStreamWindow,
 		recvLimit:     initialStreamWindow,
 		recvWindow:    streamWindow,
 		writeDeadline: pipe.MakeDeadline(),
@@ -133,33 +132,29 @@ func (s *Stream) writeSome(p []byte) (int, error) {
 		return 0, s.endCause()
 	default:
 	}
-	maxPayload := int(c.maxPayload.Load())
-	s.sendMu.Lock()
-	if s.reset.Load() || s.closeWrite {
-		s.sendMu.Unlock()
+	c.sendMu.Lock()
+	if s.reset || s.closeWrite {
+		c.sendMu.Unlock()
 		return 0, net.ErrClosed
 	}
-	length := min(len(p), maxPayload-streamHeaderLen)
+	length := min(len(p), c.send.payloadSize()-streamHeaderLen)
 	if available := s.sendLimit - s.sendUsed; available < uint64(length) {
 		length = int(available)
 	}
-	c.fcMu.Lock()
-	if available := c.fc.available(); available < uint64(length) {
+	if available := c.send.fc.available(); available < uint64(length) {
 		length = int(available)
 	}
-	if length > 0 {
-		s.sendUsed += uint64(length)
-		c.fc.sendUsed += uint64(length)
-	}
-	c.fcMu.Unlock()
 	if length == 0 {
-		s.sendMu.Unlock()
+		c.sendMu.Unlock()
 		return 0, nil
 	}
+	s.sendUsed += uint64(length)
+	c.send.fc.sendUsed += uint64(length)
 	offset := s.sendOffset
 	s.sendOffset += uint64(length)
-	s.sendMu.Unlock()
-	c.queueStreamFrame(newStreamFrame(s, offset, false, p[:length]))
+	c.send.queueData(newStreamFrame(s, offset, false, p[:length]))
+	c.sendMu.Unlock()
+	c.wake()
 	return length, nil
 }
 
@@ -177,37 +172,40 @@ func (s *Stream) waitSend() error {
 }
 
 func (s *Stream) CloseWrite() error {
-	s.sendMu.Lock()
-	if s.closeWrite || s.reset.Load() {
-		s.sendMu.Unlock()
+	c := s.conn
+	c.sendMu.Lock()
+	if s.closeWrite || s.reset {
+		c.sendMu.Unlock()
 		return nil
 	}
 	s.closeWrite = true
-	offset := s.sendOffset
-	s.sendMu.Unlock()
-	s.conn.queueStreamFrame(newStreamFrame(s, offset, true, nil))
+	c.send.queueData(newStreamFrame(s, s.sendOffset, true, nil))
+	c.sendMu.Unlock()
+	c.wake()
 	s.endIfDone()
 	return nil
 }
 
 func (s *Stream) Close() error {
-	if s.reset.Swap(true) {
+	c := s.conn
+	c.sendMu.Lock()
+	if s.reset {
+		c.sendMu.Unlock()
 		return nil
 	}
-	s.sendMu.Lock()
-	closeWrite := s.closeWrite
-	sendOffset := s.sendOffset
-	s.closeWrite = true
-	s.sendMu.Unlock()
-	c := s.conn
-	if !closeWrite {
-		c.queueStreamFrame(newStreamFrame(s, sendOffset, true, nil))
+	s.reset = true
+	if !s.closeWrite {
+		s.closeWrite = true
+		c.send.queueData(newStreamFrame(s, s.sendOffset, true, nil))
 	}
+	offset := s.sendOffset
+	c.sendMu.Unlock()
+	c.wake()
 	s.recvMu.Lock()
 	readSideEnded := (s.finReceived && s.readOffset >= s.finOffset) || s.resetReceived
 	s.recvMu.Unlock()
 	if !readSideEnded {
-		c.queueControl(appendResetStreamFrame(nil, s.id, sendOffset))
+		c.queueControl(appendResetStreamFrame(nil, s.id, offset))
 	}
 	s.end(net.ErrClosed)
 	c.removeStream(s.id)
@@ -339,9 +337,9 @@ func (s *Stream) endIfDone() {
 	s.recvMu.Lock()
 	recvDone := (s.finReceived && s.readOffset >= s.finOffset) || s.resetReceived
 	s.recvMu.Unlock()
-	s.sendMu.Lock()
-	sendDone := s.closeWrite || s.reset.Load()
-	s.sendMu.Unlock()
+	s.conn.sendMu.Lock()
+	sendDone := s.closeWrite || s.reset
+	s.conn.sendMu.Unlock()
 	if recvDone && sendDone {
 		s.conn.removeStream(s.id)
 	}
@@ -374,13 +372,14 @@ func (s *Stream) signalRecv() {
 }
 
 func (s *Stream) giveSendCredit(limit uint64) {
-	s.sendMu.Lock()
+	c := s.conn
+	c.sendMu.Lock()
 	if limit <= s.sendLimit {
-		s.sendMu.Unlock()
+		c.sendMu.Unlock()
 		return
 	}
 	s.sendLimit = limit
-	s.sendMu.Unlock()
+	c.sendMu.Unlock()
 	s.signalSend()
 }
 

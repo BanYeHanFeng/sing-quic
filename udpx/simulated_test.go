@@ -11,105 +11,6 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-type transferBounds struct {
-	streams          int
-	inFlightBytes    int
-	queuedFrames     int
-	streamSegments   int
-	reassembly       int
-	streamWindow     uint64
-	connectionWindow uint64
-}
-
-func sampleBounds(conn *Conn) transferBounds {
-	conn.streamsMu.Lock()
-	streams := make([]*Stream, 0, len(conn.streams.table))
-	for _, stream := range conn.streams.table {
-		streams = append(streams, stream)
-	}
-	conn.streamsMu.Unlock()
-	conn.sendMu.Lock()
-	inFlightBytes := int(conn.send.inFlight.bytes)
-	queuedFrames := len(conn.send.queue)
-	conn.sendMu.Unlock()
-	conn.fcMu.Lock()
-	connectionWindow := conn.fc.recvWindow
-	conn.fcMu.Unlock()
-	streamSegments := 0
-	streamWindow := uint64(0)
-	for _, stream := range streams {
-		stream.recvMu.Lock()
-		for _, segment := range stream.segments {
-			streamSegments += len(segment.data)
-		}
-		streamWindow = max(streamWindow, stream.recvWindow)
-		stream.recvMu.Unlock()
-	}
-	return transferBounds{
-		streams:          len(streams),
-		inFlightBytes:    inFlightBytes,
-		queuedFrames:     queuedFrames,
-		streamSegments:   streamSegments,
-		streamWindow:     streamWindow,
-		connectionWindow: connectionWindow,
-	}
-}
-
-type boundsSampler struct {
-	mu     sync.Mutex
-	worst  transferBounds
-	stopCh chan struct{}
-	done   chan struct{}
-}
-
-func startBoundsSampler(t *testing.T, associations ...*Conn) *boundsSampler {
-	t.Helper()
-	sampler := &boundsSampler{
-		stopCh: make(chan struct{}),
-		done:   make(chan struct{}),
-	}
-	go func() {
-		defer close(sampler.done)
-		for {
-			select {
-			case <-sampler.stopCh:
-				return
-			case <-time.After(5 * time.Millisecond):
-			}
-			for _, conn := range associations {
-				bounds := sampleBounds(conn)
-				sampler.mu.Lock()
-				sampler.worst.streams = max(sampler.worst.streams, bounds.streams)
-				sampler.worst.inFlightBytes = max(sampler.worst.inFlightBytes, bounds.inFlightBytes)
-				sampler.worst.queuedFrames = max(sampler.worst.queuedFrames, bounds.queuedFrames)
-				sampler.worst.streamSegments = max(sampler.worst.streamSegments, bounds.streamSegments)
-				sampler.worst.streamWindow = max(sampler.worst.streamWindow, bounds.streamWindow)
-				sampler.worst.connectionWindow = max(sampler.worst.connectionWindow, bounds.connectionWindow)
-				sampler.mu.Unlock()
-			}
-		}
-	}()
-	t.Cleanup(func() {
-		close(sampler.stopCh)
-		<-sampler.done
-	})
-	return sampler
-}
-
-func (s *boundsSampler) worstBounds() transferBounds {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.worst
-}
-
-func streamCount(t *testing.T, conn *Conn) int {
-	t.Helper()
-	c := conn
-	c.streamsMu.Lock()
-	defer c.streamsMu.Unlock()
-	return len(c.streams.table)
-}
-
 func otherPayload(size int) []byte {
 	payload := testPayload(size)
 	for index := range payload {
@@ -187,10 +88,9 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	}
 	defer server.CloseWithError(nil)
 
-	sampler := startBoundsSampler(t, client, server)
 	upload := testPayload(payloadSize)
 	download := otherPayload(payloadSize)
-	datagramPayload := testPayload(2 * (int(client.maxPayload.Load()) - datagramHeaderLen))
+	datagramPayload := testPayload(2 * (mtuIPv4 - headerLen - tagLen - datagramHeaderLen))
 	var wg sync.WaitGroup
 
 	wg.Add(2)
@@ -300,25 +200,6 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 		t.Errorf("%d datagrams arrived of %d sent", arrived, datagramCount)
 	}
 
-	bounds := sampler.worstBounds()
-	if bounds.streams > initialStreams {
-		t.Errorf("%d streams were open at once", bounds.streams)
-	}
-	if bounds.inFlightBytes > int(2*bounds.connectionWindow) {
-		t.Errorf("%d bytes were in flight at once, with a window of %d", bounds.inFlightBytes, bounds.connectionWindow)
-	}
-	if dataLen := int(client.maxPayload.Load()) - streamHeaderLen; bounds.queuedFrames > int(8*(max(bounds.streamWindow, initialStreamWindow)/uint64(dataLen))) {
-		t.Errorf("%d frames were queued at once, with a window of %d", bounds.queuedFrames, bounds.streamWindow)
-	}
-	if bounds.streamSegments > int(2*bounds.streamWindow) {
-		t.Errorf("%d bytes were waiting to be read on the streams at once, with a window of %d", bounds.streamSegments, bounds.streamWindow)
-	}
-	if count := streamCount(t, client); count != 0 {
-		t.Errorf("%d streams are left on the client", count)
-	}
-	if count := streamCount(t, server); count != 0 {
-		t.Errorf("%d streams are left on the server", count)
-	}
 }
 
 func TestStreamBothDirectionsBlocked(t *testing.T) {

@@ -28,7 +28,7 @@ func (c *Conn) sendStep(now time.Time) sendOutcome {
 		return outcome
 	}
 	s.batch.reset()
-	maxPayload := int(c.maxPayload.Load())
+	maxPayload := s.payloadSize()
 	s.planProbe()
 	if s.shouldPack(now) {
 		s.pack(now, maxPayload)
@@ -102,20 +102,19 @@ func (c *Conn) sendWriteFailed(err error) bool {
 		candidate := s.mtu.candidate
 		s.mtu.dropCandidate()
 		c.logDebug("mtu ", candidate, " too large for the path")
-		c.releaseFailed(failed)
+		s.releaseFailed(failed)
 		return true
 	}
 	if !s.stepDown() {
-		c.logDebug("mtu ", c.mtuSize(), " refused by the socket and no candidate is left")
+		c.logDebug("mtu ", s.mtu.size, " refused by the socket and no candidate is left")
 		return false
 	}
-	c.logDebug("mtu refused by the socket, mtu now ", c.mtuSize())
-	c.releaseFailed(failed)
+	c.logDebug("mtu refused by the socket, mtu now ", s.mtu.size)
+	s.releaseFailed(failed)
 	return true
 }
 
-func (c *Conn) releaseFailed(failed []*sentPacket) {
-	s := &c.send
+func (s *sender) releaseFailed(failed []*sentPacket) {
 	var retransmit []outFrame
 	for _, sent := range failed {
 		s.inFlight.remove(sent)
@@ -137,25 +136,16 @@ func isMessageTooLong(err error) bool {
 	return errors.Is(err, syscall.EMSGSIZE)
 }
 
-func (c *Conn) queueControl(payload []byte) {
+func (c *Conn) queueData(frame outFrame) {
 	c.sendMu.Lock()
-	if c.send.closing {
-		c.sendMu.Unlock()
-		return
-	}
-	c.send.pushControl(payload)
+	c.send.queueData(frame)
 	c.sendMu.Unlock()
 	c.wake()
 }
 
-func (c *Conn) queueStreamFrame(frame outFrame) {
+func (c *Conn) queueControl(payload []byte) {
 	c.sendMu.Lock()
-	if c.send.closing {
-		c.sendMu.Unlock()
-		frame.release()
-		return
-	}
-	c.send.queue = append(c.send.queue, frame)
+	c.send.queueControl(payload)
 	c.sendMu.Unlock()
 	c.wake()
 }
@@ -174,7 +164,7 @@ func (s *sender) pack(now time.Time, maxPayload int) {
 		if !allowData && len(s.ackQueue) == 0 && !s.queue[0].probe && !s.queue[0].mtu {
 			return
 		}
-		frames, ackEliciting := s.takeFrames(maxPayload, allowData)
+		frames, ackEliciting := s.takeFrames(s.payloadSize(), allowData)
 		if frames == nil {
 			return
 		}
@@ -264,7 +254,7 @@ func (s *sender) planProbe() {
 	if s.closing || s.probePending || s.conn.options.MTU > 0 || s.mtu.active {
 		return
 	}
-	candidate, loaded := s.mtu.next(s.conn.mtuSize())
+	candidate, loaded := s.mtu.next(s.mtu.size)
 	if !loaded {
 		return
 	}
@@ -313,6 +303,7 @@ func (s *sender) packPacket(now time.Time, frames []outFrame, ackEliciting bool)
 	for index := range frames {
 		sent.mtu = sent.mtu || frames[index].mtu
 	}
+	sent.ackEliciting = ackEliciting
 	if sent.mtu {
 		s.probePending = false
 		s.mtu.start(s.probeSize, packetNumber, now)

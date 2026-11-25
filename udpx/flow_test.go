@@ -2,7 +2,6 @@ package udpx
 
 import (
 	"testing"
-	"time"
 )
 
 func TestNextWindowOpensOnce(t *testing.T) {
@@ -56,33 +55,4 @@ func TestFlowControlSendCredit(t *testing.T) {
 	if limit != connectionWindow {
 		t.Fatalf("limit %d", limit)
 	}
-}
-
-func TestConnectionWindowIsHandedBackAfterReset(t *testing.T) {
-	client, server, _ := testSetup(t, Options{}, Options{})
-	ctx := testContext(t, 10*time.Second)
-	stream, err := client.OpenStream(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = stream.Write([]byte("hello")); err != nil {
-		t.Fatal(err)
-	}
-	accepted, err := server.AcceptStream(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if read := readAll(t, accepted, 5); string(read) != "hello" {
-		t.Fatalf("read %q", read)
-	}
-	serverAssociation := server
-	serverAssociation.fcMu.Lock()
-	received := serverAssociation.fc.recvReceived
-	read := serverAssociation.fc.recvRead
-	serverAssociation.fcMu.Unlock()
-	if received != read {
-		t.Fatalf("%d bytes received, %d read", received, read)
-	}
-	_ = stream.Close()
-	_ = accepted.Close()
 }

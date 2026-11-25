@@ -133,22 +133,23 @@ func (c *Conn) SendDatagram(channel uint32, data []byte) error {
 	if len(data) > maxDatagramSize {
 		return E.New("datagram of ", len(data), " bytes is larger than ", maxDatagramSize)
 	}
-	fragmentLen := int(c.maxPayload.Load()) - datagramHeaderLen
-	fragmentCount := (len(data) + fragmentLen - 1) / fragmentLen
-	if fragmentCount == 0 {
-		fragmentCount = 1
-	}
+	message := uint16(c.datagramMessage.Add(1))
+	c.sendMu.Lock()
+	fragmentLen := c.send.payloadSize() - datagramHeaderLen
+	fragmentCount := max((len(data)+fragmentLen-1)/fragmentLen, 1)
 	if fragmentCount > maxDatagramFragments {
+		c.sendMu.Unlock()
 		return E.New("datagram of ", len(data), " bytes does not fit in ", maxDatagramFragments, " fragments")
 	}
-	message := uint16(c.datagramMessage.Add(1))
 	for index := range fragmentCount {
 		start := index * fragmentLen
 		end := min(start+fragmentLen, len(data))
 		payload := appendDatagramHeader(nil, channel, message, uint8(index), uint8(fragmentCount), end-start)
 		payload = append(payload, data[start:end]...)
-		c.queueControl(payload)
+		c.send.queueData(outFrame{payload: payload})
 	}
+	c.sendMu.Unlock()
+	c.wake()
 	return nil
 }
 

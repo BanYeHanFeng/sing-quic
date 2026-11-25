@@ -162,10 +162,10 @@ func (s *sender) mtuConfirmed(ack ack) {
 	}
 	candidate := s.mtu.candidate
 	s.mtu.confirm()
-	if candidate <= s.conn.mtuSize() {
+	if candidate <= s.mtu.size {
 		return
 	}
-	s.conn.maxPayload.Store(int32(candidate - headerLen - tagLen))
+	s.mtu.size = candidate
 	s.conn.logDebug("mtu confirmed ", candidate)
 }
 

@@ -27,7 +27,9 @@ func mtuCandidatesFor(remote net.Addr) []int {
 	return slices.Clone(mtuCandidatesIPv4)
 }
 
+// mtuState 的字段只在 sendMu 下访问。
 type mtuState struct {
+	size       int
 	candidates []int
 
 	active    bool
@@ -36,8 +38,9 @@ type mtuState struct {
 	deadline  time.Time
 }
 
-func (m *mtuState) init(fixedMTU int, remote net.Addr) {
-	if fixedMTU > 0 {
+func (m *mtuState) init(size, configured int, remote net.Addr) {
+	m.size = size
+	if configured > 0 {
 		return
 	}
 	m.candidates = mtuCandidatesFor(remote)

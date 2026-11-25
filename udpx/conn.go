@@ -79,17 +79,14 @@ type Conn struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
-	peerAddr   atomic.Pointer[net.Addr]
-	maxPayload atomic.Int32
+	peerAddr    atomic.Pointer[net.Addr]
+	openStreams atomic.Int32 // 供发送循环的空闲判定读取
 
 	sendMu    sync.Mutex
 	send      sender
 	sendWake  chan struct{}
 	sendDone  chan struct{}
 	closeOnce sync.Once
-
-	fcMu sync.Mutex
-	fc   flowControl
 
 	streamsMu sync.Mutex
 	streams   streamTable
@@ -122,7 +119,6 @@ func newConn(conn net.PacketConn, io udpio.Conn, result handshakeResult, peer ne
 		cancel:     cancel,
 		sendWake:   make(chan struct{}, 1),
 		sendDone:   make(chan struct{}),
-		fc:         newFlowControl(),
 		streams:    newStreamTable(initiator),
 		defragger:  newDatagramDefragger(),
 		datagrams:  make(chan Datagram, datagramBacklog),
@@ -132,10 +128,9 @@ func newConn(conn net.PacketConn, io udpio.Conn, result handshakeResult, peer ne
 	if options.MTU > 0 {
 		mtu = max(mtuMin, min(options.MTU, maxPacketSize))
 	}
-	c.maxPayload.Store(int32(mtu - headerLen - tagLen))
-	c.send.init(c)
+	c.send.init(c, mtu)
 	c.logDebug("connection up local=", c.logTag,
-		" client=", initiator, " remote=", peer, " mtu=", c.mtuSize())
+		" client=", initiator, " remote=", peer, " mtu=", mtu)
 	return c
 }
 
@@ -161,10 +156,6 @@ func (c *Conn) Context() context.Context {
 
 func (c *Conn) KeyID() [keyIDLen]byte {
 	return c.keyID
-}
-
-func (c *Conn) mtuSize() int {
-	return int(c.maxPayload.Load()) + headerLen + tagLen
 }
 
 func (c *Conn) CloseWithError(err error) error {
