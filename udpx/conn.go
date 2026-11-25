@@ -109,7 +109,9 @@ type Conn struct {
 	send   sender
 
 	streamsMu sync.Mutex
-	streams   streamTable
+	streams   map[uint32]*Stream
+	outbound  outboundStreamGate
+	inbound   inboundStreamGate
 
 	defragger datagramDefragger // 只有接收循环访问
 
@@ -134,8 +136,16 @@ func newConn(socket net.PacketConn, io udpio.Conn, result handshakeResult, peer 
 		cancel:     cancel,
 		sendWake:   make(chan struct{}, 1),
 		sendDone:   make(chan struct{}),
-		streams:    newStreamTable(),
-		defragger:  newDatagramDefragger(),
+		streams:    make(map[uint32]*Stream),
+		outbound: outboundStreamGate{
+			credit:     initialStreams,
+			creditWait: make(chan struct{}),
+		},
+		inbound: inboundStreamGate{
+			limit:   initialStreams,
+			skipped: make(map[uint32]struct{}),
+		},
+		defragger: newDatagramDefragger(),
 	}
 	c.peerAddr.Store(&peer)
 	mtu := mtuMin
@@ -199,6 +209,7 @@ func (c *Conn) finish(cause error) {
 		if cause == nil {
 			cause = net.ErrClosed
 		}
+		c.logDebug("connection closed: ", cause)
 		c.cancel(cause)
 		c.closeStreams(cause)
 		if c.ownsSocket {
@@ -230,11 +241,11 @@ func (c *Conn) shutdown(cause error, notifyPeer bool) {
 
 func (c *Conn) closeStreams(cause error) {
 	c.streamsMu.Lock()
-	streams := make([]*Stream, 0, len(c.streams.table))
-	for _, stream := range c.streams.table {
+	streams := make([]*Stream, 0, len(c.streams))
+	for _, stream := range c.streams {
 		streams = append(streams, stream)
 	}
-	c.streams.table = make(map[uint32]*Stream)
+	c.streams = make(map[uint32]*Stream)
 	c.streamsMu.Unlock()
 	for _, stream := range streams {
 		stream.end(cause)

@@ -7,29 +7,18 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-// streamTable 的字段由 conn.streamsMu 保护。
-type streamTable struct {
-	table map[uint32]*Stream
-
-	// 拨号方：可以打开的流数与额度
-	nextID     uint32
-	openCredit uint32
-	credit     chan struct{}
-
-	// 接听方：允许对端打开的流数，以及跳过的序号
-	peerLimit uint32
-	peerNext  uint32
-	skipped   map[uint32]struct{}
+// outboundStreamGate 是拨号方的开流额度，字段由 conn.streamsMu 保护。
+type outboundStreamGate struct {
+	next       uint32        // 下一个要打开的流 ID
+	credit     uint32        // 对端允许本端打开的数量
+	creditWait chan struct{} // 额度增加时关闭重建
 }
 
-func newStreamTable() streamTable {
-	return streamTable{
-		table:      make(map[uint32]*Stream),
-		openCredit: initialStreams,
-		credit:     make(chan struct{}),
-		peerLimit:  initialStreams,
-		skipped:    make(map[uint32]struct{}),
-	}
+// inboundStreamGate 是接听方的接受额度，字段由 conn.streamsMu 保护。
+type inboundStreamGate struct {
+	limit   uint32              // 本端允许对端打开的数量
+	next    uint32              // 对端已出现的最大流 ID + 1
+	skipped map[uint32]struct{} // 对端跳过、尚未出现的 ID
 }
 
 func (c *Conn) OpenStream(ctx context.Context) (*Stream, error) {
@@ -38,20 +27,20 @@ func (c *Conn) OpenStream(ctx context.Context) (*Stream, error) {
 	}
 	for {
 		c.streamsMu.Lock()
-		if c.streams.nextID < c.streams.openCredit {
-			id := c.streams.nextID
-			c.streams.nextID++
+		if c.outbound.next < c.outbound.credit {
+			id := c.outbound.next
+			c.outbound.next++
 			stream := newStream(c, id)
-			c.streams.table[id] = stream
+			c.streams[id] = stream
 			c.streamsMu.Unlock()
 			c.openStreams.Add(1)
 			c.queueData(newStreamFrame(stream, 0, false, nil))
 			return stream, nil
 		}
-		credit := c.streams.credit
+		creditWait := c.outbound.creditWait
 		c.streamsMu.Unlock()
 		select {
-		case <-credit:
+		case <-creditWait:
 		case <-ctx.Done():
 			return nil, context.Cause(ctx)
 		case <-c.ctx.Done():
@@ -63,7 +52,7 @@ func (c *Conn) OpenStream(ctx context.Context) (*Stream, error) {
 func (c *Conn) stream(id uint32) *Stream {
 	c.streamsMu.Lock()
 	defer c.streamsMu.Unlock()
-	return c.streams.table[id]
+	return c.streams[id]
 }
 
 func (c *Conn) activeStreams() int {
@@ -73,15 +62,15 @@ func (c *Conn) activeStreams() int {
 // removeStream 把流移出表；对端开的一条流被移除时额度加一并发 MAX_STREAMS。
 func (c *Conn) removeStream(id uint32) bool {
 	c.streamsMu.Lock()
-	_, loaded := c.streams.table[id]
+	_, loaded := c.streams[id]
 	if loaded {
-		delete(c.streams.table, id)
+		delete(c.streams, id)
 	}
 	grant := loaded && !c.initiator
 	if grant {
-		c.streams.peerLimit++
+		c.inbound.limit++
 	}
-	limit := c.streams.peerLimit
+	limit := c.inbound.limit
 	c.streamsMu.Unlock()
 	if loaded {
 		c.openStreams.Add(-1)
@@ -97,24 +86,24 @@ func (c *Conn) removeStream(id uint32) bool {
 func (c *Conn) acceptOpenedStream(id uint32) (*Stream, error) {
 	c.streamsMu.Lock()
 	switch {
-	case id < c.streams.peerNext:
-		if _, skipped := c.streams.skipped[id]; !skipped {
+	case id < c.inbound.next:
+		if _, skipped := c.inbound.skipped[id]; !skipped {
 			c.streamsMu.Unlock()
 			return nil, nil
 		}
-		delete(c.streams.skipped, id)
-	case id >= c.streams.peerLimit:
-		limit := c.streams.peerLimit
+		delete(c.inbound.skipped, id)
+	case id >= c.inbound.limit:
+		limit := c.inbound.limit
 		c.streamsMu.Unlock()
 		return nil, E.New("the peer opened stream ", id, " with a limit of ", limit)
 	default:
-		for skipped := c.streams.peerNext; skipped < id; skipped++ {
-			c.streams.skipped[skipped] = struct{}{}
+		for skipped := c.inbound.next; skipped < id; skipped++ {
+			c.inbound.skipped[skipped] = struct{}{}
 		}
-		c.streams.peerNext = id + 1
+		c.inbound.next = id + 1
 	}
 	stream := newStream(c, id)
-	c.streams.table[id] = stream
+	c.streams[id] = stream
 	c.streamsMu.Unlock()
 	c.openStreams.Add(1)
 	go c.handler.OnStream(c, stream)
@@ -123,33 +112,33 @@ func (c *Conn) acceptOpenedStream(id uint32) (*Stream, error) {
 
 func (c *Conn) releaseSkippedStream(id uint32) {
 	c.streamsMu.Lock()
-	if _, skipped := c.streams.skipped[id]; !skipped {
+	if _, skipped := c.inbound.skipped[id]; !skipped {
 		c.streamsMu.Unlock()
 		return
 	}
-	delete(c.streams.skipped, id)
-	c.streams.peerLimit++
-	limit := c.streams.peerLimit
+	delete(c.inbound.skipped, id)
+	c.inbound.limit++
+	limit := c.inbound.limit
 	c.streamsMu.Unlock()
 	c.queueControl(appendMaxStreamsFrame(nil, limit))
 }
 
 func (c *Conn) handleMaxStreams(limit uint32) {
 	c.streamsMu.Lock()
-	if limit <= c.streams.openCredit {
+	if limit <= c.outbound.credit {
 		c.streamsMu.Unlock()
 		return
 	}
-	c.streams.openCredit = limit
-	close(c.streams.credit)
-	c.streams.credit = make(chan struct{})
+	c.outbound.credit = limit
+	close(c.outbound.creditWait)
+	c.outbound.creditWait = make(chan struct{})
 	c.streamsMu.Unlock()
 }
 
 func (c *Conn) notifyStreams() {
 	c.streamsMu.Lock()
-	streams := make([]*Stream, 0, len(c.streams.table))
-	for _, stream := range c.streams.table {
+	streams := make([]*Stream, 0, len(c.streams))
+	for _, stream := range c.streams {
 		streams = append(streams, stream)
 	}
 	c.streamsMu.Unlock()
