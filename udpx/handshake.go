@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	version = 7
+	version = 8
 
 	randomLen = 16
 

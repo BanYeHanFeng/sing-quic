@@ -9,7 +9,7 @@ import (
 
 func openStreamFrame(t *testing.T, c *Conn, index uint32, payload string) error {
 	t.Helper()
-	frame := appendStreamHeader(nil, index<<1, 0, false, len(payload))
+	frame := appendStreamHeader(nil, index, 0, false, len(payload))
 	frame = append(frame, payload...)
 	return c.handleStreamFrame(frameTypeStream, frame[frameHeaderLen:])
 }

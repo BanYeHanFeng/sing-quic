@@ -2,6 +2,7 @@ package udpx
 
 import (
 	"bytes"
+	"io"
 	"math/rand"
 	"net"
 	"sync"
@@ -387,9 +388,14 @@ func TestDownloadOverUplinkLoss(t *testing.T) {
 
 	payload := testPayload(payloadSize)
 	go func() {
-		stream, openErr := server.OpenStream(ctx)
-		if openErr != nil {
-			t.Errorf("open the download: %v", openErr)
+		stream, acceptErr := server.AcceptStream(ctx)
+		if acceptErr != nil {
+			t.Errorf("accept the download: %v", acceptErr)
+			return
+		}
+		var request [1]byte
+		if _, readErr := io.ReadFull(stream, request[:]); readErr != nil {
+			t.Errorf("read the request: %v", readErr)
 			return
 		}
 		if _, writeErr := stream.Write(payload); writeErr != nil {
@@ -401,8 +407,11 @@ func TestDownloadOverUplinkLoss(t *testing.T) {
 		}
 	}()
 	start := time.Now()
-	stream, err := client.AcceptStream(ctx)
+	stream, err := client.OpenStream(ctx)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = stream.Write([]byte{'q'}); err != nil {
 		t.Fatal(err)
 	}
 	read, err := readToEnd(stream, len(payload))
@@ -444,19 +453,28 @@ func TestStreamOverABufferedPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stream, err := server.OpenStream(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
 	payload := testPayload(payloadSize)
 	start := time.Now()
 	go func() {
+		stream, acceptErr := server.AcceptStream(ctx)
+		if acceptErr != nil {
+			t.Errorf("accept: %v", acceptErr)
+			return
+		}
+		var request [1]byte
+		if _, readErr := io.ReadFull(stream, request[:]); readErr != nil {
+			t.Errorf("read the request: %v", readErr)
+			return
+		}
 		if _, writeErr := stream.Write(payload); writeErr != nil {
 			t.Errorf("write: %v", writeErr)
 		}
 	}()
-	accepted, err := client.AcceptStream(ctx)
+	accepted, err := client.OpenStream(ctx)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = accepted.Write([]byte{'q'}); err != nil {
 		t.Fatal(err)
 	}
 	read := 0

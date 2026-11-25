@@ -41,7 +41,7 @@ func TestFrameRoundTrip(t *testing.T) {
 	payload = appendStreamHeader(payload, 3, 1<<20, true, 5)
 	payload = append(payload, "hello"...)
 	payload = appendResetStreamFrame(payload, 9, 1<<21)
-	payload = appendDatagramHeader(payload, 11, 12, 1, 2, 3)
+	payload = appendDatagramHeader(payload, 12, 1, 2, 3)
 	payload = append(payload, "abc"...)
 	payload = appendPaddingFrame(payload, 4)
 
@@ -79,7 +79,7 @@ func TestFrameRoundTrip(t *testing.T) {
 		t.Fatal("reset")
 	}
 	datagram := parseDatagram(frames[7].Body)
-	if datagram.channel != 11 || datagram.message != 12 || datagram.index != 1 || datagram.total != 2 || string(datagram.data) != "abc" {
+	if datagram.message != 12 || datagram.index != 1 || datagram.total != 2 || string(datagram.data) != "abc" {
 		t.Fatal("datagram")
 	}
 	if frames[8].Type != frameTypePadding || len(frames[8].Body) != 4 {
@@ -109,7 +109,7 @@ func FuzzFrame(f *testing.F) {
 	f.Add(ack{largest: 4, count: 1, ranges: [maxAckRanges]pnRange{{start: 1, end: 4}}}.appendTo(nil))
 	f.Add(appendStreamHeader(nil, 1, 2, true, 3))
 	f.Add(appendResetStreamFrame(nil, 3, 4))
-	f.Add(appendDatagramHeader(nil, 1, 2, 0, 1, 2))
+	f.Add(appendDatagramHeader(nil, 2, 0, 1, 2))
 	f.Add(appendPaddingFrame(nil, 8))
 	f.Fuzz(func(t *testing.T, payload []byte) {
 		frames, err := decodeFrames(payload)
@@ -132,7 +132,7 @@ func FuzzFrame(f *testing.F) {
 				}
 				_ = parseResetStream(frame.Body)
 			case frameTypeDatagram:
-				if len(frame.Body) < 8 {
+				if len(frame.Body) < 4 {
 					continue
 				}
 				_ = parseDatagram(frame.Body)

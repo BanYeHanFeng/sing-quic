@@ -93,7 +93,44 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	datagramPayload := testPayload(2 * (mtuIPv4 - headerLen - tagLen - datagramHeaderLen))
 	var wg sync.WaitGroup
 
-	wg.Add(2)
+	// 两条流都由客户端打开，首字节说明方向：u 上行，d 下行
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 2 {
+			stream, acceptErr := server.AcceptStream(ctx)
+			if acceptErr != nil {
+				t.Errorf("accept: %v", acceptErr)
+				return
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var tag [1]byte
+				if _, readErr := io.ReadFull(stream, tag[:]); readErr != nil {
+					t.Errorf("read the direction: %v", readErr)
+					return
+				}
+				if tag[0] == 'd' {
+					if _, writeErr := stream.Write(download); writeErr != nil {
+						t.Errorf("download: %v", writeErr)
+					}
+					_ = stream.CloseWrite()
+					return
+				}
+				read, readErr := readToEnd(stream, len(upload))
+				if readErr != nil {
+					t.Errorf("the upload stopped after %d bytes: %v", len(read), readErr)
+					return
+				}
+				if !bytes.Equal(read, upload) {
+					t.Error("the upload changed on the way")
+				}
+			}()
+		}
+	}()
+
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		stream, openErr := client.OpenStream(ctx)
@@ -101,7 +138,7 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 			t.Errorf("open the upload: %v", openErr)
 			return
 		}
-		if _, writeErr := stream.Write(upload); writeErr != nil {
+		if _, writeErr := stream.Write(append([]byte{'u'}, upload...)); writeErr != nil {
 			t.Errorf("upload: %v", writeErr)
 			return
 		}
@@ -109,44 +146,17 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 			t.Errorf("close the upload: %v", closeErr)
 		}
 	}()
-	go func() {
-		defer wg.Done()
-		stream, acceptErr := server.AcceptStream(ctx)
-		if acceptErr != nil {
-			t.Errorf("accept the upload: %v", acceptErr)
-			return
-		}
-		read, readErr := readToEnd(stream, len(upload))
-		if readErr != nil {
-			t.Errorf("the upload stopped after %d bytes: %v", len(read), readErr)
-			return
-		}
-		if !bytes.Equal(read, upload) {
-			t.Error("the upload changed on the way")
-		}
-	}()
 
-	wg.Add(2)
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		stream, openErr := server.OpenStream(ctx)
+		stream, openErr := client.OpenStream(ctx)
 		if openErr != nil {
 			t.Errorf("open the download: %v", openErr)
 			return
 		}
-		if _, writeErr := stream.Write(download); writeErr != nil {
-			t.Errorf("download: %v", writeErr)
-			return
-		}
-		if closeErr := stream.CloseWrite(); closeErr != nil {
-			t.Errorf("close the download: %v", closeErr)
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		stream, acceptErr := client.AcceptStream(ctx)
-		if acceptErr != nil {
-			t.Errorf("accept the download: %v", acceptErr)
+		if _, writeErr := stream.Write([]byte{'d'}); writeErr != nil {
+			t.Errorf("request the download: %v", writeErr)
 			return
 		}
 		read, readErr := readToEnd(stream, len(download))
@@ -169,8 +179,8 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 				arrivedDatagrams <- arrived
 				return
 			}
-			if datagram.Channel != 3 || !bytes.Equal(datagram.Data, datagramPayload) {
-				t.Errorf("a datagram on channel %d changed on the way", datagram.Channel)
+			if !bytes.Equal(datagram, datagramPayload) {
+				t.Errorf("a datagram of %d bytes changed on the way", len(datagram))
 				arrivedDatagrams <- arrived
 				return
 			}
@@ -181,7 +191,7 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for index := 0; index < datagramCount; index++ {
-			if sendErr := client.SendDatagram(3, datagramPayload); sendErr != nil {
+			if sendErr := client.SendDatagram(datagramPayload); sendErr != nil {
 				t.Errorf("datagram %d: %v", index, sendErr)
 				return
 			}

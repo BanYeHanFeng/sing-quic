@@ -94,7 +94,7 @@ func serveAssociation(ctx context.Context, conn *udpx.Conn, streamMode bool) {
 		if err != nil {
 			return
 		}
-		if err = conn.SendDatagram(datagram.Channel, datagram.Data); err != nil {
+		if err = conn.SendDatagram(datagram); err != nil {
 			return
 		}
 	}
@@ -191,10 +191,10 @@ func runDatagrams(ctx context.Context, conn *udpx.Conn, size, pps int, duration 
 			if err != nil {
 				return
 			}
-			if len(datagram.Data) < datagramHeaderLen {
+			if len(datagram) < datagramHeaderLen {
 				continue
 			}
-			at := time.Unix(0, int64(binary.BigEndian.Uint64(datagram.Data[8:])))
+			at := time.Unix(0, int64(binary.BigEndian.Uint64(datagram[8:])))
 			measure.record(at)
 		}
 	}()
@@ -203,7 +203,7 @@ func runDatagrams(ctx context.Context, conn *udpx.Conn, size, pps int, duration 
 		binary.BigEndian.PutUint64(payload[:8], sequence)
 		binary.BigEndian.PutUint64(payload[8:], uint64(time.Now().UnixNano()))
 		sequence++
-		if err := conn.SendDatagram(1, payload); err != nil {
+		if err := conn.SendDatagram(payload); err != nil {
 			return err
 		}
 		measure.sent.Add(1)

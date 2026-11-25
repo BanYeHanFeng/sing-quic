@@ -93,7 +93,7 @@ type Conn struct {
 
 	datagramMessage atomic.Uint32
 	defragger       datagramDefragger
-	datagrams       chan Datagram
+	datagrams       chan []byte
 
 	onClose func()
 }
@@ -119,9 +119,9 @@ func newConn(conn net.PacketConn, io udpio.Conn, result handshakeResult, peer ne
 		cancel:     cancel,
 		sendWake:   make(chan struct{}, 1),
 		sendDone:   make(chan struct{}),
-		streams:    newStreamTable(initiator),
+		streams:    newStreamTable(),
 		defragger:  newDatagramDefragger(),
-		datagrams:  make(chan Datagram, datagramBacklog),
+		datagrams:  make(chan []byte, datagramBacklog),
 	}
 	c.peerAddr.Store(&peer)
 	mtu := mtuMin

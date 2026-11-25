@@ -406,11 +406,41 @@ func TestStreamLocalAddrIsTheDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if accepted.ID()%2 != 0 {
-		t.Fatalf("the peer initiated stream has id %d", accepted.ID())
+	if accepted.ID() != stream.ID() {
+		t.Fatalf("the accepted stream has id %d, the opened one %d", accepted.ID(), stream.ID())
 	}
 	_ = stream.Close()
 	_ = accepted.Close()
+}
+
+func TestOnlyTheDialingSideOpensStreams(t *testing.T) {
+	_, server, _ := testSetup(t, Options{}, Options{})
+	if _, err := server.OpenStream(testContext(t, time.Second)); err == nil {
+		t.Fatal("the accepting side opened a stream")
+	}
+}
+
+func TestStreamBeyondThePeerLimitIsAnError(t *testing.T) {
+	client, server, _ := testSetup(t, Options{}, Options{})
+	ctx := testContext(t, 10*time.Second)
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = stream.Write([]byte("open")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = server.AcceptStream(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = openStreamFrame(t, server, initialStreams, "beyond"); err == nil {
+		t.Fatal("a stream beyond the limit was accepted")
+	}
+	select {
+	case <-server.Context().Done():
+		t.Fatalf("the connection ended with %v", context.Cause(server.Context()))
+	default:
+	}
 }
 
 func TestStreamLargeTransfer(t *testing.T) {

@@ -20,15 +20,7 @@ const (
 	datagramReassemblyAge = 4 * time.Second
 )
 
-type Datagram struct {
-	Channel uint32
-	Data    []byte
-}
-
-type datagramKey struct {
-	channel uint32
-	message uint16
-}
+type datagramKey uint16
 
 type datagramReassembly struct {
 	parts  [][]byte
@@ -55,7 +47,7 @@ func (d *datagramDefragger) feed(data datagramData, now time.Time) ([]byte, bool
 		return append(make([]byte, 0, len(data.data)), data.data...), true, nil
 	}
 	d.expire(now)
-	key := datagramKey{channel: data.channel, message: data.message}
+	key := datagramKey(data.message)
 	reassembly, loaded := d.entries[key]
 	if !loaded || len(reassembly.parts) != int(data.total) {
 		if loaded {
@@ -124,7 +116,7 @@ func (d *datagramDefragger) remove(key datagramKey) {
 	delete(d.entries, key)
 }
 
-func (c *Conn) SendDatagram(channel uint32, data []byte) error {
+func (c *Conn) SendDatagram(data []byte) error {
 	select {
 	case <-c.ctx.Done():
 		return context.Cause(c.ctx)
@@ -144,7 +136,7 @@ func (c *Conn) SendDatagram(channel uint32, data []byte) error {
 	for index := range fragmentCount {
 		start := index * fragmentLen
 		end := min(start+fragmentLen, len(data))
-		payload := appendDatagramHeader(nil, channel, message, uint8(index), uint8(fragmentCount), end-start)
+		payload := appendDatagramHeader(nil, message, uint8(index), uint8(fragmentCount), end-start)
 		payload = append(payload, data[start:end]...)
 		c.send.queueData(outFrame{payload: payload})
 	}
@@ -153,19 +145,19 @@ func (c *Conn) SendDatagram(channel uint32, data []byte) error {
 	return nil
 }
 
-func (c *Conn) ReceiveDatagram(ctx context.Context) (Datagram, error) {
+func (c *Conn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	select {
 	case datagram := <-c.datagrams:
 		return datagram, nil
 	case <-ctx.Done():
-		return Datagram{}, context.Cause(ctx)
+		return nil, context.Cause(ctx)
 	case <-c.ctx.Done():
-		return Datagram{}, context.Cause(c.ctx)
+		return nil, context.Cause(c.ctx)
 	}
 }
 
 func (c *Conn) handleDatagram(body []byte) error {
-	if len(body) < 8 {
+	if len(body) < 4 {
 		return errShortFrame
 	}
 	data := parseDatagram(body)
@@ -177,7 +169,7 @@ func (c *Conn) handleDatagram(body []byte) error {
 		return nil
 	}
 	select {
-	case c.datagrams <- Datagram{Channel: data.channel, Data: message}:
+	case c.datagrams <- message:
 	default:
 	}
 	return nil

@@ -2,6 +2,7 @@ package quicx
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -63,7 +64,11 @@ func FuzzAddrPort(f *testing.F) {
 func TestMessageRoundTrip(t *testing.T) {
 	destination := M.ParseSocksaddr("example.com:53")
 	message := udpMessage{destination: destination, data: []byte("payload")}
-	command, parsedDestination, payload, err := parseMessage(message.pack())
+	packed := message.pack(7)
+	if channel := binary.BigEndian.Uint32(packed); channel != 7 {
+		t.Fatalf("channel %d", channel)
+	}
+	command, parsedDestination, payload, err := parseMessage(packed[4:])
 	if err != nil {
 		t.Fatal(err)
 	}

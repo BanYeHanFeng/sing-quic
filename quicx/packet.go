@@ -134,7 +134,7 @@ func (c *channelConn) write(destination M.Socksaddr, payload []byte) error {
 		return E.New("invalid destination address")
 	}
 	message := udpMessage{destination: destination, data: payload}
-	err := c.conn.SendDatagram(c.channel, message.pack())
+	err := c.conn.SendDatagram(message.pack(c.channel))
 	if err != nil {
 		return E.Cause(err, "send message")
 	}
@@ -156,7 +156,7 @@ func (c *channelConn) Close() error {
 		}
 		c.session.access.Unlock()
 		c.closeWithError(os.ErrClosed)
-		_ = c.conn.SendDatagram(c.channel, []byte{CommandDissociate})
+		_ = c.conn.SendDatagram(packChannel(c.channel, CommandDissociate))
 	})
 	return nil
 }

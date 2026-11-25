@@ -1,6 +1,7 @@
 package quicx
 
 import (
+	"encoding/binary"
 	"io"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -20,9 +21,17 @@ type udpMessage struct {
 	data        []byte
 }
 
-func (m udpMessage) pack() []byte {
-	message := append([]byte{CommandPacket}, appendAddrPort(nil, m.destination)...)
+// pack 编成数据报负载：channel u32 | command | address | data。
+func (m udpMessage) pack(channel uint32) []byte {
+	message := binary.BigEndian.AppendUint32(nil, channel)
+	message = append(message, CommandPacket)
+	message = appendAddrPort(message, m.destination)
 	return append(message, m.data...)
+}
+
+// packChannel 编成只有通道与命令的负载。
+func packChannel(channel uint32, command byte) []byte {
+	return append(binary.BigEndian.AppendUint32(nil, channel), command)
 }
 
 func parseMessage(data []byte) (command byte, destination M.Socksaddr, payload []byte, err error) {

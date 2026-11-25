@@ -7,47 +7,42 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
+// streamTable 的字段由 conn.streamsMu 保护。
 type streamTable struct {
 	table map[uint32]*Stream
 
-	implicit map[uint32]struct{}
-
-	nextID uint32
-
+	// 拨号方：可以打开的流数与额度
+	nextID     uint32
 	openCredit uint32
+	credit     chan struct{}
 
-	credit chan struct{}
-
+	// 接听方：允许对端打开的流数，以及跳过的序号
 	peerLimit uint32
-
-	peerNext uint32
+	peerNext  uint32
+	implicit  map[uint32]struct{}
 
 	accept chan *Stream
-
-	initiatorBit uint32
 }
 
-func newStreamTable(initiator bool) streamTable {
-	var initiatorBit uint32
-	if !initiator {
-		initiatorBit = streamInitiatorBit
-	}
+func newStreamTable() streamTable {
 	return streamTable{
-		table:        make(map[uint32]*Stream),
-		implicit:     make(map[uint32]struct{}),
-		openCredit:   initialStreams,
-		credit:       make(chan struct{}),
-		peerLimit:    initialStreams,
-		accept:       make(chan *Stream, initialStreams),
-		initiatorBit: initiatorBit,
+		table:      make(map[uint32]*Stream),
+		openCredit: initialStreams,
+		credit:     make(chan struct{}),
+		peerLimit:  initialStreams,
+		implicit:   make(map[uint32]struct{}),
+		accept:     make(chan *Stream, initialStreams),
 	}
 }
 
 func (c *Conn) OpenStream(ctx context.Context) (*Stream, error) {
+	if !c.initiator {
+		return nil, E.New("only the dialing side can open a stream")
+	}
 	for {
 		c.streamsMu.Lock()
 		if c.streams.nextID < c.streams.openCredit {
-			id := c.streams.nextID<<1 | c.streams.initiatorBit
+			id := c.streams.nextID
 			c.streams.nextID++
 			stream := newStream(c, id)
 			c.streams.table[id] = stream
@@ -110,7 +105,7 @@ func (c *Conn) removeStream(id uint32) bool {
 	if loaded {
 		delete(c.streams.table, id)
 	}
-	grant := loaded && stream.accepted && id&streamInitiatorBit != c.streams.initiatorBit
+	grant := loaded && stream.accepted && !c.initiator
 	if grant {
 		c.streams.peerLimit++
 	}
@@ -125,25 +120,25 @@ func (c *Conn) removeStream(id uint32) bool {
 	return loaded
 }
 
+// acceptOpenedStream 按需建立对端打开的流：落后的序号记成已跳过，迟到的开流仍然接受。
 func (c *Conn) acceptOpenedStream(id uint32) (*Stream, error) {
-	index := id >> 1
 	c.streamsMu.Lock()
 	switch {
-	case index < c.streams.peerNext:
-		if _, implicit := c.streams.implicit[id]; !implicit {
+	case id < c.streams.peerNext:
+		if _, skipped := c.streams.implicit[id]; !skipped {
 			c.streamsMu.Unlock()
 			return nil, nil
 		}
 		delete(c.streams.implicit, id)
-	case index >= c.streams.peerLimit:
+	case id >= c.streams.peerLimit:
 		limit := c.streams.peerLimit
 		c.streamsMu.Unlock()
-		return nil, E.New("the peer opened stream ", index, " with a limit of ", limit)
+		return nil, E.New("the peer opened stream ", id, " with a limit of ", limit)
 	default:
-		for skipped := c.streams.peerNext; skipped < index; skipped++ {
-			c.streams.implicit[skipped<<1|(id&streamInitiatorBit)] = struct{}{}
+		for skipped := c.streams.peerNext; skipped < id; skipped++ {
+			c.streams.implicit[skipped] = struct{}{}
 		}
-		c.streams.peerNext = index + 1
+		c.streams.peerNext = id + 1
 	}
 	stream := newStream(c, id)
 	c.streams.table[id] = stream
@@ -160,7 +155,7 @@ func (c *Conn) acceptOpenedStream(id uint32) (*Stream, error) {
 
 func (c *Conn) releaseImplicitStream(id uint32) {
 	c.streamsMu.Lock()
-	if _, implicit := c.streams.implicit[id]; !implicit {
+	if _, skipped := c.streams.implicit[id]; !skipped {
 		c.streamsMu.Unlock()
 		return
 	}
@@ -202,7 +197,8 @@ func (c *Conn) handleStreamFrame(frameType byte, body []byte) error {
 	data := parseStreamFrame(frameType, body)
 	stream := c.stream(data.streamID)
 	if stream == nil {
-		if data.streamID&streamInitiatorBit == c.streams.initiatorBit {
+		if c.initiator {
+			// 流只由拨号方打开：表里没有说明它已经关闭，丢弃数据并归还连接级额度。
 			c.dataDropped(len(data.data))
 			return nil
 		}

@@ -164,7 +164,7 @@ const (
 
 	maxStreamsFrameLen = frameHeaderLen + 4
 
-	datagramHeaderLen = frameHeaderLen + 4 + 2 + 1 + 1
+	datagramHeaderLen = frameHeaderLen + 2 + 1 + 1
 )
 
 func retransmittable(frameType uint8) bool {
@@ -222,9 +222,8 @@ func appendStreamHeader(dst []byte, streamID uint32, offset uint64, fin bool, da
 	return binary.BigEndian.AppendUint64(dst, offset)
 }
 
-func appendDatagramHeader(dst []byte, channel uint32, message uint16, index uint8, total uint8, dataLen int) []byte {
-	dst = append(dst, frameTypeDatagram, byte((4+2+1+1+dataLen)>>8), byte(4+2+1+1+dataLen))
-	dst = binary.BigEndian.AppendUint32(dst, channel)
+func appendDatagramHeader(dst []byte, message uint16, index uint8, total uint8, dataLen int) []byte {
+	dst = append(dst, frameTypeDatagram, byte((2+1+1+dataLen)>>8), byte(2+1+1+dataLen))
 	dst = binary.BigEndian.AppendUint16(dst, message)
 	dst = append(dst, index, total)
 	return dst
@@ -292,7 +291,6 @@ func parseResetStream(body []byte) streamReset {
 
 type datagramData struct {
 	data    []byte
-	channel uint32
 	message uint16
 	index   uint8
 	total   uint8
@@ -300,10 +298,9 @@ type datagramData struct {
 
 func parseDatagram(body []byte) datagramData {
 	return datagramData{
-		channel: binary.BigEndian.Uint32(body),
-		message: binary.BigEndian.Uint16(body[4:]),
-		index:   body[6],
-		total:   body[7],
-		data:    body[8:],
+		message: binary.BigEndian.Uint16(body),
+		index:   body[2],
+		total:   body[3],
+		data:    body[4:],
 	}
 }

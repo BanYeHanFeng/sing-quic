@@ -2,6 +2,7 @@ package quicx
 
 import (
 	"context"
+	"encoding/binary"
 	"sync"
 
 	"github.com/sagernet/sing-quic/udpx"
@@ -42,16 +43,21 @@ func (s *session) run() {
 			s.closeWithError(err)
 			return
 		}
-		command, destination, payload, err := parseMessage(datagram.Data)
+		if len(datagram) < 4 {
+			s.closeWithError(E.New("datagram of ", len(datagram), " bytes has no channel"))
+			return
+		}
+		channel := binary.BigEndian.Uint32(datagram)
+		command, destination, payload, err := parseMessage(datagram[4:])
 		if err != nil {
 			s.closeWithError(E.Cause(err, "handle message"))
 			return
 		}
 		switch command {
 		case CommandPacket:
-			s.dispatch(datagram.Channel, udpMessage{destination: destination, data: payload})
+			s.dispatch(channel, udpMessage{destination: destination, data: payload})
 		case CommandDissociate:
-			s.dissociate(datagram.Channel)
+			s.dissociate(channel)
 		}
 	}
 }

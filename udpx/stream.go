@@ -14,8 +14,6 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-const streamInitiatorBit = 0x01
-
 var ErrStreamReset error = streamResetError{}
 
 type streamResetError struct{}
