@@ -133,14 +133,6 @@ func (s *sender) queueData(frame outFrame) {
 	s.data = append(s.data, frame)
 }
 
-// queueControl 入队一个需要对端确认的控制帧（流控、RESET_STREAM）；连接已 closing 时丢弃。
-func (s *sender) queueControl(payload []byte) {
-	if s.closing {
-		return
-	}
-	s.data = append(s.data, outFrame{payload: payload})
-}
-
 // fail 记录致命原因，通知对端（可选），丢弃排队与在途的帧。幂等，不等待。
 func (s *sender) fail(cause error, notifyPeer bool) bool {
 	if s.closing {

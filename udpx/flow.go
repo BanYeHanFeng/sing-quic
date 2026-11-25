@@ -72,7 +72,7 @@ func (w *receiveWindow) next() (uint64, bool) {
 // advanceWindow 在连接级接收窗口移动时入队 MAX_DATA；调用方持有 sendMu。
 func (s *sender) advanceWindow() {
 	if limit, moved := s.recv.next(); moved {
-		s.queueControl(appendMaxDataFrame(nil, limit))
+		s.queueData(outFrame{payload: appendMaxDataFrame(nil, limit)})
 	}
 }
 

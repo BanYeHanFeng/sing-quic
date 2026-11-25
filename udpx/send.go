@@ -120,18 +120,17 @@ func (s *sender) releaseFailed(failed []*sentPacket) {
 	}
 }
 
-func (c *Conn) queueData(frame outFrame) {
+// queueFrame 入队一个需要对端确认的帧。
+func (c *Conn) queueFrame(frame outFrame) {
 	c.sendMu.Lock()
 	c.send.queueData(frame)
 	c.sendMu.Unlock()
 	c.wake()
 }
 
+// queueControl 入队一个需要对端确认的控制帧（流控、RESET_STREAM）。
 func (c *Conn) queueControl(payload []byte) {
-	c.sendMu.Lock()
-	c.send.queueControl(payload)
-	c.sendMu.Unlock()
-	c.wake()
+	c.queueFrame(outFrame{payload: payload})
 }
 
 // take 把尽可能多的帧打成包：是否开批由 sendable 决定，批内只再受拥塞窗口限制。

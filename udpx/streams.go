@@ -34,7 +34,7 @@ func (c *Conn) OpenStream(ctx context.Context) (*Stream, error) {
 			c.streams[id] = stream
 			c.streamsMu.Unlock()
 			c.openStreams.Add(1)
-			c.queueData(newStreamFrame(stream, 0, false, nil))
+			c.queueFrame(newStreamFrame(stream, 0, false, nil))
 			return stream, nil
 		}
 		creditWait := c.outbound.creditWait
