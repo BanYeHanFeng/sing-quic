@@ -41,10 +41,7 @@ type Stream struct {
 
 	recvMu        sync.Mutex
 	segments      []recvSegment
-	readOffset    uint64
-	recvHighest   uint64
-	recvLimit     uint64
-	recvWindow    uint64
+	recv          receiveWindow
 	finReceived   bool
 	finOffset     uint64
 	resetReceived bool
@@ -64,8 +61,7 @@ func newStream(conn *Conn, id uint32) *Stream {
 		conn:          conn,
 		id:            id,
 		sendLimit:     initialStreamWindow,
-		recvLimit:     initialStreamWindow,
-		recvWindow:    streamWindow,
+		recv:          newStreamReceiveWindow(),
 		writeDeadline: pipe.MakeDeadline(),
 		readDeadline:  pipe.MakeDeadline(),
 		done:          make(chan struct{}),
@@ -137,7 +133,7 @@ func (s *Stream) writeSome(p []byte) (int, error) {
 	if available := s.sendLimit - s.sendUsed; available < uint64(length) {
 		length = int(available)
 	}
-	if available := c.send.fc.available(); available < uint64(length) {
+	if available := c.send.sendLimit - c.send.sendUsed; available < uint64(length) {
 		length = int(available)
 	}
 	if length == 0 {
@@ -145,7 +141,7 @@ func (s *Stream) writeSome(p []byte) (int, error) {
 		return 0, nil
 	}
 	s.sendUsed += uint64(length)
-	c.send.fc.sendUsed += uint64(length)
+	c.send.sendUsed += uint64(length)
 	offset := s.sendOffset
 	s.sendOffset += uint64(length)
 	c.send.queueData(newStreamFrame(s, offset, false, p[:length]))
@@ -198,7 +194,7 @@ func (s *Stream) Close() error {
 	c.sendMu.Unlock()
 	c.wake()
 	s.recvMu.Lock()
-	readSideEnded := (s.finReceived && s.readOffset >= s.finOffset) || s.resetReceived
+	readSideEnded := (s.finReceived && s.recv.read >= s.finOffset) || s.resetReceived
 	s.recvMu.Unlock()
 	if !readSideEnded {
 		c.queueControl(appendResetStreamFrame(nil, s.id, offset))
@@ -211,9 +207,9 @@ func (s *Stream) Close() error {
 func (s *Stream) Read(p []byte) (int, error) {
 	for {
 		s.recvMu.Lock()
-		if len(s.segments) > 0 && s.segments[0].offset == s.readOffset {
+		if len(s.segments) > 0 && s.segments[0].offset == s.recv.read {
 			read := 0
-			for read < len(p) && len(s.segments) > 0 && s.segments[0].offset == s.readOffset+uint64(read) {
+			for read < len(p) && len(s.segments) > 0 && s.segments[0].offset == s.recv.read+uint64(read) {
 				segment := s.segments[0]
 				copied := copy(p[read:], segment.data)
 				read += copied
@@ -226,18 +222,18 @@ func (s *Stream) Read(p []byte) (int, error) {
 				}
 				s.segments[0] = segment
 			}
-			s.readOffset += uint64(read)
+			s.recv.onRead(read)
 			s.recvMu.Unlock()
 			s.conn.dataRead(read)
 			s.endIfDone()
 			s.moveWindow()
 			return read, nil
 		}
-		if s.finReceived && s.readOffset >= s.finOffset {
+		if s.finReceived && s.recv.read >= s.finOffset {
 			s.recvMu.Unlock()
 			return 0, io.EOF
 		}
-		if s.resetReceived && s.readOffset >= s.resetOffset {
+		if s.resetReceived && s.recv.read >= s.resetOffset {
 			s.recvMu.Unlock()
 			return 0, ErrStreamReset
 		}
@@ -287,20 +283,16 @@ func (s *Stream) discardUnread() {
 func (s *Stream) push(offset uint64, data []byte, fin bool) (int, error) {
 	s.recvMu.Lock()
 	end := offset + uint64(len(data))
-	if end > s.recvLimit {
-		limit := s.recvLimit
+	if end > s.recv.limit {
+		limit := s.recv.limit
 		s.recvMu.Unlock()
 		return 0, E.New("stream ", s.id, " received up to ", end, " beyond its window ", limit)
 	}
-	received := 0
-	if end > s.recvHighest {
-		received = int(end - s.recvHighest)
-		s.recvHighest = end
-	}
-	if len(data) > 0 && end > s.readOffset {
-		if offset < s.readOffset {
-			data = data[s.readOffset-offset:]
-			offset = s.readOffset
+	received := s.recv.observe(end)
+	if len(data) > 0 && end > s.recv.read {
+		if offset < s.recv.read {
+			data = data[s.recv.read-offset:]
+			offset = s.recv.read
 		}
 		storeSegment(s, offset, data)
 	}
@@ -331,7 +323,7 @@ func (s *Stream) resetFromPeer(finalOffset uint64) {
 
 func (s *Stream) endIfDone() {
 	s.recvMu.Lock()
-	recvDone := (s.finReceived && s.readOffset >= s.finOffset) || s.resetReceived
+	recvDone := (s.finReceived && s.recv.read >= s.finOffset) || s.resetReceived
 	s.recvMu.Unlock()
 	s.conn.sendMu.Lock()
 	sendDone := s.closeWrite || s.reset
@@ -343,10 +335,7 @@ func (s *Stream) endIfDone() {
 
 func (s *Stream) moveWindow() {
 	s.recvMu.Lock()
-	limit, moved := nextWindow(s.recvHighest, s.readOffset, s.recvWindow, s.recvLimit)
-	if moved {
-		s.recvLimit = limit
-	}
+	limit, moved := s.recv.next()
 	s.recvMu.Unlock()
 	if moved {
 		s.conn.queueControl(appendMaxStreamDataFrame(nil, s.id, limit))

@@ -82,7 +82,10 @@ type sender struct {
 	inFlight inFlight
 	batch    batch
 
-	fc flowControl
+	// 连接级接收额度，以及名字取自对端的发送额度
+	recv      receiveWindow
+	sendLimit uint64
+	sendUsed  uint64
 
 	rtt rttEstimator
 	cc  congestion.Controller
@@ -110,7 +113,8 @@ func (s *sender) init(conn *Conn, mtu int) {
 	s.conn = conn
 	s.mtu.init(mtu, conn.options.MTU, conn.RemoteAddr())
 	s.batch = newBatch()
-	s.fc = newFlowControl()
+	s.recv = newConnectionReceiveWindow()
+	s.sendLimit = initialConnectionWindow
 	s.cc = newCongestionController()
 	s.cc.SetMinRTTProvider(&s.rtt)
 	s.idleAt = time.Now().Add(conn.options.IdleTimeout)

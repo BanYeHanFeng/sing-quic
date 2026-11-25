@@ -18,58 +18,62 @@ const (
 	initialStreams = 256
 )
 
-type flowControl struct {
-	sendLimit uint64
-	sendUsed  uint64
-
-	recvRead     uint64
-	recvReceived uint64
-	recvLimit    uint64
-	recvWindow   uint64
+// receiveWindow 是连接级与流级共用的接收额度。
+// 流级用 observe 把 received 推到见过的最大偏移，连接级用 add 累加。
+type receiveWindow struct {
+	read     uint64 // 上层已取走的字节
+	received uint64 // 已收到的字节
+	limit    uint64 // 已通告的上限
+	window   uint64 // 每次推进的窗口大小
 }
 
-func newFlowControl() flowControl {
-	return flowControl{
-		sendLimit:  initialConnectionWindow,
-		recvLimit:  initialConnectionWindow,
-		recvWindow: connectionWindow,
-	}
+func newStreamReceiveWindow() receiveWindow {
+	return receiveWindow{limit: initialStreamWindow, window: streamWindow}
 }
 
-func (f *flowControl) available() uint64 {
-	if f.sendUsed >= f.sendLimit {
+func newConnectionReceiveWindow() receiveWindow {
+	return receiveWindow{limit: initialConnectionWindow, window: connectionWindow}
+}
+
+// add 记入 n 个已收字节；超出已通告的窗口说明对端犯规。
+func (w *receiveWindow) add(n int) bool {
+	w.received += uint64(n)
+	return w.received <= w.limit
+}
+
+// observe 把 received 推到 end，返回新增的字节数。
+func (w *receiveWindow) observe(end uint64) int {
+	if end <= w.received {
 		return 0
 	}
-	return f.sendLimit - f.sendUsed
+	received := int(end - w.received)
+	w.received = end
+	return received
 }
 
-func (f *flowControl) nextReceiveLimit() (uint64, bool) {
-	limit, moved := nextWindow(f.recvReceived, f.recvRead, f.recvWindow, f.recvLimit)
-	if !moved {
+// onRead 读侧归还额度。
+func (w *receiveWindow) onRead(n int) {
+	w.read += uint64(n)
+}
+
+// next 在窗口被用掉一半以上时推进，返回新上限。
+func (w *receiveWindow) next() (uint64, bool) {
+	if w.received < w.limit && w.limit-w.received > w.window/2 {
 		return 0, false
 	}
-	f.recvLimit = limit
+	limit := min(w.received+w.window, w.read+2*w.window)
+	if limit <= w.limit {
+		return 0, false
+	}
+	w.limit = limit
 	return limit, true
 }
 
-func nextWindow(highest, read, window, current uint64) (uint64, bool) {
-	if highest < current && current-highest > window/2 {
-		return 0, false
-	}
-	limit := min(highest+window, read+2*window)
-	if limit <= current {
-		return 0, false
-	}
-	return limit, true
-}
-
-// advanceWindow 在连接级接收窗口移动时入队 MAX_DATA 并报告；调用方持有 sendMu。
-func (s *sender) advanceWindow() bool {
-	limit, moved := s.fc.nextReceiveLimit()
-	if moved {
+// advanceWindow 在连接级接收窗口移动时入队 MAX_DATA；调用方持有 sendMu。
+func (s *sender) advanceWindow() {
+	if limit, moved := s.recv.next(); moved {
 		s.queueControl(appendMaxDataFrame(nil, limit))
 	}
-	return moved
 }
 
 func (c *Conn) handleMaxData(body []byte) error {
@@ -78,9 +82,9 @@ func (c *Conn) handleMaxData(body []byte) error {
 	}
 	limit := binary.BigEndian.Uint64(body)
 	c.sendMu.Lock()
-	moved := c.send.fc.sendLimit < limit
+	moved := c.send.sendLimit < limit
 	if moved {
-		c.send.fc.sendLimit = limit
+		c.send.sendLimit = limit
 	}
 	c.sendMu.Unlock()
 	if moved {
@@ -96,14 +100,10 @@ func (c *Conn) dataReceived(n int) error {
 	}
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
-	fc := &c.send.fc
-	fc.recvReceived += uint64(n)
-	if fc.recvReceived > fc.recvLimit {
-		return E.New("connection received ", fc.recvReceived, " bytes beyond its window ", fc.recvLimit)
+	if !c.send.recv.add(n) {
+		return E.New("connection received ", c.send.recv.received, " bytes beyond its window ", c.send.recv.limit)
 	}
-	if c.send.advanceWindow() {
-		c.wake()
-	}
+	c.send.advanceWindow()
 	return nil
 }
 
@@ -114,10 +114,8 @@ func (c *Conn) dataRead(n int) {
 	}
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
-	c.send.fc.recvRead += uint64(n)
-	if c.send.advanceWindow() {
-		c.wake()
-	}
+	c.send.recv.onRead(n)
+	c.send.advanceWindow()
 }
 
 // dataDropped 丢弃已关闭的流上的数据，额度立即归还。
@@ -127,9 +125,7 @@ func (c *Conn) dataDropped(n int) {
 	}
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
-	c.send.fc.recvReceived += uint64(n)
-	c.send.fc.recvRead += uint64(n)
-	if c.send.advanceWindow() {
-		c.wake()
-	}
+	c.send.recv.add(n)
+	c.send.recv.onRead(n)
+	c.send.advanceWindow()
 }
