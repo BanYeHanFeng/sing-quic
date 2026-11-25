@@ -156,14 +156,6 @@ const (
 const (
 	streamHeaderLen = frameHeaderLen + 4 + 8
 
-	resetStreamFrameLen = frameHeaderLen + 4 + 8 + 1
-
-	maxStreamDataFrameLen = frameHeaderLen + 4 + 8
-
-	maxDataFrameLen = frameHeaderLen + 8
-
-	maxStreamsFrameLen = frameHeaderLen + 4
-
 	datagramHeaderLen = frameHeaderLen + 2 + 1 + 1
 )
 
