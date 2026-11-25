@@ -15,7 +15,7 @@ type idleSimulation struct {
 
 func newIdleSimulation() *idleSimulation {
 	controller := newBbrSender(testDatagramSize, initialCongestionWindowPackets)
-	controller.SetRTTStatsProvider(fixedRTT(testRoundTrip))
+	controller.SetMinRTTProvider(fixedRTT(testRoundTrip))
 	return &idleSimulation{controller: controller, now: time.Unix(0, 0)}
 }
 

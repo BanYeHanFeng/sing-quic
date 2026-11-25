@@ -75,23 +75,20 @@ func TestRoundTrip(t *testing.T) {
 	for _, testCase := range []struct {
 		name     string
 		sendPath string
-		readGRO  bool
 	}{
-		{name: "plain to plain", sendPath: "plain"},
-		{name: "batched to plain", sendPath: "batched"},
-		{name: "plain to gro", sendPath: "plain", readGRO: true},
-		{name: "batched to gro", sendPath: "batched", readGRO: true},
+		{name: "plain sender", sendPath: "plain"},
+		{name: "batched sender", sendPath: "batched"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			receiver := listenPacket(t)
 			sender := listenPacket(t)
 			var senderConn Conn
 			if testCase.sendPath == "batched" {
-				senderConn = New(sender, Options{})
+				senderConn = New(sender)
 			} else {
-				senderConn = New(&wrapper{PacketConn: sender}, Options{})
+				senderConn = New(&wrapper{PacketConn: sender})
 			}
-			receiverConn := New(receiver, Options{GRO: testCase.readGRO})
+			receiverConn := New(receiver)
 			receiverAddr, isUDPAddr := receiver.LocalAddr().(*net.UDPAddr)
 			if !isUDPAddr {
 				t.Fatalf("local address is %T", receiver.LocalAddr())
@@ -110,27 +107,25 @@ func TestRoundTrip(t *testing.T) {
 			received := 0
 			merged := 0
 			for received < len(payloads) {
-				packets, err := receiverConn.ReadPackets([][]byte{buffer})
+				packet, err := receiverConn.ReadPacket(buffer)
 				if err != nil {
 					t.Fatalf("read after %d payloads: %v", received, err)
 				}
-				for _, packet := range packets {
-					if packet.Segments > 1 {
-						merged++
-					}
-					packet.ForEach(func(datagram []byte) {
-						if received >= len(payloads) {
-							t.Errorf("received more than the %d payloads sent", len(payloads))
-							return
-						}
-						if !bytes.Equal(datagram, payloads[received]) {
-							t.Errorf("payload %d is %d bytes, want %d", received, len(datagram), len(payloads[received]))
-						}
-						received++
-					})
+				if packet.Segments > 1 {
+					merged++
 				}
+				packet.ForEach(func(datagram []byte) {
+					if received >= len(payloads) {
+						t.Errorf("received more than the %d payloads sent", len(payloads))
+						return
+					}
+					if !bytes.Equal(datagram, payloads[received]) {
+						t.Errorf("payload %d is %d bytes, want %d", received, len(datagram), len(payloads[received]))
+					}
+					received++
+				})
 			}
-			if testCase.readGRO && merged == 0 {
+			if merged == 0 {
 				t.Log("the kernel did not merge any reads, so GRO was not exercised")
 			}
 		})
@@ -138,7 +133,7 @@ func TestRoundTrip(t *testing.T) {
 }
 
 func TestWriteRejectsUnknownAddress(t *testing.T) {
-	conn := New(&wrapper{PacketConn: listenPacket(t)}, Options{})
+	conn := New(&wrapper{PacketConn: listenPacket(t)})
 	err := conn.WritePackets([]Packet{{Data: []byte("x"), Addr: nil}})
 	if err == nil {
 		t.Fatal("a packet without an address was written")
@@ -146,13 +141,12 @@ func TestWriteRejectsUnknownAddress(t *testing.T) {
 }
 
 func TestOffload(t *testing.T) {
-	batched := New(listenPacket(t), Options{GRO: true})
+	batched := New(listenPacket(t))
 	gso, gro := batched.Offload()
 	if !gso || !gro {
 		t.Skipf("this kernel offers gso=%v gro=%v", gso, gro)
 	}
-	plain := New(&wrapper{PacketConn: listenPacket(t)}, Options{GRO: true})
-	if gso, gro := plain.Offload(); gso || gro {
+	if gso, gro := New(&wrapper{PacketConn: listenPacket(t)}).Offload(); gso || gro {
 		t.Fatalf("a socket without a file descriptor reported gso=%v gro=%v", gso, gro)
 	}
 }

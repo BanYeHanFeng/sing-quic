@@ -177,7 +177,7 @@ func TestUnequalSend(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			sender := listenPacket(t)
 			receiver := listenPacket(t)
-			senderConn := New(sender, Options{})
+			senderConn := New(sender)
 			receiverAddr, isUDPAddr := receiver.LocalAddr().(*net.UDPAddr)
 			if !isUDPAddr {
 				t.Fatalf("local address is %T", receiver.LocalAddr())
@@ -229,7 +229,7 @@ func TestBatchToSeveralAddresses(t *testing.T) {
 	first := listenPacket(t)
 	second := listenPacket(t)
 	sender := listenPacket(t)
-	senderConn := New(sender, Options{})
+	senderConn := New(sender)
 	payloads := makePayloadsOfSizes([]int{300, 400, 500, 600})
 	packets := []Packet{
 		{Data: payloads[0], Addr: first.LocalAddr()},
@@ -269,7 +269,7 @@ func TestBatchToSeveralAddresses(t *testing.T) {
 func TestSegmentedSend(t *testing.T) {
 	sender := listenPacket(t)
 	receiver := listenPacket(t)
-	senderConn := New(sender, Options{})
+	senderConn := New(sender)
 	if gso, _ := senderConn.Offload(); !gso {
 		t.Skip("this kernel does not offer UDP_SEGMENT")
 	}
@@ -332,7 +332,7 @@ func socketBuffer(t *testing.T, conn net.PacketConn, option int) int {
 func TestSocketBuffers(t *testing.T) {
 	conn := listenPacket(t)
 	before := socketBuffer(t, conn, unix.SO_RCVBUF)
-	if New(conn, Options{}) == nil {
+	if New(conn) == nil {
 		t.Skip("this kernel offers no batched path")
 	}
 	after := socketBuffer(t, conn, unix.SO_RCVBUF)

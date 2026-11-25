@@ -49,7 +49,7 @@ func Listen(conn net.PacketConn, verifier Verifier, options Options) *Listener {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	l := &Listener{
 		socket:      conn,
-		io:          udpio.New(conn, udpio.Options{GRO: true}),
+		io:          udpio.New(conn),
 		verifier:    verifier,
 		options:     options.withDefaults(),
 		ctx:         ctx,
@@ -97,7 +97,7 @@ func (l *Listener) shutdown(cause error) {
 func (l *Listener) readLoop() {
 	buffer := make([]byte, maxReceiveSize)
 	for {
-		packets, err := l.io.ReadPackets([][]byte{buffer})
+		packet, err := l.io.ReadPacket(buffer)
 		if err != nil {
 			if l.ctx.Err() != nil {
 				return
@@ -109,19 +109,17 @@ func (l *Listener) readLoop() {
 			continue
 		}
 		l.sweepHellos(time.Now())
-		for _, packet := range packets {
-			packet.ForEach(func(datagram []byte) {
-				packetHeader, parseErr := parseHeader(datagram)
-				if parseErr != nil {
-					return
-				}
-				if packetHeader.Type == packetTypeHandshake {
-					l.handleHello(packetHeader.ConnectionID, bytes.Clone(datagram), packet.Addr)
-					return
-				}
-				l.dispatch(packetHeader, datagram, packet.Addr)
-			})
-		}
+		packet.ForEach(func(datagram []byte) {
+			packetHeader, parseErr := parseHeader(datagram)
+			if parseErr != nil {
+				return
+			}
+			if packetHeader.Type == packetTypeHandshake {
+				l.handleHello(packetHeader.ConnectionID, bytes.Clone(datagram), packet.Addr)
+				return
+			}
+			l.dispatch(packetHeader, datagram, packet.Addr)
+		})
 	}
 }
 

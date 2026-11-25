@@ -28,25 +28,20 @@ func (p Packet) ForEach(fn func(datagram []byte)) {
 	}
 }
 
+// Conn 批量收发 UDP 包：ReadPacket 一次读入一个缓冲，GRO 合并出来的多个数据报用 Packet.ForEach 拆开。
 type Conn interface {
-	ReadPackets(buffers [][]byte) ([]Packet, error)
+	ReadPacket(buffer []byte) (Packet, error)
 
 	WritePackets(packets []Packet) error
-
-	LocalAddr() net.Addr
 
 	Offload() (gso, gro bool)
 }
 
-type Options struct {
-	GRO bool
-}
-
-func New(conn net.PacketConn, options Options) Conn {
+func New(conn net.PacketConn) Conn {
 	if conn == nil {
 		return nil
 	}
-	batched := newBatched(conn, options)
+	batched := newBatched(conn)
 	if batched != nil {
 		return batched
 	}
@@ -55,19 +50,14 @@ func New(conn net.PacketConn, options Options) Conn {
 
 type plainConn struct {
 	net.PacketConn
-	one [1]Packet
 }
 
-func (c *plainConn) ReadPackets(buffers [][]byte) ([]Packet, error) {
-	if len(buffers) == 0 {
-		return nil, nil
-	}
-	n, addr, err := c.ReadFrom(buffers[0])
+func (c *plainConn) ReadPacket(buffer []byte) (Packet, error) {
+	n, addr, err := c.ReadFrom(buffer)
 	if err != nil {
-		return nil, err
+		return Packet{}, err
 	}
-	c.one[0] = Packet{Data: buffers[0][:n], Addr: addr, Segments: 1}
-	return c.one[:], nil
+	return Packet{Data: buffer[:n], Addr: addr, Segments: 1}, nil
 }
 
 func (c *plainConn) WritePackets(packets []Packet) error {

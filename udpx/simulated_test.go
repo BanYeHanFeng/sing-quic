@@ -270,7 +270,7 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 				return
 			}
 			if datagram.Channel != 3 || !bytes.Equal(datagram.Data, datagramPayload) {
-				t.Errorf("c datagram on channel %d changed on the way", datagram.Channel)
+				t.Errorf("a datagram on channel %d changed on the way", datagram.Channel)
 				arrivedDatagrams <- arrived
 				return
 			}
@@ -305,13 +305,13 @@ func TestTransferOverSimulatedPath(t *testing.T) {
 		t.Errorf("%d streams were open at once", bounds.streams)
 	}
 	if bounds.inFlightBytes > int(2*bounds.connectionWindow) {
-		t.Errorf("%d bytes were in flight at once, with c window of %d", bounds.inFlightBytes, bounds.connectionWindow)
+		t.Errorf("%d bytes were in flight at once, with a window of %d", bounds.inFlightBytes, bounds.connectionWindow)
 	}
 	if dataLen := int(client.maxPayload.Load()) - streamHeaderLen; bounds.queuedFrames > int(8*(max(bounds.streamWindow, initialStreamWindow)/uint64(dataLen))) {
-		t.Errorf("%d frames were queued at once, with c window of %d", bounds.queuedFrames, bounds.streamWindow)
+		t.Errorf("%d frames were queued at once, with a window of %d", bounds.queuedFrames, bounds.streamWindow)
 	}
 	if bounds.streamSegments > int(2*bounds.streamWindow) {
-		t.Errorf("%d bytes were waiting to be read on the streams at once, with c window of %d", bounds.streamSegments, bounds.streamWindow)
+		t.Errorf("%d bytes were waiting to be read on the streams at once, with a window of %d", bounds.streamSegments, bounds.streamWindow)
 	}
 	if count := streamCount(t, client); count != 0 {
 		t.Errorf("%d streams are left on the client", count)
@@ -410,10 +410,10 @@ func TestAssociationEndsUnderLoad(t *testing.T) {
 	select {
 	case err = <-writeDone:
 		if err == nil {
-			t.Fatal("the write finished after the conn ended")
+			t.Fatal("the write finished after the connection ended")
 		}
 	case <-time.After(30 * time.Second):
-		t.Fatal("the write waited for an conn that ended")
+		t.Fatal("the write waited for a connection that ended")
 	}
 	select {
 	case <-client.Context().Done():
@@ -421,9 +421,9 @@ func TestAssociationEndsUnderLoad(t *testing.T) {
 		t.Fatal("the client did not notice that the peer closed")
 	}
 	if _, err = accepted.Read(make([]byte, 1)); err == nil {
-		t.Fatal("c stream of an ended conn still reads")
+		t.Fatal("a stream of an ended connection still reads")
 	}
 	if _, err = stream.Write([]byte("more")); err == nil {
-		t.Fatal("c stream of an ended conn still writes")
+		t.Fatal("a stream of an ended connection still writes")
 	}
 }

@@ -90,7 +90,7 @@ func (c *Conn) acceptedStream(stream *Stream) {
 	c.streams.peerLimit++
 	limit := c.streams.peerLimit
 	c.streamsMu.Unlock()
-	c.queueControl(appendMaxStreamsFrame(nil, limit), true)
+	c.queueControl(appendMaxStreamsFrame(nil, limit))
 }
 
 func (c *Conn) stream(id uint32) *Stream {
@@ -118,7 +118,7 @@ func (c *Conn) removeStream(id uint32) bool {
 	limit := c.streams.peerLimit
 	c.streamsMu.Unlock()
 	if grant {
-		c.queueControl(appendMaxStreamsFrame(nil, limit), true)
+		c.queueControl(appendMaxStreamsFrame(nil, limit))
 	}
 	return loaded
 }
@@ -136,7 +136,7 @@ func (c *Conn) acceptOpenedStream(id uint32) (*Stream, error) {
 	case index >= c.streams.peerLimit:
 		limit := c.streams.peerLimit
 		c.streamsMu.Unlock()
-		return nil, E.New("the peer opened stream ", index, " with c limit of ", limit)
+		return nil, E.New("the peer opened stream ", index, " with a limit of ", limit)
 	default:
 		for skipped := c.streams.peerNext; skipped < index; skipped++ {
 			c.streams.implicit[skipped<<1|(id&streamInitiatorBit)] = struct{}{}
@@ -165,7 +165,7 @@ func (c *Conn) releaseImplicitStream(id uint32) {
 	c.streams.peerLimit++
 	limit := c.streams.peerLimit
 	c.streamsMu.Unlock()
-	c.queueControl(appendMaxStreamsFrame(nil, limit), true)
+	c.queueControl(appendMaxStreamsFrame(nil, limit))
 }
 
 func (c *Conn) handleMaxStreams(limit uint32) {
@@ -230,7 +230,7 @@ func (c *Conn) handleResetStream(body []byte) error {
 		c.releaseImplicitStream(reset.streamID)
 		return nil
 	}
-	stream.resetFromPeer(reset.finalOffset, reset.code)
+	stream.resetFromPeer(reset.finalOffset)
 	c.removeStream(reset.streamID)
 	return nil
 }

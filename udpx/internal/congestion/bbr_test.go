@@ -7,9 +7,7 @@ import (
 
 type fixedRTT time.Duration
 
-func (f fixedRTT) MinRTT() time.Duration      { return time.Duration(f) }
-func (f fixedRTT) SmoothedRTT() time.Duration { return time.Duration(f) }
-func (f fixedRTT) LatestRTT() time.Duration   { return time.Duration(f) }
+func (f fixedRTT) MinRTT() time.Duration { return time.Duration(f) }
 
 const (
 	testDatagramSize = 1200
@@ -27,7 +25,7 @@ type bbrSimulation struct {
 
 func newBBRSimulation() *bbrSimulation {
 	controller := NewBbrController(testDatagramSize, initialCongestionWindowPackets)
-	controller.SetRTTStatsProvider(fixedRTT(testRoundTrip))
+	controller.SetMinRTTProvider(fixedRTT(testRoundTrip))
 	return &bbrSimulation{
 		controller: controller,
 		now:        time.Unix(0, 0),
@@ -212,7 +210,7 @@ func TestBbrProbeRttSkippedWhileLosing(t *testing.T) {
 
 func TestBbrEstimateBoundedByPacing(t *testing.T) {
 	sender := newBbrSender(testDatagramSize, initialCongestionWindowPackets)
-	sender.SetRTTStatsProvider(fixedRTT(testRoundTrip))
+	sender.SetMinRTTProvider(fixedRTT(testRoundTrip))
 	now := time.Unix(0, 0)
 	var inFlight ByteCount
 	var sent []AckedPacketInfo

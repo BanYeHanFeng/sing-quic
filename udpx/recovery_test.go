@@ -54,7 +54,7 @@ func TestPeerOpensStreamsOutOfOrder(t *testing.T) {
 	}
 	select {
 	case <-c.Context().Done():
-		t.Fatalf("the conn ended with %v", context.Cause(c.Context()))
+		t.Fatalf("the connection ended with %v", context.Cause(c.Context()))
 	default:
 	}
 }
@@ -88,15 +88,10 @@ func TestProbeRetransmitsWithoutAFlood(t *testing.T) {
 	link.setLoss(1)
 	payload := testPayload(8 * 1024)
 	mustWrite(t, stream, payload)
-	before := testSnapshot(client)
+	before := link.sentFromClient.Load()
 	time.Sleep(2 * time.Second)
-	after := testSnapshot(client)
-	probes := after.probes - before.probes
-	if probes > 20 {
-		t.Fatalf("%d probes were sent in two seconds", probes)
-	}
-	if after.inFlight > 64 {
-		t.Fatalf("%d packets are in flight", after.inFlight)
+	if sent := link.sentFromClient.Load() - before; sent > 64 {
+		t.Fatalf("%d packets were sent in two seconds of silence", sent)
 	}
 
 	link.setLoss(0)

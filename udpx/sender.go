@@ -29,8 +29,6 @@ type outFrame struct {
 
 	stream *Stream
 
-	ackEliciting bool
-
 	probe bool
 
 	mtu bool
@@ -60,10 +58,9 @@ func newStreamFrame(stream *Stream, offset uint64, fin bool, data []byte) outFra
 	payload := appendStreamHeader((*buffer)[:0], stream.id, offset, fin, len(data))
 	payload = append(payload, data...)
 	return outFrame{
-		payload:      payload,
-		buffer:       buffer,
-		stream:       stream,
-		ackEliciting: true,
+		payload: payload,
+		buffer:  buffer,
+		stream:  stream,
 	}
 }
 
@@ -76,9 +73,8 @@ type sender struct {
 	inFlight inFlight
 	batch    batch
 
-	rtt      rttEstimator
-	rttStats rttStats
-	cc       congestion.Controller
+	rtt rttEstimator
+	cc  congestion.Controller
 
 	sendPacket uint32
 	probes     int
@@ -90,8 +86,6 @@ type sender struct {
 
 	idleAt      time.Time
 	keepAliveAt time.Time
-	statsAt     time.Time
-	statsLast   statsSnapshot
 
 	mtu          mtuState
 	probeSize    int
@@ -103,10 +97,9 @@ func (s *sender) init(conn *Conn) {
 	s.conn = conn
 	s.batch = newBatch()
 	s.cc = newCongestionController()
-	s.cc.SetRTTStatsProvider(&s.rttStats)
+	s.cc.SetMinRTTProvider(&s.rtt)
 	s.mtu.init(conn.options.MTU, conn.RemoteAddr())
 	s.idleAt = time.Now().Add(conn.options.IdleTimeout)
-	s.statsAt = time.Now().Add(time.Second)
 }
 
 func (s *sender) closeLocked(cause error, notifyPeer bool) {
@@ -127,8 +120,8 @@ func (s *sender) idle() bool {
 	return s.closing && len(s.ackQueue) == 0 && len(s.queue) == 0
 }
 
-func (s *sender) pushControl(payload []byte, ackEliciting bool) {
-	s.queue = append(s.queue, outFrame{payload: payload, ackEliciting: ackEliciting})
+func (s *sender) pushControl(payload []byte) {
+	s.queue = append(s.queue, outFrame{payload: payload})
 }
 
 func (s *sender) windowAllows() bool {
@@ -177,7 +170,7 @@ func (s *sender) runTimers(now time.Time) error {
 		candidate, packetNumber := s.mtu.candidate, s.mtu.packet
 		s.mtu.dropCandidate()
 		s.dropProbe(packetNumber)
-		c.logInfo("mtu probe of ", candidate, " unanswered, mtu stays ", c.mtuSize())
+		c.logDebug("mtu probe of ", candidate, " unanswered, mtu stays ", c.mtuSize())
 	}
 	keepAlive := c.options.KeepAlivePeriod
 	if keepAlive <= 0 && activeStreams > 0 {
@@ -188,7 +181,7 @@ func (s *sender) runTimers(now time.Time) error {
 			s.keepAliveAt = now.Add(keepAlive)
 		} else if !now.Before(s.keepAliveAt) {
 			if s.inFlight.len() == 0 && len(s.queue) == 0 {
-				s.pushControl(appendPingFrame(nil), true)
+				s.pushControl(appendPingFrame(nil))
 			}
 			s.keepAliveAt = now.Add(keepAlive)
 		}
@@ -224,15 +217,14 @@ func (s *sender) probeLocked(now time.Time) error {
 		s.probeSince = now
 	}
 	if now.Sub(s.probeSince) >= maxProbeSilence {
-		s.conn.logInfo("probe ", oldest.packetNumber, " unanswered for ", maxProbeSilence, ", closing")
+		s.conn.logDebug("probe ", oldest.packetNumber, " unanswered for ", maxProbeSilence, ", closing")
 		return ErrProbeTimeout
 	}
-	s.conn.stats.probes.Add(1)
 	s.inFlight.remove(oldest)
 	var retransmit []outFrame
 	for index := range oldest.frames {
 		frame := oldest.frames[index]
-		if frame.ackEliciting && retransmittable(frame.payload[0]&frameTypeMask) {
+		if retransmittable(frame.payload[0] & frameTypeMask) {
 			frame.probe = true
 			retransmit = append(retransmit, frame)
 			continue
@@ -240,7 +232,7 @@ func (s *sender) probeLocked(now time.Time) error {
 		frame.release()
 	}
 	if len(retransmit) == 0 {
-		retransmit = append(retransmit, outFrame{payload: appendPingFrame(nil), ackEliciting: true, probe: true})
+		retransmit = append(retransmit, outFrame{payload: appendPingFrame(nil), probe: true})
 	}
 	s.queue = append(retransmit, s.queue...)
 	return nil
@@ -301,7 +293,6 @@ func (s *sender) nextDeadline(now time.Time) time.Time {
 	}
 	consider(s.ackAt)
 	consider(s.keepAliveAt)
-	consider(s.statsAt)
 	if s.mtu.active {
 		consider(s.mtu.deadline)
 	}

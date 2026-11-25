@@ -43,10 +43,9 @@ type batchedConn struct {
 	sendN    int
 	sendErr  error
 	writeFn  func(fd uintptr) bool
-	one      [1]Packet
 }
 
-func newBatched(conn net.PacketConn, options Options) Conn {
+func newBatched(conn net.PacketConn) Conn {
 	syscallConn, isSyscallConn := conn.(syscall.Conn)
 	if !isSyscallConn {
 		return nil
@@ -63,9 +62,7 @@ func newBatched(conn net.PacketConn, options Options) Conn {
 		setBuffer(int(fd), unix.SO_SNDBUF, unix.SO_SNDBUFFORCE, desiredSendBuffer)
 		_, gsoErr := unix.GetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_SEGMENT)
 		gso = gsoErr == nil
-		if options.GRO {
-			gro = unix.SetsockoptInt(int(fd), unix.IPPROTO_UDP, udpGRO, 1) == nil
-		}
+		gro = unix.SetsockoptInt(int(fd), unix.IPPROTO_UDP, udpGRO, 1) == nil
 	})
 	if err != nil {
 		return nil
@@ -86,11 +83,7 @@ func setBuffer(fd int, option int, force int, size int) {
 	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, force, size)
 }
 
-func (c *batchedConn) ReadPackets(buffers [][]byte) ([]Packet, error) {
-	if len(buffers) == 0 {
-		return nil, nil
-	}
-	buffer := buffers[0]
+func (c *batchedConn) ReadPacket(buffer []byte) (Packet, error) {
 	var (
 		received int
 		oobLen   int
@@ -107,13 +100,12 @@ func (c *batchedConn) ReadPackets(buffers [][]byte) ([]Packet, error) {
 		}
 	})
 	if waitErr != nil {
-		return nil, waitErr
+		return Packet{}, waitErr
 	}
 	if recvErr != nil {
-		return nil, os.NewSyscallError("recvmsg", recvErr)
+		return Packet{}, os.NewSyscallError("recvmsg", recvErr)
 	}
-	c.one[0] = receivedPacket(buffer[:received], c.oob[:oobLen], from)
-	return c.one[:], nil
+	return receivedPacket(buffer[:received], c.oob[:oobLen], from), nil
 }
 
 func receivedPacket(data []byte, oob []byte, from unix.Sockaddr) Packet {

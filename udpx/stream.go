@@ -54,9 +54,8 @@ type Stream struct {
 	resetOffset   uint64
 	readDeadline  pipe.Deadline
 
-	endMu   sync.Mutex
-	endErr  error
 	endOnce sync.Once
+	endErr  error // 在 close(done) 之前写入，只在其后读取
 	done    chan struct{}
 
 	accepted bool
@@ -208,7 +207,7 @@ func (s *Stream) Close() error {
 	readSideEnded := (s.finReceived && s.readOffset >= s.finOffset) || s.resetReceived
 	s.recvMu.Unlock()
 	if !readSideEnded {
-		c.queueControl(appendResetStreamFrame(nil, s.id, sendOffset, resetCodeNormal), true)
+		c.queueControl(appendResetStreamFrame(nil, s.id, sendOffset))
 	}
 	s.end(net.ErrClosed)
 	c.removeStream(s.id)
@@ -246,7 +245,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 		}
 		if s.resetReceived && s.readOffset >= s.resetOffset {
 			s.recvMu.Unlock()
-			return 0, s.endCause()
+			return 0, ErrStreamReset
 		}
 		s.recvMu.Unlock()
 		select {
@@ -263,9 +262,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 
 func (s *Stream) end(cause error) {
 	s.endOnce.Do(func() {
-		s.endMu.Lock()
 		s.endErr = cause
-		s.endMu.Unlock()
 		if !errors.Is(cause, ErrStreamReset) {
 			s.discardUnread()
 		}
@@ -276,8 +273,6 @@ func (s *Stream) end(cause error) {
 }
 
 func (s *Stream) endCause() error {
-	s.endMu.Lock()
-	defer s.endMu.Unlock()
 	return s.endErr
 }
 
@@ -328,7 +323,7 @@ func (s *Stream) push(offset uint64, data []byte, fin bool) (int, error) {
 	return received, nil
 }
 
-func (s *Stream) resetFromPeer(finalOffset uint64, code resetCode) {
+func (s *Stream) resetFromPeer(finalOffset uint64) {
 	s.recvMu.Lock()
 	dropped := s.truncate(finalOffset)
 	s.resetReceived = true
@@ -337,7 +332,7 @@ func (s *Stream) resetFromPeer(finalOffset uint64, code resetCode) {
 	if dropped > 0 {
 		s.conn.dataRead(dropped)
 	}
-	s.end(code.err())
+	s.end(ErrStreamReset)
 }
 
 func (s *Stream) endIfDone() {
@@ -360,7 +355,7 @@ func (s *Stream) moveWindow() {
 	}
 	s.recvMu.Unlock()
 	if moved {
-		s.conn.queueControl(appendMaxStreamDataFrame(nil, s.id, limit), true)
+		s.conn.queueControl(appendMaxStreamDataFrame(nil, s.id, limit))
 	}
 }
 

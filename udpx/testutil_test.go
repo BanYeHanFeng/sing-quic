@@ -31,7 +31,7 @@ func waitDone(t *testing.T, ctx context.Context, timeout time.Duration) {
 	select {
 	case <-ctx.Done():
 	case <-time.After(timeout):
-		t.Fatal("conn did not end")
+		t.Fatal("connection did not end")
 	}
 }
 
@@ -72,12 +72,6 @@ func testSetup(t *testing.T, clientOptions, serverOptions Options) (*Conn, *Conn
 		t.Fatal(err)
 	}
 	return client, server, listener
-}
-
-func testSnapshot(c *Conn) statsSnapshot {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-	return *c.send.snapshot()
 }
 
 func testPayload(size int) []byte {

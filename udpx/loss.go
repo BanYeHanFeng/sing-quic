@@ -166,7 +166,7 @@ func (s *sender) mtuConfirmed(ack ack) {
 		return
 	}
 	s.conn.maxPayload.Store(int32(candidate - headerLen - tagLen))
-	s.conn.logInfo("mtu confirmed ", candidate)
+	s.conn.logDebug("mtu confirmed ", candidate)
 }
 
 func (s *sender) handleAck(ack ack, now time.Time) {
@@ -182,20 +182,16 @@ func (s *sender) handleAck(ack ack, now time.Time) {
 			continue
 		}
 		s.rtt.sample(now.Sub(packet.sentAt) - ack.delay)
-		s.rttStats.update(s.rtt)
 	}
 	s.probes = 0
 	s.probeSince = time.Time{}
 	lostDelay := lossDelay(s.rtt)
 	lost := s.inFlight.lost(now, ack.largest, lostDelay, ack.count >= maxAckRanges)
-	if len(lost) > 0 {
-		s.conn.stats.lostPackets.Add(int64(len(lost)))
-	}
 	var retransmit []outFrame
 	for _, packet := range lost {
 		for index := range packet.frames {
 			frame := packet.frames[index]
-			if frame.ackEliciting && retransmittable(frame.payload[0]&frameTypeMask) {
+			if retransmittable(frame.payload[0] & frameTypeMask) {
 				retransmit = append(retransmit, frame)
 				continue
 			}
@@ -203,7 +199,6 @@ func (s *sender) handleAck(ack ack, now time.Time) {
 		}
 	}
 	if len(retransmit) > 0 {
-		s.conn.stats.retransmits.Add(int64(len(retransmit)))
 		s.queue = append(retransmit, s.queue...)
 	}
 	if len(acked) > 0 || len(lost) > 0 {

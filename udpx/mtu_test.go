@@ -37,7 +37,7 @@ func TestMTUFixed(t *testing.T) {
 	var state mtuState
 	state.init(1280, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if _, loaded := state.next(1200); loaded {
-		t.Fatal("c fixed mtu was probed")
+		t.Fatal("a fixed mtu was probed")
 	}
 }
 

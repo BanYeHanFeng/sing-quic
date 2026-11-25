@@ -1,7 +1,6 @@
 package congestion
 
 import (
-	"fmt"
 	"math/rand"
 	"time"
 )
@@ -43,8 +42,8 @@ const (
 )
 
 type bbrSender struct {
-	rttStats RTTStatsProvider
-	pacer    *pacer
+	minRTT MinRTTProvider
+	pacer  *pacer
 
 	mode bbrMode
 
@@ -140,18 +139,12 @@ func minCongestionWindowForMaxDatagramSize(maxDatagramSize ByteCount) ByteCount 
 	return minCongestionWindowPackets * maxDatagramSize
 }
 
-func (b *bbrSender) SetRTTStatsProvider(provider RTTStatsProvider) {
-	b.rttStats = provider
+func (b *bbrSender) SetMinRTTProvider(provider MinRTTProvider) {
+	b.minRTT = provider
 }
 
 func (b *bbrSender) PacingWait(now time.Time) time.Duration {
 	return b.pacer.wait(now)
-}
-
-func (b *bbrSender) Describe() string {
-	return fmt.Sprintf("mode=%s cwnd=%d pacing=%d bw=%d minrtt=%s",
-		b.mode, b.GetCongestionWindow(), b.pacingRate(), b.bandwidthEstimate(),
-		b.getMinRtt())
 }
 
 func (m bbrMode) String() string {
@@ -277,7 +270,7 @@ func (b *bbrSender) getMinRtt() time.Duration {
 	if b.minRtt != 0 {
 		return b.minRtt
 	}
-	minRtt := b.rttStats.MinRTT()
+	minRtt := b.minRTT.MinRTT()
 	if minRtt == 0 {
 		return 100 * time.Millisecond
 	} else {

@@ -57,7 +57,7 @@ func TestStreamHalfClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err = stream.Write([]byte("more")); err == nil {
-		t.Fatal("c closed write side accepted data")
+		t.Fatal("a closed write side accepted data")
 	}
 	accepted, err := server.AcceptStream(ctx)
 	if err != nil {
@@ -204,7 +204,7 @@ func TestStreamEndsWithAssociation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err = accepted.Read(make([]byte, 1)); err == nil {
-		t.Fatal("c stream of an ended conn still reads")
+		t.Fatal("a stream of an ended connection still reads")
 	}
 	select {
 	case <-stream.Context().Done():
@@ -212,7 +212,7 @@ func TestStreamEndsWithAssociation(t *testing.T) {
 		t.Fatal("the client did not notice that the peer closed")
 	}
 	if _, err = stream.Write([]byte("more")); err == nil {
-		t.Fatal("c stream of an ended conn still writes")
+		t.Fatal("a stream of an ended connection still writes")
 	}
 }
 
@@ -381,7 +381,7 @@ func TestStreamSlotIsHeldUntilAccepted(t *testing.T) {
 	_ = accepted.Close()
 	late, err := client.OpenStream(ctx)
 	if err != nil {
-		t.Fatalf("the peer never gave c slot back: %v", err)
+		t.Fatalf("the peer never gave a slot back: %v", err)
 	}
 	_ = late.Close()
 }

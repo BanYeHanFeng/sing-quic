@@ -14,17 +14,17 @@ func TestCredential(t *testing.T) {
 	credential := NewCredential("password")
 	other := NewCredential("password ")
 	if credential.KeyID() == other.KeyID() {
-		t.Fatal("two passwords share c key id")
+		t.Fatal("two passwords share a key id")
 	}
 	signature := credential.Sign([]byte("transcript"))
 	if !credential.Verify([]byte("transcript"), signature) {
-		t.Fatal("c signature did not verify")
+		t.Fatal("a signature did not verify")
 	}
 	if credential.Verify([]byte("transcript "), signature) {
-		t.Fatal("c signature verified another transcript")
+		t.Fatal("a signature verified another transcript")
 	}
 	if credential.Verify([]byte("transcript"), []byte("forged")) {
-		t.Fatal("c forged signature verified")
+		t.Fatal("a forged signature verified")
 	}
 	if again := NewCredential("password"); again.KeyID() != credential.KeyID() {
 		t.Fatal("key id is not deterministic")
@@ -89,7 +89,7 @@ func TestHandshakeTamperedHello(t *testing.T) {
 	hello := bytes.Clone(handshake.hello())
 	hello[headerLen+3+keyIDLen+randomLen] ^= 0xff
 	if _, err = newServerHandshake(hello, testVerifier{credential: credential}); err == nil {
-		t.Fatal("c tampered hello was accepted")
+		t.Fatal("a tampered hello was accepted")
 	}
 }
 
@@ -106,7 +106,7 @@ func TestHandshakeTamperedAnswer(t *testing.T) {
 	answer := bytes.Clone(server.hello())
 	answer[headerLen+3+randomLen] ^= 0xff
 	if _, err = handshake.handleResponse(answer); err == nil {
-		t.Fatal("c tampered answer was accepted")
+		t.Fatal("a tampered answer was accepted")
 	}
 }
 
@@ -120,7 +120,7 @@ func TestHandshakeVersion(t *testing.T) {
 	hello[headerLen+1] = 0xff
 	_, err = newServerHandshake(hello, testVerifier{credential: credential})
 	if !errors.Is(err, errUnsupportedVersion) {
-		t.Fatalf("c hello of another version ended with %v", err)
+		t.Fatalf("a hello of another version ended with %v", err)
 	}
 }
 
@@ -133,7 +133,7 @@ func TestHandshakePacketType(t *testing.T) {
 	hello := bytes.Clone(handshake.hello())
 	hello[connectionIDLen] = packetTypeData
 	if _, err = newServerHandshake(hello, testVerifier{credential: credential}); err == nil {
-		t.Fatal("c data packet was taken for c hello")
+		t.Fatal("a data packet was taken for a hello")
 	}
 }
 
@@ -197,7 +197,7 @@ func TestUnknownConnectionID(t *testing.T) {
 	}
 	select {
 	case <-listener.ctx.Done():
-		t.Fatal("the listener ended on c stray packet")
+		t.Fatal("the listener ended on a stray packet")
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -267,7 +267,7 @@ func TestRepeatedHelloIsOneAssociation(t *testing.T) {
 	_ = conn.CloseWithError(nil)
 	select {
 	case extra := <-listener.accept:
-		t.Fatalf("c repeated hello created another conn: %v", extra)
+		t.Fatalf("a repeated hello created another connection: %v", extra)
 	case <-time.After(100 * time.Millisecond):
 	}
 }
@@ -349,7 +349,7 @@ func TestPacketTamperedOnTheWire(t *testing.T) {
 	}
 	select {
 	case <-server.Context().Done():
-		t.Fatal("c tampered packet ended the conn")
+		t.Fatal("a tampered packet ended the connection")
 	case <-time.After(100 * time.Millisecond):
 	}
 	if _, err = stream.Write([]byte("still here")); err != nil {

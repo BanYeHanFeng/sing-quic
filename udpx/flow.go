@@ -95,7 +95,7 @@ func (c *Conn) dataReceived(n int) error {
 	limit, moved := c.fc.nextReceiveLimit()
 	c.fcMu.Unlock()
 	if moved {
-		c.queueControl(appendMaxDataFrame(nil, limit), true)
+		c.queueControl(appendMaxDataFrame(nil, limit))
 	}
 	return nil
 }
@@ -109,7 +109,7 @@ func (c *Conn) dataRead(n int) {
 	limit, moved := c.fc.nextReceiveLimit()
 	c.fcMu.Unlock()
 	if moved {
-		c.queueControl(appendMaxDataFrame(nil, limit), true)
+		c.queueControl(appendMaxDataFrame(nil, limit))
 	}
 }
 
@@ -123,6 +123,6 @@ func (c *Conn) dataDropped(n int) {
 	limit, moved := c.fc.nextReceiveLimit()
 	c.fcMu.Unlock()
 	if moved {
-		c.queueControl(appendMaxDataFrame(nil, limit), true)
+		c.queueControl(appendMaxDataFrame(nil, limit))
 	}
 }

@@ -205,11 +205,11 @@ func appendMaxStreamsFrame(dst []byte, limit uint32) []byte {
 	return binary.BigEndian.AppendUint32(dst, limit)
 }
 
-func appendResetStreamFrame(dst []byte, streamID uint32, finalOffset uint64, code resetCode) []byte {
+func appendResetStreamFrame(dst []byte, streamID uint32, finalOffset uint64) []byte {
 	dst = append(dst, frameTypeResetStream, 0, 13)
 	dst = binary.BigEndian.AppendUint32(dst, streamID)
 	dst = binary.BigEndian.AppendUint64(dst, finalOffset)
-	return append(dst, byte(code))
+	return append(dst, 0)
 }
 
 func appendStreamHeader(dst []byte, streamID uint32, offset uint64, fin bool, dataLen int) []byte {
@@ -228,16 +228,6 @@ func appendDatagramHeader(dst []byte, channel uint32, message uint16, index uint
 	dst = binary.BigEndian.AppendUint16(dst, message)
 	dst = append(dst, index, total)
 	return dst
-}
-
-type resetCode uint8
-
-const (
-	resetCodeNormal resetCode = iota
-)
-
-func (c resetCode) err() error {
-	return ErrStreamReset
 }
 
 type closeCode uint8
@@ -291,14 +281,12 @@ func parseStreamFrame(frameType byte, body []byte) streamData {
 type streamReset struct {
 	streamID    uint32
 	finalOffset uint64
-	code        resetCode
 }
 
 func parseResetStream(body []byte) streamReset {
 	return streamReset{
 		streamID:    binary.BigEndian.Uint32(body),
 		finalOffset: binary.BigEndian.Uint64(body[4:]),
-		code:        resetCode(body[12]),
 	}
 }
 

@@ -32,20 +32,13 @@ type Controller interface {
 	OnPacketSent(sentTime time.Time, bytesInFlight ByteCount, packetNumber PacketNumber, bytes ByteCount) SendState
 	OnCongestionEvent(priorInFlight ByteCount, eventTime time.Time, ackedPackets []AckedPacketInfo, lostPackets []LostPacketInfo)
 	CanSend(bytesInFlight ByteCount) bool
-	OnAppLimited()
 	PacingWait(now time.Time) time.Duration
 	GetCongestionWindow() ByteCount
-	SetRTTStatsProvider(provider RTTStatsProvider)
+	SetMinRTTProvider(provider MinRTTProvider)
 }
 
-type Diagnostics interface {
-	Describe() string
-}
-
-type RTTStatsProvider interface {
+type MinRTTProvider interface {
 	MinRTT() time.Duration
-	SmoothedRTT() time.Duration
-	LatestRTT() time.Duration
 }
 
 func NewBbrController(initialMaxDatagramSize ByteCount, initialWindowPackets int64) Controller {

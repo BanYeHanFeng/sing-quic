@@ -1,6 +1,7 @@
 package udpx
 
 import (
+	"encoding/binary"
 	"errors"
 	"syscall"
 	"time"
@@ -13,9 +14,8 @@ import (
 )
 
 type sendOutcome struct {
-	packets  []udpio.Packet
-	snapshot *statsSnapshot
-	cause    error
+	packets []udpio.Packet
+	cause   error
 }
 
 func (c *Conn) sendStep(now time.Time) sendOutcome {
@@ -33,7 +33,6 @@ func (c *Conn) sendStep(now time.Time) sendOutcome {
 	if s.shouldPack(now) {
 		s.pack(now, maxPayload)
 	}
-	outcome.snapshot = s.snapshotIfDue(now)
 	s.batch.packets = s.batch.packets[:0]
 	remote := *c.peerAddr.Load()
 	for _, sent := range s.batch.sent {
@@ -58,9 +57,6 @@ func (c *Conn) sendLoop() {
 				c.shutdown(E.Cause(err, "write packets"), false)
 				return
 			}
-		}
-		if outcome.snapshot != nil {
-			c.logStats(outcome.snapshot)
 		}
 		if outcome.cause != nil {
 			c.shutdown(outcome.cause, true)
@@ -105,15 +101,15 @@ func (c *Conn) sendWriteFailed(err error) bool {
 	if probed {
 		candidate := s.mtu.candidate
 		s.mtu.dropCandidate()
-		c.logInfo("mtu ", candidate, " too large for the path")
+		c.logDebug("mtu ", candidate, " too large for the path")
 		c.releaseFailed(failed)
 		return true
 	}
 	if !s.stepDown() {
-		c.logInfo("mtu ", c.mtuSize(), " refused by the socket and no candidate is left")
+		c.logDebug("mtu ", c.mtuSize(), " refused by the socket and no candidate is left")
 		return false
 	}
-	c.logInfo("mtu refused by the socket, mtu now ", c.mtuSize())
+	c.logDebug("mtu refused by the socket, mtu now ", c.mtuSize())
 	c.releaseFailed(failed)
 	return true
 }
@@ -141,13 +137,13 @@ func isMessageTooLong(err error) bool {
 	return errors.Is(err, syscall.EMSGSIZE)
 }
 
-func (c *Conn) queueControl(payload []byte, ackEliciting bool) {
+func (c *Conn) queueControl(payload []byte) {
 	c.sendMu.Lock()
 	if c.send.closing {
 		c.sendMu.Unlock()
 		return
 	}
-	c.send.pushControl(payload, ackEliciting)
+	c.send.pushControl(payload)
 	c.sendMu.Unlock()
 	c.wake()
 }
@@ -178,22 +174,23 @@ func (s *sender) pack(now time.Time, maxPayload int) {
 		if !allowData && len(s.ackQueue) == 0 && !s.queue[0].probe && !s.queue[0].mtu {
 			return
 		}
-		frames := s.takeFrames(maxPayload, allowData)
+		frames, ackEliciting := s.takeFrames(maxPayload, allowData)
 		if frames == nil {
 			return
 		}
-		if !s.packPacket(now, frames) {
+		if !s.packPacket(now, frames, ackEliciting) {
 			return
 		}
 	}
 }
 
-func (s *sender) takeFrames(maxPayload int, allowData bool) []outFrame {
+// takeFrames 取下一包的帧；第二个返回值说明这些帧是否需要对端确认。
+func (s *sender) takeFrames(maxPayload int, allowData bool) ([]outFrame, bool) {
 	if len(s.ackQueue) > 0 {
-		return takePrefix(&s.ackQueue, maxPayload, true)
+		return takePrefix(&s.ackQueue, maxPayload, true), false
 	}
 	if len(s.queue) == 0 {
-		return nil
+		return nil, false
 	}
 	head := s.queue[0]
 	if head.mtu {
@@ -202,15 +199,15 @@ func (s *sender) takeFrames(maxPayload int, allowData bool) []outFrame {
 		if len(s.queue) == 0 {
 			s.queue = nil
 		}
-		return frames
+		return frames, true
 	}
-	if !allowData && head.ackEliciting && !head.probe {
-		return nil
+	if !allowData && !head.probe {
+		return nil, false
 	}
 	if head.size() > maxPayload && head.stream != nil {
 		s.splitHead(maxPayload)
 	}
-	return takePrefix(&s.queue, maxPayload, allowData)
+	return takePrefix(&s.queue, maxPayload, allowData), true
 }
 
 func takePrefix(queue *[]outFrame, maxPayload int, allowData bool) []outFrame {
@@ -222,7 +219,7 @@ func takePrefix(queue *[]outFrame, maxPayload int, allowData bool) []outFrame {
 		if frame.mtu {
 			break
 		}
-		if !allowData && frame.ackEliciting && !frame.probe {
+		if !allowData && !frame.probe {
 			break
 		}
 		if size+frame.size() > maxPayload {
@@ -252,10 +249,7 @@ func (s *sender) splitHead(maxPayload int) {
 	if firstLen <= 0 || firstLen >= len(data) {
 		return
 	}
-	var offset uint64
-	for index := range 8 {
-		offset = offset<<8 | uint64(head.payload[7+index])
-	}
+	offset := binary.BigEndian.Uint64(head.payload[7:])
 	fin := head.payload[0]&frameFlagFin != 0
 	first := newStreamFrame(head.stream, offset, false, data[:firstLen])
 	second := newStreamFrame(head.stream, offset+uint64(firstLen), fin, data[firstLen:])
@@ -285,10 +279,10 @@ func (s *sender) planProbe() {
 	}
 	s.probeSize = candidate
 	s.probePending = true
-	s.queue = append([]outFrame{{payload: probe, ackEliciting: true, mtu: true}}, s.queue...)
+	s.queue = append([]outFrame{{payload: probe, mtu: true}}, s.queue...)
 }
 
-func (s *sender) packPacket(now time.Time, frames []outFrame) bool {
+func (s *sender) packPacket(now time.Time, frames []outFrame, ackEliciting bool) bool {
 	payloadLen := 0
 	for _, frame := range frames {
 		payloadLen += len(frame.payload)
@@ -317,7 +311,6 @@ func (s *sender) packPacket(now time.Time, frames []outFrame) bool {
 		packetNumber: packetNumber,
 	}
 	for index := range frames {
-		sent.ackEliciting = sent.ackEliciting || frames[index].ackEliciting
 		sent.mtu = sent.mtu || frames[index].mtu
 	}
 	if sent.mtu {
@@ -326,14 +319,13 @@ func (s *sender) packPacket(now time.Time, frames []outFrame) bool {
 		s.probeSize = 0
 	}
 	s.sendPacket++
-	if sent.ackEliciting {
+	if ackEliciting {
+		sent.ackEliciting = true
 		s.lastSentAt = now
 		priorInFlight := s.inFlight.bytes
 		s.inFlight.append(sent)
 		sent.sendState = s.cc.OnPacketSent(now, priorInFlight, congestion.PacketNumber(packetNumber), congestion.ByteCount(length))
 	}
 	s.batch.sent = append(s.batch.sent, sent)
-	s.conn.stats.sentPackets.Add(1)
-	s.conn.stats.sentBytes.Add(int64(length))
 	return true
 }

@@ -18,8 +18,6 @@ func (c *Conn) handlePacket(packet []byte, source net.Addr) error {
 	if err != nil {
 		return err
 	}
-	c.stats.recvPackets.Add(1)
-	c.stats.recvBytes.Add(int64(len(packet)))
 	if packetHeader.ConnectionID != c.localID {
 		return errAuthentication
 	}

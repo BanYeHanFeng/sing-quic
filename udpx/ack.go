@@ -3,7 +3,6 @@ package udpx
 import (
 	"encoding/binary"
 	"math"
-	"sync/atomic"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -228,26 +227,6 @@ func lossDelay(rtt rttEstimator) time.Duration {
 	return delay
 }
 
-type rttStats struct {
-	min      atomic.Int64
-	smoothed atomic.Int64
-	latest   atomic.Int64
-}
-
-func (s *rttStats) update(estimator rttEstimator) {
-	s.min.Store(int64(estimator.min))
-	s.smoothed.Store(int64(estimator.smoothed))
-	s.latest.Store(int64(estimator.latest))
-}
-
-func (s *rttStats) MinRTT() time.Duration {
-	return time.Duration(s.min.Load())
-}
-
-func (s *rttStats) SmoothedRTT() time.Duration {
-	return time.Duration(s.smoothed.Load())
-}
-
-func (s *rttStats) LatestRTT() time.Duration {
-	return time.Duration(s.latest.Load())
+func (e *rttEstimator) MinRTT() time.Duration {
+	return e.min
 }

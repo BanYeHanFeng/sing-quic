@@ -147,7 +147,7 @@ func (c *Conn) SendDatagram(channel uint32, data []byte) error {
 		end := min(start+fragmentLen, len(data))
 		payload := appendDatagramHeader(nil, channel, message, uint8(index), uint8(fragmentCount), end-start)
 		payload = append(payload, data[start:end]...)
-		c.queueControl(payload, true)
+		c.queueControl(payload)
 	}
 	return nil
 }
@@ -178,7 +178,6 @@ func (c *Conn) handleDatagram(body []byte) error {
 	select {
 	case c.datagrams <- Datagram{Channel: data.channel, Data: message}:
 	default:
-		c.stats.droppedDatagrams.Add(1)
 	}
 	return nil
 }

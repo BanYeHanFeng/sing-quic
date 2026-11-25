@@ -21,7 +21,7 @@ func TestIsNormalClose(t *testing.T) {
 		ErrStreamReset,
 	} {
 		if !IsNormalClose(err) {
-			t.Fatalf("%v is not c normal close", err)
+			t.Fatalf("%v is not a normal close", err)
 		}
 	}
 	for _, err := range []error{
@@ -30,7 +30,7 @@ func TestIsNormalClose(t *testing.T) {
 		net.UnknownNetworkError("tcp"),
 	} {
 		if IsNormalClose(err) {
-			t.Fatalf("%v is c normal close", err)
+			t.Fatalf("%v is a normal close", err)
 		}
 	}
 }

@@ -2,6 +2,7 @@ package udpx
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"net"
 	"sync"
@@ -97,8 +98,6 @@ type Conn struct {
 	defragger       datagramDefragger
 	datagrams       chan Datagram
 
-	stats associationStats
-
 	onClose func()
 }
 
@@ -108,11 +107,11 @@ func newConn(conn net.PacketConn, io udpio.Conn, result handshakeResult, peer ne
 		options.Logger = logger.NOP()
 	}
 	c := &Conn{
+		logTag:     hex.EncodeToString(result.localID[:2]),
 		socket:     conn,
 		io:         io,
 		options:    options.withDefaults(),
 		logger:     options.Logger,
-		logTag:     logTagFor(result.localID),
 		initiator:  initiator,
 		localID:    result.localID,
 		peerID:     result.peerID,
@@ -135,9 +134,13 @@ func newConn(conn net.PacketConn, io udpio.Conn, result handshakeResult, peer ne
 	}
 	c.maxPayload.Store(int32(mtu - headerLen - tagLen))
 	c.send.init(c)
-	c.logInfo("connection up local=", c.logTag,
+	c.logDebug("connection up local=", c.logTag,
 		" client=", initiator, " remote=", peer, " mtu=", c.mtuSize())
 	return c
+}
+
+func (c *Conn) logDebug(args ...any) {
+	c.logger.Debug(append([]any{"udpx[" + c.logTag + "]: "}, args...)...)
 }
 
 func (c *Conn) start() {
@@ -227,7 +230,7 @@ func Dial(ctx context.Context, conn net.PacketConn, remote net.Addr, credential 
 	if err != nil {
 		return nil, err
 	}
-	io := udpio.New(conn, udpio.Options{GRO: true})
+	io := udpio.New(conn)
 	c := newConn(conn, io, result, remote, options, true)
 	c.start()
 	go c.recvLoop()
@@ -286,7 +289,7 @@ func exchangeHello(ctx context.Context, conn net.PacketConn, remote net.Addr, ha
 func (c *Conn) recvLoop() {
 	buffer := make([]byte, maxReceiveSize)
 	for {
-		packets, err := c.io.ReadPackets([][]byte{buffer})
+		packet, err := c.io.ReadPacket(buffer)
 		if err != nil {
 			if c.ctx.Err() != nil {
 				return
@@ -297,14 +300,9 @@ func (c *Conn) recvLoop() {
 			}
 			continue
 		}
-		for _, packet := range packets {
-			packet.ForEach(func(datagram []byte) {
-				_ = c.handlePacket(datagram, packet.Addr)
-			})
-			if c.ctx.Err() != nil {
-				return
-			}
-		}
+		packet.ForEach(func(datagram []byte) {
+			_ = c.handlePacket(datagram, packet.Addr)
+		})
 	}
 }
 
