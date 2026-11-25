@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sagernet/sing-quic/udpx"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -27,7 +26,6 @@ type channelConn struct {
 	context context.Context
 	cancel  context.CancelCauseFunc
 	session *session
-	conn    *udpx.Conn
 	channel uint32
 
 	messages     chan udpMessage
@@ -42,7 +40,6 @@ func newChannelConn(ctx context.Context, current *session, id uint32) *channelCo
 		context:      ctx,
 		cancel:       cancel,
 		session:      current,
-		conn:         current.conn,
 		channel:      id,
 		messages:     make(chan udpMessage, channelBacklog),
 		readDeadline: pipe.MakeDeadline(),
@@ -134,7 +131,7 @@ func (c *channelConn) write(destination M.Socksaddr, payload []byte) error {
 		return E.New("invalid destination address")
 	}
 	message := udpMessage{destination: destination, data: payload}
-	err := c.conn.SendDatagram(message.pack(c.channel))
+	err := c.session.conn.SendDatagram(message.pack(c.channel))
 	if err != nil {
 		return E.Cause(err, "send message")
 	}
@@ -156,7 +153,7 @@ func (c *channelConn) Close() error {
 		}
 		c.session.mu.Unlock()
 		c.closeWithError(os.ErrClosed)
-		_ = c.conn.SendDatagram(packChannel(c.channel, CommandDissociate))
+		_ = c.session.conn.SendDatagram(packChannel(c.channel, CommandDissociate))
 	})
 	return nil
 }
@@ -166,7 +163,7 @@ func (c *channelConn) closeWithError(err error) {
 }
 
 func (c *channelConn) LocalAddr() net.Addr {
-	return c.conn.LocalAddr()
+	return c.session.conn.LocalAddr()
 }
 
 func (c *channelConn) SetDeadline(deadline time.Time) error {
