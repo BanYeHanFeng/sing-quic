@@ -96,11 +96,12 @@ type Conn struct {
 	sendCipher packetCipher
 	recvCipher packetCipher
 
-	ctx       context.Context
-	cancel    context.CancelCauseFunc
-	closeOnce sync.Once
-	sendDone  chan struct{}
-	sendWake  chan struct{}
+	ctx      context.Context
+	cancel   context.CancelCauseFunc
+	finishMu sync.Mutex
+	finished bool
+	sendDone chan struct{}
+	sendWake chan struct{}
 
 	peerAddr    atomic.Pointer[net.Addr]
 	openStreams atomic.Int32 // 供发送循环的空闲判定读取
@@ -205,24 +206,30 @@ func (c *Conn) cause() error {
 }
 
 // finish 取消 ctx、结束所有流、释放 socket、通知 handler，恰好执行一次。
+// handler 的 OnClose 里再调 CloseWithError 也不会自锁。
 func (c *Conn) finish(cause error) {
-	c.closeOnce.Do(func() {
-		if cause == nil {
-			cause = net.ErrClosed
-		}
-		c.logDebug("connection closed: ", cause)
-		c.cancel(cause)
-		c.closeStreams(cause)
-		if c.ownsSocket {
-			_ = c.socket.Close()
-		}
-		if c.onClose != nil {
-			c.onClose()
-		}
-		if c.handler != nil {
-			c.handler.OnClose(c, cause)
-		}
-	})
+	c.finishMu.Lock()
+	if c.finished {
+		c.finishMu.Unlock()
+		return
+	}
+	c.finished = true
+	c.finishMu.Unlock()
+	if cause == nil {
+		cause = net.ErrClosed
+	}
+	c.logDebug("connection closed: ", cause)
+	c.cancel(cause)
+	c.closeStreams(cause)
+	if c.ownsSocket {
+		_ = c.socket.Close()
+	}
+	if c.onClose != nil {
+		c.onClose()
+	}
+	if c.handler != nil {
+		c.handler.OnClose(c, cause)
+	}
 }
 
 // finishFromLoop 发送循环排空自己的队列后收尾。

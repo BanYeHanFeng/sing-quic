@@ -129,3 +129,39 @@ func TestDialRejectsWhenTheHandlerRefuses(t *testing.T) {
 		t.Fatal("the socket was left open")
 	}
 }
+
+// OnClose 里再调 CloseWithError 不能自锁。
+type closingHandler struct {
+	closed chan error
+}
+
+func (h *closingHandler) OnDatagram(conn *Conn, data []byte) {}
+
+func (h *closingHandler) OnStream(conn *Conn, stream *Stream) {
+	_ = stream.Close()
+}
+
+func (h *closingHandler) OnClose(conn *Conn, cause error) {
+	_ = conn.CloseWithError(nil)
+	h.closed <- cause
+}
+
+func TestCloseFromOnCloseReturns(t *testing.T) {
+	credential := NewCredential("password")
+	listenerConn := udpConn(t)
+	handler := &closingHandler{closed: make(chan error, 1)}
+	listener := Listen(listenerConn, testVerifier{credential: credential}, Options{
+		MTU: mtuIPv4,
+		NewHandler: func(conn *Conn) Handler {
+			return handler
+		},
+	})
+	defer listener.Close()
+	client := testDial(t, testContext(t, 5*time.Second), udpConn(t), listenerConn.LocalAddr(), credential, Options{MTU: mtuIPv4})
+	_ = client.CloseWithError(nil)
+	select {
+	case <-handler.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnClose did not return after closing the connection again")
+	}
+}
