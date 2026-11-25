@@ -123,16 +123,21 @@ func (c *Conn) releaseSkippedStream(id uint32) {
 	c.queueControl(appendMaxStreamsFrame(nil, limit))
 }
 
-func (c *Conn) handleMaxStreams(limit uint32) {
+func (c *Conn) handleMaxStreams(body []byte) error {
+	if len(body) < 4 {
+		return errShortFrame
+	}
+	limit := binary.BigEndian.Uint32(body)
 	c.streamsMu.Lock()
 	if limit <= c.outbound.credit {
 		c.streamsMu.Unlock()
-		return
+		return nil
 	}
 	c.outbound.credit = limit
 	close(c.outbound.creditWait)
 	c.outbound.creditWait = make(chan struct{})
 	c.streamsMu.Unlock()
+	return nil
 }
 
 func (c *Conn) notifyStreams() {

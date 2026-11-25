@@ -120,12 +120,13 @@ type Conn struct {
 
 func newConn(socket net.PacketConn, io udpio.Conn, result handshakeResult, peer net.Addr, options Options, initiator bool) *Conn {
 	ctx, cancel := context.WithCancelCause(context.Background())
+	options = options.withDefaults()
 	c := &Conn{
 		logTag:     hex.EncodeToString(result.localID[:2]),
 		socket:     socket,
 		io:         io,
-		options:    options.withDefaults(),
-		logger:     options.withDefaults().Logger,
+		options:    options,
+		logger:     options.Logger,
 		initiator:  initiator,
 		localID:    result.localID,
 		peerID:     result.peerID,

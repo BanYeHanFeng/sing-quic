@@ -72,30 +72,27 @@ func (c *Conn) write(packets []udpio.Packet) error {
 	if !isMessageTooLong(err) {
 		return err
 	}
-	var tooLarge int
 	c.sendMu.Lock()
 	s := &c.send
 	failed := append([]*sentPacket(nil), s.batch.sent...)
-	probed := slices.ContainsFunc(failed, func(packet *sentPacket) bool { return packet.mtu })
-	switch {
-	case probed:
-		tooLarge = s.mtu.candidate
+	if slices.ContainsFunc(failed, func(packet *sentPacket) bool { return packet.mtu }) {
+		candidate := s.mtu.candidate
 		s.mtu.dropCandidate()
 		s.releaseFailed(failed)
-	case s.stepDown():
-		tooLarge = s.mtu.size
-		s.releaseFailed(failed)
-	}
-	mtu := s.mtu.size
-	c.sendMu.Unlock()
-	if probed {
-		c.logDebug("mtu ", tooLarge, " too large for the path")
+		c.sendMu.Unlock()
+		c.logDebug("mtu ", candidate, " too large for the path")
 		return nil
 	}
-	if tooLarge == 0 {
+	refused := s.mtu.size
+	if !s.stepDown() {
+		c.sendMu.Unlock()
+		c.logDebug("mtu ", refused, " refused by the socket and no candidate is left")
 		return err
 	}
-	c.logDebug("mtu ", tooLarge, " refused by the socket, mtu now ", mtu)
+	s.releaseFailed(failed)
+	next := s.mtu.size
+	c.sendMu.Unlock()
+	c.logDebug("mtu ", refused, " refused by the socket, mtu now ", next)
 	return nil
 }
 

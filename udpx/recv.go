@@ -33,6 +33,16 @@ func (c *Conn) handlePacket(packet []byte, source net.Addr) error {
 	return err
 }
 
+// ackElicitingFrame 说明哪种帧需要对端确认：唯一一张表，不再散写在 switch 里。
+func ackElicitingFrame(frameType uint8) bool {
+	switch frameType {
+	case frameTypePadding, frameTypeAck, frameTypeClose:
+		return false
+	default:
+		return true
+	}
+}
+
 func (c *Conn) handlePayload(packetNumber uint32, payload []byte, now time.Time) error {
 	ackEliciting := false
 	for len(payload) > 0 {
@@ -46,11 +56,10 @@ func (c *Conn) handlePayload(packetNumber uint32, payload []byte, now time.Time)
 		}
 		body := payload[frameHeaderLen : frameHeaderLen+length]
 		payload = payload[frameHeaderLen+length:]
+		ackEliciting = ackEliciting || ackElicitingFrame(frameType&frameTypeMask)
 		var err error
 		switch frameType & frameTypeMask {
-		case frameTypePadding:
-		case frameTypePing:
-			ackEliciting = true
+		case frameTypePadding, frameTypePing:
 		case frameTypeClose:
 			code := closeCodeNormal
 			if len(body) > 0 {
@@ -62,27 +71,17 @@ func (c *Conn) handlePayload(packetNumber uint32, payload []byte, now time.Time)
 		case frameTypeAck:
 			err = c.handleAck(body, now)
 		case frameTypeStream:
-			ackEliciting = true
 			err = c.handleStreamFrame(frameType, body)
 		case frameTypeMaxData:
-			ackEliciting = true
 			err = c.handleMaxData(body)
 		case frameTypeMaxStreamData:
-			ackEliciting = true
 			err = c.handleMaxStreamData(body)
 		case frameTypeResetStream:
-			ackEliciting = true
 			err = c.handleResetStream(body)
 		case frameTypeDatagram:
-			ackEliciting = true
 			err = c.handleDatagram(body)
 		case frameTypeMaxStreams:
-			ackEliciting = true
-			if len(body) < 4 {
-				err = errShortFrame
-				break
-			}
-			c.handleMaxStreams(binary.BigEndian.Uint32(body))
+			err = c.handleMaxStreams(body)
 		default:
 			return errUnknownFrame
 		}
