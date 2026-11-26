@@ -24,6 +24,7 @@ type ServiceOptions struct {
 	UDPTimeout  time.Duration
 	Handler     ServiceHandler
 	MTU         int
+	Trace       TraceOptions
 }
 
 type ServiceHandler interface {
@@ -71,6 +72,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 			IdleTimeout:     options.IdleTimeout,
 			KeepAlivePeriod: options.Heartbeat,
 			MTU:             options.MTU,
+			Trace:           udpx.TraceOptions{Dir: options.Trace.Path, Capacity: options.Trace.Capacity},
 			Logger:          options.Logger,
 		},
 		userMap: make(map[[8]byte]userEntry[U]),
@@ -173,6 +175,7 @@ func (s *serverSession[U]) onUnknownChannel(channel uint32, message udpMessage) 
 	if !s.session.addChannel(conn) {
 		return
 	}
+	s.conn.Trace("quicx:channel_opened", channelEvent{Channel: channel, Destination: message.destination.String()})
 	conn.input(message)
 	ctx, packetConn := canceler.NewPacketConn(conn.context, conn, s.udpTimeout)
 	go s.handler.NewPacketConnectionEx(ctx, packetConn, s.source.Unwrap(), message.destination, nil)

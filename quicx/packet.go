@@ -135,6 +135,11 @@ func (c *channelConn) write(destination M.Socksaddr, payload []byte) error {
 	if err != nil {
 		return E.Cause(err, "send message")
 	}
+	c.session.conn.Trace("quicx:message_sent", channelEvent{
+		Channel:     c.channel,
+		Destination: destination.String(),
+		Length:      len(payload),
+	})
 	return nil
 }
 
@@ -142,6 +147,12 @@ func (c *channelConn) input(message udpMessage) {
 	select {
 	case c.messages <- message:
 	default:
+		c.session.conn.Trace("quicx:message_dropped", channelEvent{
+			Channel:     c.channel,
+			Destination: message.destination.String(),
+			Length:      len(message.data),
+			Reason:      "queue_full",
+		})
 	}
 }
 
@@ -152,6 +163,7 @@ func (c *channelConn) Close() error {
 			delete(c.session.channels, c.channel)
 		}
 		c.session.mu.Unlock()
+		c.session.conn.Trace("quicx:channel_closed", channelEvent{Channel: c.channel, Reason: "local"})
 		c.closeWithError(os.ErrClosed)
 		_ = c.session.conn.SendDatagram(packChannel(c.channel, CommandDissociate))
 	})

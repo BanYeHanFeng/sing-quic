@@ -197,6 +197,7 @@ func (s *Stream) Close() error {
 	readSideEnded := (s.finReceived && s.recv.read >= s.finOffset) || s.resetReceived
 	s.recvMu.Unlock()
 	if !readSideEnded {
+		c.tracer.record("udpx:stream_reset", traceStream{StreamID: s.id, Initiator: "local", FinalSize: offset})
 		c.queueControl(appendResetStreamFrame(nil, s.id, offset))
 	}
 	s.end(net.ErrClosed)
@@ -310,6 +311,7 @@ func (s *Stream) push(offset uint64, data []byte, fin bool) (int, error) {
 }
 
 func (s *Stream) resetFromPeer(finalOffset uint64) {
+	s.conn.tracer.record("udpx:stream_reset", traceStream{StreamID: s.id, Initiator: "remote", FinalSize: finalOffset})
 	s.recvMu.Lock()
 	dropped := s.truncate(finalOffset)
 	s.resetReceived = true

@@ -65,6 +65,7 @@ func (s *session) OnStream(conn *udpx.Conn, stream *udpx.Stream) {
 }
 
 func (s *session) OnClose(conn *udpx.Conn, cause error) {
+	conn.Trace("quicx:session_closed", sessionEvent{Reason: cause.Error()})
 	if udpx.IsNormalClose(cause) {
 		s.logger.Debug("QUICX session ", s.label, " closed: ", cause)
 	} else {
@@ -111,10 +112,16 @@ func (s *session) openChannel(ctx context.Context) (*channelConn, error) {
 	conn := newChannelConn(ctx, s, id)
 	s.channels[id] = conn
 	s.mu.Unlock()
+	s.conn.Trace("quicx:channel_opened", channelEvent{Channel: id})
 	return conn, nil
 }
 
 func (s *session) dispatch(id uint32, message udpMessage) {
+	s.conn.Trace("quicx:message_received", channelEvent{
+		Channel:     id,
+		Destination: message.destination.String(),
+		Length:      len(message.data),
+	})
 	conn := s.channel(id)
 	if conn != nil {
 		conn.input(message)
@@ -122,7 +129,14 @@ func (s *session) dispatch(id uint32, message udpMessage) {
 	}
 	if s.newChannel != nil {
 		s.newChannel(id, message)
+		return
 	}
+	s.conn.Trace("quicx:message_dropped", channelEvent{
+		Channel:     id,
+		Destination: message.destination.String(),
+		Length:      len(message.data),
+		Reason:      "unknown_channel",
+	})
 }
 
 func (s *session) dissociate(id uint32) {
@@ -131,6 +145,7 @@ func (s *session) dissociate(id uint32) {
 	delete(s.channels, id)
 	s.mu.Unlock()
 	if loaded {
+		s.conn.Trace("quicx:channel_closed", channelEvent{Channel: id, Reason: "dissociate"})
 		conn.closeWithError(E.New("remote closed"))
 	}
 }

@@ -27,6 +27,7 @@ type ClientOptions struct {
 	Heartbeat     time.Duration
 
 	MTU    int
+	Trace  TraceOptions
 	Logger logger.Logger
 }
 
@@ -70,6 +71,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 			IdleTimeout:     options.IdleTimeout,
 			KeepAlivePeriod: options.Heartbeat,
 			MTU:             options.MTU,
+			Trace:           udpx.TraceOptions{Dir: options.Trace.Path, Capacity: options.Trace.Capacity},
 			Logger:          options.Logger,
 		},
 		logger: options.Logger,

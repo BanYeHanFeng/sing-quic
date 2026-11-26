@@ -16,21 +16,47 @@ func (c *Conn) rxDone(packetNumber uint32, ackEliciting bool, now time.Time) {
 func (c *Conn) handlePacket(packet []byte, source net.Addr) error {
 	packetHeader, err := parseHeader(packet)
 	if err != nil {
+		c.tracer.record("transport:packet_dropped", tracePacketDropped{
+			Header:  tracePacketHeader{PacketType: "1RTT"},
+			Raw:     tracePacketRaw{Length: len(packet)},
+			Trigger: "invalid_header",
+		})
 		return err
 	}
 	if packetHeader.ConnectionID != c.localID {
+		c.tracer.record("transport:packet_dropped", tracePacketDropped{
+			Header:  tracePacketHeader{PacketType: "1RTT", PacketNumber: packetHeader.PacketNumber},
+			Raw:     tracePacketRaw{Length: len(packet)},
+			Trigger: "unknown_connection_id",
+		})
 		return errAuthentication
 	}
 	_, payload, err := c.recvCipher.open(packet)
 	if err != nil {
+		c.tracer.record("transport:packet_dropped", tracePacketDropped{
+			Header:  tracePacketHeader{PacketType: "1RTT", PacketNumber: packetHeader.PacketNumber},
+			Raw:     tracePacketRaw{Length: len(packet)},
+			Trigger: "authentication_failed",
+		})
 		return err
 	}
 	c.peerAddr.Store(&source)
-	err = c.handlePayload(packetHeader.PacketNumber, payload, time.Now())
+	err = c.handlePayload(packetHeader.PacketNumber, payload, len(packet), time.Now())
 	if err != nil {
 		c.shutdown(err, true)
 	}
 	return err
+}
+
+func (c *Conn) recordPacketReceived(packetNumber uint32, packetSize int, frames []traceFrame) {
+	if c.tracer == nil {
+		return
+	}
+	c.tracer.record("transport:packet_received", tracePacket{
+		Header: tracePacketHeader{PacketType: "1RTT", PacketNumber: packetNumber},
+		Raw:    tracePacketRaw{Length: packetSize},
+		Frames: frames,
+	})
 }
 
 // ackElicitingFrame 说明哪种帧需要对端确认：唯一一张表，不再散写在 switch 里。
@@ -43,16 +69,22 @@ func ackElicitingFrame(frameType uint8) bool {
 	}
 }
 
-func (c *Conn) handlePayload(packetNumber uint32, payload []byte, now time.Time) error {
+func (c *Conn) handlePayload(packetNumber uint32, payload []byte, packetSize int, now time.Time) error {
+	var frames []traceFrame
 	ackEliciting := false
 	for len(payload) > 0 {
 		if len(payload) < frameHeaderLen {
+			c.recordPacketReceived(packetNumber, packetSize, frames)
 			return errShortFrame
 		}
 		frameType := payload[0]
 		length := int(binary.BigEndian.Uint16(payload[1:3]))
 		if len(payload) < frameHeaderLen+length {
+			c.recordPacketReceived(packetNumber, packetSize, frames)
 			return errShortFrame
+		}
+		if c.tracer != nil {
+			frames = append(frames, traceFrameOf(payload[:frameHeaderLen+length]))
 		}
 		body := payload[frameHeaderLen : frameHeaderLen+length]
 		payload = payload[frameHeaderLen+length:]
@@ -65,6 +97,8 @@ func (c *Conn) handlePayload(packetNumber uint32, payload []byte, now time.Time)
 			if len(body) > 0 {
 				code = closeCode(body[0])
 			}
+			c.recordPacketReceived(packetNumber, packetSize, frames)
+			c.closedByPeer.Store(true)
 			c.rxDone(packetNumber, ackEliciting, now)
 			c.shutdown(code.err(), false)
 			return nil
@@ -83,12 +117,15 @@ func (c *Conn) handlePayload(packetNumber uint32, payload []byte, now time.Time)
 		case frameTypeMaxStreams:
 			err = c.handleMaxStreams(body)
 		default:
+			c.recordPacketReceived(packetNumber, packetSize, frames)
 			return errUnknownFrame
 		}
 		if err != nil {
+			c.recordPacketReceived(packetNumber, packetSize, frames)
 			return err
 		}
 	}
+	c.recordPacketReceived(packetNumber, packetSize, frames)
 	c.rxDone(packetNumber, ackEliciting, now)
 	return nil
 }

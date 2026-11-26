@@ -37,12 +37,15 @@ func run() error {
 	duration := flag.Duration("duration", 30*time.Second, "how long the client runs")
 	mtu := flag.Int("mtu", 0, "packet size limit, zero to discover it")
 	debug := flag.Bool("debug", false, "print the transport's own log")
+	trace := flag.String("trace", "", "directory for qlog files")
+	traceCapacity := flag.Int("trace-capacity", 0, "qlog file limit per connection in MB")
 	flag.Parse()
 
 	options := udpx.Options{
 		IdleTimeout:     time.Minute,
 		KeepAlivePeriod: 10 * time.Second,
 		MTU:             *mtu,
+		Trace:           udpx.TraceOptions{Dir: *trace, Capacity: *traceCapacity},
 	}
 	if *debug {
 		options.Logger = stdLogger{}

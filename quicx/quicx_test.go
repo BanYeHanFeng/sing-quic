@@ -3,8 +3,12 @@ package quicx
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,11 +93,17 @@ func (d testDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (
 
 func testSetup(t *testing.T, password string) (*Client, *testHandler) {
 	t.Helper()
+	return testSetupTrace(t, password, "")
+}
+
+func testSetupTrace(t *testing.T, password string, traceDir string) (*Client, *testHandler) {
+	t.Helper()
 	ctx := testContext(t, 20*time.Second)
 	handler := newTestHandler()
 	service, err := NewService[int](ServiceOptions{
 		Context: ctx,
 		Handler: handler,
+		Trace:   TraceOptions{Path: traceDir},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -115,6 +125,7 @@ func testSetup(t *testing.T, password string) (*Client, *testHandler) {
 		Dialer:        testDialer{server: M.SocksaddrFromNet(listenerConn.LocalAddr())},
 		ServerAddress: M.SocksaddrFromNet(listenerConn.LocalAddr()),
 		Password:      password,
+		Trace:         TraceOptions{Path: traceDir},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -415,5 +426,81 @@ func TestResetIsANormalClose(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the server did not notice the reset")
+	}
+}
+
+func TestTraceRecordsChannels(t *testing.T) {
+	dir := t.TempDir()
+	client, handler := testSetupTrace(t, "password", dir)
+	ctx := testContext(t, 20*time.Second)
+	packetConn, err := client.ListenPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := M.ParseSocksaddr("1.1.1.1:53")
+	_, err = packetConn.WriteTo([]byte("query"), destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverConn := handler.packetConnection(t, ctx)
+	request := buf.New()
+	defer request.Release()
+	_, err = serverConn.conn.ReadPacket(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer := buf.NewSize(6)
+	answer.Write([]byte("answer"))
+	err = serverConn.conn.WritePacket(answer, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, 16*1024)
+	_, _, err = packetConn.ReadFrom(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = packetConn.Close()
+	_ = client.CloseWithError(nil)
+
+	names := readTraceNames(t, dir)
+	for _, name := range []string{"quicx:channel_opened", "quicx:message_sent", "quicx:message_received", "quicx:channel_closed"} {
+		if names[name] == 0 {
+			t.Fatalf("the traces have no %s event, only %v", name, names)
+		}
+	}
+}
+
+func readTraceNames(t *testing.T, dir string) map[string]int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		names := make(map[string]int)
+		matches, err := filepath.Glob(filepath.Join(dir, "*.sqlog"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, match := range matches {
+			content, err := os.ReadFile(match)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, chunk := range strings.Split(string(content), "\x1e") {
+				var record struct {
+					Name string `json:"name"`
+				}
+				if json.Unmarshal([]byte(chunk), &record) != nil {
+					continue
+				}
+				names[record.Name]++
+			}
+		}
+		if names["quicx:message_received"] > 0 && names["quicx:channel_closed"] > 0 {
+			return names
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the traces are %v", names)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

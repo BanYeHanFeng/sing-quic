@@ -34,6 +34,7 @@ func (c *Conn) OpenStream(ctx context.Context) (*Stream, error) {
 			c.streams[id] = stream
 			c.streamsMu.Unlock()
 			c.openStreams.Add(1)
+			c.tracer.record("udpx:stream_opened", traceStream{StreamID: id, Initiator: "local"})
 			c.queueFrame(newStreamFrame(stream, 0, false, nil))
 			return stream, nil
 		}
@@ -74,6 +75,7 @@ func (c *Conn) removeStream(id uint32) bool {
 	c.streamsMu.Unlock()
 	if loaded {
 		c.openStreams.Add(-1)
+		c.tracer.record("udpx:stream_removed", traceStream{StreamID: id})
 	}
 	if grant {
 		c.queueControl(appendMaxStreamsFrame(nil, limit))
@@ -106,6 +108,7 @@ func (c *Conn) acceptOpenedStream(id uint32) (*Stream, error) {
 	c.streams[id] = stream
 	c.streamsMu.Unlock()
 	c.openStreams.Add(1)
+	c.tracer.record("udpx:stream_opened", traceStream{StreamID: id, Initiator: "remote"})
 	go c.handler.OnStream(c, stream)
 	return stream, nil
 }

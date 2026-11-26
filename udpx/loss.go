@@ -28,6 +28,11 @@ type sentPacket struct {
 	sendState    congestion.SendState
 }
 
+type lostPacket struct {
+	packet  *sentPacket
+	trigger string
+}
+
 type inFlight struct {
 	packets []*sentPacket
 	bytes   congestion.ByteCount
@@ -68,19 +73,19 @@ func (f *inFlight) ack(ranges []pnRange) []*sentPacket {
 	return acked
 }
 
-func (f *inFlight) lost(now time.Time, largestAcked uint32, lossDelay time.Duration, ackTruncated bool) []*sentPacket {
-	count := 0
+func (f *inFlight) lost(now time.Time, largestAcked uint32, lossDelay time.Duration, ackTruncated bool) []lostPacket {
+	var lost []lostPacket
 	for _, packet := range f.packets {
-		if !isLostPacket(packet, now, largestAcked, lossDelay, ackTruncated) {
+		trigger := lostTrigger(packet, now, largestAcked, lossDelay, ackTruncated)
+		if trigger == "" {
 			break
 		}
-		count++
+		lost = append(lost, lostPacket{packet: packet, trigger: trigger})
 	}
-	if count == 0 {
+	if len(lost) == 0 {
 		return nil
 	}
-	lost := make([]*sentPacket, count)
-	copy(lost, f.packets[:count])
+	count := len(lost)
 	remaining := copy(f.packets, f.packets[count:])
 	for index := remaining; index < len(f.packets); index++ {
 		f.packets[index] = nil
@@ -127,14 +132,17 @@ func coversPacketNumber(ranges []pnRange, packetNumber uint32) bool {
 	return false
 }
 
-func isLostPacket(packet *sentPacket, now time.Time, largestAcked uint32, lossDelay time.Duration, ackTruncated bool) bool {
+func lostTrigger(packet *sentPacket, now time.Time, largestAcked uint32, lossDelay time.Duration, ackTruncated bool) string {
 	if largestAcked < packet.packetNumber {
-		return false
+		return ""
 	}
 	if !ackTruncated && largestAcked-packet.packetNumber >= packetThreshold {
-		return true
+		return "reordering_threshold"
 	}
-	return now.Sub(packet.sentAt) >= lossDelay
+	if now.Sub(packet.sentAt) >= lossDelay {
+		return "time_threshold"
+	}
+	return ""
 }
 
 type batch struct {
@@ -162,11 +170,13 @@ func (s *sender) mtuConfirmed(ack ack) {
 	}
 	candidate := s.mtu.candidate
 	s.mtu.confirm()
+	s.conn.tracer.record("udpx:mtu_probe", traceMTUProbe{Candidate: candidate, Confirmed: true})
 	if candidate <= s.mtu.size {
 		return
 	}
 	s.mtu.size = candidate
 	s.conn.logDebug("mtu confirmed ", candidate)
+	s.conn.tracer.record("recovery:mtu_updated", traceMTU{MTU: candidate})
 }
 
 func (s *sender) handleAck(ack ack, now time.Time) {
@@ -188,7 +198,12 @@ func (s *sender) handleAck(ack ack, now time.Time) {
 	lostDelay := lossDelay(s.rtt)
 	lost := s.inFlight.lost(now, ack.largest, lostDelay, ack.count >= maxAckRanges)
 	var retransmit []outFrame
-	for _, packet := range lost {
+	for _, entry := range lost {
+		packet := entry.packet
+		s.conn.tracer.record("recovery:packet_lost", tracePacketLost{
+			Header:  tracePacketHeader{PacketType: "1RTT", PacketNumber: packet.packetNumber},
+			Trigger: entry.trigger,
+		})
 		for index := range packet.frames {
 			frame := packet.frames[index]
 			if retransmittable(frame.payload[0] & frameTypeMask) {
@@ -216,7 +231,8 @@ func (s *sender) handleAck(ack ack, now time.Time) {
 			})
 		}
 		lostInfo := make([]congestion.LostPacketInfo, 0, len(lost))
-		for _, packet := range lost {
+		for _, entry := range lost {
+			packet := entry.packet
 			if !packet.ackEliciting {
 				continue
 			}
@@ -228,5 +244,16 @@ func (s *sender) handleAck(ack ack, now time.Time) {
 			})
 		}
 		s.cc.OnCongestionEvent(priorInFlight, now, ackedInfo, lostInfo)
+		s.conn.tracer.record("recovery:metrics_updated", traceMetrics{
+			MinRTT:           traceMillis(s.rtt.min),
+			SmoothedRTT:      traceMillis(s.rtt.smoothed),
+			LatestRTT:        traceMillis(s.rtt.latest),
+			RTTVariance:      traceMillis(s.rtt.rttvar),
+			CongestionWindow: uint64(s.cc.GetCongestionWindow()),
+			BytesInFlight:    uint64(s.inFlight.bytes),
+			PacketsInFlight:  s.inFlight.len(),
+			PTO:              traceMillis(s.rtt.pto()),
+			ProbeCount:       s.probes,
+		})
 	}
 }

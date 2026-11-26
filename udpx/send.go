@@ -81,6 +81,7 @@ func (c *Conn) write(packets []udpio.Packet) error {
 		s.releaseFailed(failed)
 		c.sendMu.Unlock()
 		c.logDebug("mtu ", candidate, " too large for the path")
+		c.tracer.record("udpx:mtu_probe", traceMTUProbe{Candidate: candidate})
 		return nil
 	}
 	refused := s.mtu.size
@@ -93,6 +94,8 @@ func (c *Conn) write(packets []udpio.Packet) error {
 	next := s.mtu.size
 	c.sendMu.Unlock()
 	c.logDebug("mtu ", refused, " refused by the socket, mtu now ", next)
+	c.tracer.record("udpx:mtu_probe", traceMTUProbe{Candidate: refused})
+	c.tracer.record("recovery:mtu_updated", traceMTU{MTU: next})
 	return nil
 }
 
@@ -297,6 +300,17 @@ func (s *sender) packPacket(now time.Time, frames []outFrame, ackEliciting bool)
 		sent.sendState = s.cc.OnPacketSent(now, priorInFlight, congestion.PacketNumber(packetNumber), congestion.ByteCount(length))
 	}
 	s.batch.sent = append(s.batch.sent, sent)
+	if s.conn.tracer != nil {
+		traced := make([]traceFrame, len(frames))
+		for index := range frames {
+			traced[index] = traceFrameOf(frames[index].payload)
+		}
+		s.conn.tracer.record("transport:packet_sent", tracePacket{
+			Header: tracePacketHeader{PacketType: "1RTT", PacketNumber: packetNumber},
+			Raw:    tracePacketRaw{Length: length},
+			Frames: traced,
+		})
+	}
 	return true
 }
 

@@ -61,7 +61,7 @@ func TestDatagramTooLarge(t *testing.T) {
 }
 
 func TestDatagramDefraggerRejects(t *testing.T) {
-	defragger := newDatagramDefragger()
+	defragger := newDatagramDefragger(nil)
 	now := time.Now()
 	if _, _, err := defragger.feed(datagramData{index: 0, total: 0}, now); err == nil {
 		t.Fatal("a zero-fragment datagram was accepted")
@@ -72,7 +72,7 @@ func TestDatagramDefraggerRejects(t *testing.T) {
 }
 
 func TestDatagramDefraggerOrdersFragments(t *testing.T) {
-	defragger := newDatagramDefragger()
+	defragger := newDatagramDefragger(nil)
 	now := time.Now()
 	if _, complete, err := defragger.feed(datagramData{message: 1, index: 1, total: 2, data: []byte("world")}, now); err != nil || complete {
 		t.Fatal("an incomplete datagram was completed")
@@ -87,7 +87,7 @@ func TestDatagramDefraggerOrdersFragments(t *testing.T) {
 }
 
 func TestDatagramDefraggerExpires(t *testing.T) {
-	defragger := newDatagramDefragger()
+	defragger := newDatagramDefragger(nil)
 	now := time.Now()
 	_, _, _ = defragger.feed(datagramData{message: 1, index: 0, total: 2, data: []byte("a")}, now)
 	if defragger.bytes == 0 {
@@ -109,7 +109,7 @@ func FuzzDatagramReassembly(f *testing.F) {
 		payload = append(payload, byte(message>>8), byte(message))
 		payload = append(payload, header[0]&0x0f, header[1]&0x0f)
 		payload = append(payload, data...)
-		defragger := newDatagramDefragger()
+		defragger := newDatagramDefragger(nil)
 		_, _, _ = defragger.feed(parseDatagram(payload), time.Now())
 	})
 }

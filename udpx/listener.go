@@ -9,6 +9,7 @@ import (
 
 	"github.com/sagernet/sing-quic/udpx/internal/udpio"
 
+	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 )
 
@@ -180,20 +181,23 @@ func (l *Listener) forgetHello(clientConnID connectionID, answer *helloAnswer) {
 func (l *Listener) completeHandshake(clientConnID connectionID, answer *helloAnswer, hello []byte, source net.Addr) {
 	handshake, err := newServerHandshake(hello, l.verifier)
 	if err != nil {
+		l.logger.Debug("udpx: handshake from ", source, " failed: ", err)
 		l.forgetHello(clientConnID, answer)
 		return
 	}
 	result, err := handshake.keys()
 	if err != nil {
+		l.logger.Debug("udpx: handshake from ", source, " failed: ", err)
 		l.forgetHello(clientConnID, answer)
 		return
 	}
-	c := newConn(l.socket, l.io, result, source, l.options, false)
+	c := newConn(l.socket, l.io, result, source, l.options, false, nil)
 	c.onClose = func() {
 		l.remove(c.localID)
 	}
 	c.handler = l.options.NewHandler(c)
 	if c.handler == nil {
+		c.finish(E.New("the handler rejected the connection"))
 		l.forgetHello(clientConnID, answer)
 		return
 	}

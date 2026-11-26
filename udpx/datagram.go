@@ -31,10 +31,11 @@ type datagramDefragger struct {
 	entries map[datagramKey]*datagramReassembly
 	order   []datagramKey
 	bytes   int
+	trace   *tracer
 }
 
-func newDatagramDefragger() datagramDefragger {
-	return datagramDefragger{entries: make(map[datagramKey]*datagramReassembly)}
+func newDatagramDefragger(trace *tracer) datagramDefragger {
+	return datagramDefragger{entries: make(map[datagramKey]*datagramReassembly), trace: trace}
 }
 
 func (d *datagramDefragger) feed(data datagramData, now time.Time) ([]byte, bool, error) {
@@ -89,6 +90,7 @@ func (d *datagramDefragger) expire(now time.Time) {
 	for key, reassembly := range d.entries {
 		if now.Sub(reassembly.added) >= datagramReassemblyAge {
 			d.remove(key)
+			d.trace.record("udpx:datagram_dropped", traceDatagramDrop{Message: uint16(key), Reason: "reassembly_timeout"})
 		}
 	}
 }
@@ -99,6 +101,7 @@ func (d *datagramDefragger) evictOldest() bool {
 		d.order = d.order[1:]
 		if _, loaded := d.entries[key]; loaded {
 			d.remove(key)
+			d.trace.record("udpx:datagram_dropped", traceDatagramDrop{Message: uint16(key), Reason: "reassembly_limit"})
 			return true
 		}
 	}
@@ -140,6 +143,7 @@ func (c *Conn) SendDatagram(data []byte) error {
 		c.send.queueData(outFrame{payload: payload})
 	}
 	c.sendMu.Unlock()
+	c.tracer.record("udpx:datagram_sent", traceDatagram{Message: message, Fragments: fragmentCount, Length: len(data)})
 	c.wake()
 	return nil
 }
@@ -156,6 +160,7 @@ func (c *Conn) handleDatagram(body []byte) error {
 	if !complete {
 		return nil
 	}
+	c.tracer.record("udpx:datagram_received", traceDatagram{Message: data.message, Fragments: int(data.total), Length: len(message)})
 	c.handler.OnDatagram(c, message)
 	return nil
 }

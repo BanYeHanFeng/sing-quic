@@ -209,6 +209,7 @@ func (s *sender) runTimers(now time.Time) error {
 		s.mtu.dropCandidate()
 		s.dropProbe(packetNumber)
 		c.logDebug("mtu probe of ", candidate, " unanswered, mtu stays ", s.mtu.size)
+		c.tracer.record("udpx:mtu_probe", traceMTUProbe{Candidate: candidate})
 	}
 	keepAlive := c.options.KeepAlivePeriod
 	if keepAlive <= 0 && activeStreams > 0 {
@@ -258,6 +259,10 @@ func (s *sender) probeLocked(now time.Time) error {
 		s.conn.logDebug("probe ", oldest.packetNumber, " unanswered for ", maxProbeSilence, ", closing")
 		return ErrProbeTimeout
 	}
+	s.conn.tracer.record("recovery:packet_lost", tracePacketLost{
+		Header:  tracePacketHeader{PacketType: "1RTT", PacketNumber: oldest.packetNumber},
+		Trigger: "pto_expired",
+	})
 	s.inFlight.remove(oldest)
 	var retransmit []outFrame
 	for index := range oldest.frames {

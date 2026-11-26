@@ -51,6 +51,8 @@ type Options struct {
 
 	Logger logger.Logger
 
+	Trace TraceOptions
+
 	// NewHandler 必填：每条连接在握手成功之后、收发循环启动之前被调用一次。
 	// 返回 nil 表示拒绝这条连接。
 	NewHandler func(conn *Conn) Handler
@@ -87,6 +89,7 @@ type Conn struct {
 	options    Options
 	logger     logger.Logger
 	logTag     string
+	tracer     *tracer
 	handler    Handler
 	initiator  bool
 
@@ -103,8 +106,9 @@ type Conn struct {
 	sendDone chan struct{}
 	sendWake chan struct{}
 
-	peerAddr    atomic.Pointer[net.Addr]
-	openStreams atomic.Int32 // 供发送循环的空闲判定读取
+	peerAddr     atomic.Pointer[net.Addr]
+	openStreams  atomic.Int32 // 供发送循环的空闲判定读取
+	closedByPeer atomic.Bool  // 收到对端 CLOSE 帧时置位，只用于 trace
 
 	sendMu sync.Mutex
 	send   sender
@@ -119,15 +123,19 @@ type Conn struct {
 	onClose func() // 内部收尾钩子，供 Listener 把连接移出表
 }
 
-func newConn(socket net.PacketConn, io udpio.Conn, result handshakeResult, peer net.Addr, options Options, initiator bool) *Conn {
+func newConn(socket net.PacketConn, io udpio.Conn, result handshakeResult, peer net.Addr, options Options, initiator bool, trace *tracer) *Conn {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	options = options.withDefaults()
+	if trace == nil {
+		trace = newTracer(options.Trace.Dir, "server", result.peerID, options.Trace.Capacity, options.Logger)
+	}
 	c := &Conn{
 		logTag:     hex.EncodeToString(result.localID[:2]),
 		socket:     socket,
 		io:         io,
 		options:    options,
 		logger:     options.Logger,
+		tracer:     trace,
 		initiator:  initiator,
 		localID:    result.localID,
 		peerID:     result.peerID,
@@ -147,7 +155,7 @@ func newConn(socket net.PacketConn, io udpio.Conn, result handshakeResult, peer 
 			limit:   initialStreams,
 			skipped: make(map[uint32]struct{}),
 		},
-		defragger: newDatagramDefragger(),
+		defragger: newDatagramDefragger(trace),
 	}
 	c.peerAddr.Store(&peer)
 	mtu := mtuMin
@@ -155,9 +163,32 @@ func newConn(socket net.PacketConn, io udpio.Conn, result handshakeResult, peer 
 		mtu = max(mtuMin, min(options.MTU, maxPacketSize))
 	}
 	c.send.init(c, mtu)
-	c.logDebug("connection up local=", c.logTag,
-		" client=", initiator, " remote=", peer, " mtu=", mtu)
+	role := "server"
+	if initiator {
+		role = "client"
+	}
+	c.tracer.record("udpx:connection_started", traceConnectionStarted{
+		Role:        role,
+		LocalID:     c.localID.String(),
+		PeerID:      c.peerID.String(),
+		Remote:      peer.String(),
+		MTU:         mtu,
+		Version:     version,
+		IdleTimeout: traceMillis(options.IdleTimeout),
+		KeepAlive:   traceMillis(options.KeepAlivePeriod),
+	})
+	fields := []any{"connection up local=", c.logTag,
+		" client=", initiator, " remote=", peer, " mtu=", mtu}
+	if trace != nil {
+		fields = append(fields, " trace=", trace.path)
+	}
+	c.logDebug(fields...)
 	return c
+}
+
+// Trace 记录一条自定义 qlog 事件，未开启 trace 时为空操作。
+func (c *Conn) Trace(name string, data any) {
+	c.tracer.record(name, data)
 }
 
 func (c *Conn) logDebug(args ...any) {
@@ -219,6 +250,17 @@ func (c *Conn) finish(cause error) {
 		cause = net.ErrClosed
 	}
 	c.logDebug("connection closed: ", cause)
+	trigger, code := traceCloseOf(cause)
+	initiator := "local"
+	if c.closedByPeer.Load() {
+		initiator = "remote"
+	}
+	c.tracer.record("transport:connection_closed", traceConnectionClosed{
+		Initiator: initiator,
+		Trigger:   trigger,
+		ErrorCode: int(code),
+		Reason:    cause.Error(),
+	})
 	c.cancel(cause)
 	c.closeStreams(cause)
 	if c.ownsSocket {
@@ -230,6 +272,7 @@ func (c *Conn) finish(cause error) {
 	if c.handler != nil {
 		c.handler.OnClose(c, cause)
 	}
+	c.tracer.close()
 }
 
 // finishFromLoop 发送循环排空自己的队列后收尾。
@@ -280,31 +323,44 @@ func Dial(ctx context.Context, socket net.PacketConn, remote net.Addr, credentia
 	if err != nil {
 		return nil, err
 	}
-	result, err := exchangeHello(ctx, socket, remote, handshake)
+	trace := newTracer(options.Trace.Dir, "client", handshake.connID, options.Trace.Capacity, options.Logger)
+	result, err := exchangeHello(ctx, socket, remote, handshake, trace)
 	if err != nil {
+		trace.record("udpx:handshake_failed", traceHello{Reason: err.Error()})
+		trace.record("transport:connection_closed", traceConnectionClosed{
+			Initiator: "local",
+			Trigger:   "handshake_failed",
+			Reason:    err.Error(),
+		})
+		trace.close()
 		return nil, err
 	}
-	c := newConn(socket, udpio.New(socket), result, remote, options, true)
+	c := newConn(socket, udpio.New(socket), result, remote, options, true, trace)
 	c.ownsSocket = true
 	c.handler = options.NewHandler(c)
 	if c.handler == nil {
-		_ = socket.Close()
-		return nil, E.New("the handler rejected the connection")
+		rejected := E.New("the handler rejected the connection")
+		c.finish(rejected)
+		return nil, rejected
 	}
 	go c.sendLoop()
 	go c.recvLoop()
 	return c, nil
 }
 
-func exchangeHello(ctx context.Context, socket net.PacketConn, remote net.Addr, handshake *clientHandshake) (handshakeResult, error) {
+func exchangeHello(ctx context.Context, socket net.PacketConn, remote net.Addr, handshake *clientHandshake, trace *tracer) (handshakeResult, error) {
 	buffer := make([]byte, maxPacketSize)
 	hello := handshake.hello()
+	attempt := 0
 	for {
+		attempt++
+		sentAt := time.Now()
 		_, err := socket.WriteTo(hello, remote)
 		if err != nil {
 			return handshakeResult{}, E.Cause(err, "write hello")
 		}
-		deadline := time.Now().Add(helloRetransmitInterval)
+		trace.record("udpx:hello_sent", traceHello{Attempt: attempt, Length: len(hello)})
+		deadline := sentAt.Add(helloRetransmitInterval)
 		if contextDeadline, loaded := ctx.Deadline(); loaded && contextDeadline.Before(deadline) {
 			deadline = contextDeadline
 		}
@@ -336,6 +392,7 @@ func exchangeHello(ctx context.Context, socket net.PacketConn, remote net.Addr, 
 			if handleErr != nil {
 				continue
 			}
+			trace.record("udpx:hello_received", traceHello{Attempt: attempt, Elapsed: traceMillis(time.Since(sentAt))})
 			err = socket.SetReadDeadline(time.Time{})
 			if err != nil {
 				return handshakeResult{}, E.Cause(err, "clear read deadline")
