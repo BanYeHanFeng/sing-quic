@@ -12,6 +12,8 @@ require (
 	golang.org/x/sync v0.22.0
 )
 
+replace github.com/sagernet/quic-go => github.com/reF1nd/quic-go v0.66.0-sing-box-mod.1.0.20261126073502-d4615144fb01
+
 require (
 	github.com/andybalholm/brotli v1.0.6 // indirect
 	github.com/google/gopacket v1.1.19 // indirect
@@ -20,7 +22,7 @@ require (
 	github.com/klauspost/compress v1.17.9 // indirect
 	github.com/koron/go-ssdp v0.0.4 // indirect
 	github.com/libp2p/go-netroute v0.2.1 // indirect
-	github.com/metacubex/utls v1.8.7 // indirect
+	github.com/metacubex/utls v1.9.0-alpha.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.6 // indirect
 	golang.org/x/net v0.56.0 // indirect

@@ -16,12 +16,12 @@ github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138 h1:YohuNPT/1k3VcTh
 github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138/go.mod h1:TXQg5tfSy+bUjnhT5728j5j/MBj7keIYqqZ1+8k/ui8=
 github.com/libp2p/go-netroute v0.2.1 h1:V8kVrpD8GK0Riv15/7VN6RbUQ3URNZVosw7H2v9tksU=
 github.com/libp2p/go-netroute v0.2.1/go.mod h1:hraioZr0fhBjG0ZRXJJ6Zj2IVEVNx6tDTFQfSmcq7mQ=
-github.com/metacubex/utls v1.8.7 h1:Cp+yWkNTFkSihETgGWq34hlVFds5HpYWVOR1xovUVTs=
-github.com/metacubex/utls v1.8.7/go.mod h1:kncGGVhFaoGn5M3pFe3SXhZCzsbCJayNOH4UEqTKTko=
+github.com/metacubex/utls v1.9.0-alpha.1 h1:0tE4Pi5eoGnhEvS+ZZvVhEpZh5Ugo2nDQM+69g4SFaM=
+github.com/metacubex/utls v1.9.0-alpha.1/go.mod h1:kncGGVhFaoGn5M3pFe3SXhZCzsbCJayNOH4UEqTKTko=
 github.com/quic-go/qpack v0.6.0 h1:g7W+BMYynC1LbYLSqRt8PBg5Tgwxn214ZZR34VIOjz8=
 github.com/quic-go/qpack v0.6.0/go.mod h1:lUpLKChi8njB4ty2bFLX2x4gzDqXwUpaO1DP9qMDZII=
-github.com/sagernet/quic-go v0.66.0-sing-box-mod.1 h1:Wo0ZwRzKEzlRLMDoe+xZ/IS0PoQERYgu7iFCWfWvV3Q=
-github.com/sagernet/quic-go v0.66.0-sing-box-mod.1/go.mod h1:Zo98Ai4X4V5LfA+9lieDJyoYRQlhMQBvVSWQgD2uNe4=
+github.com/reF1nd/quic-go v0.66.0-sing-box-mod.1.0.20261126073502-d4615144fb01 h1:6J2IwzLD73jH6afPU6KSXEabA0E6TSPN4QXS1dbCavU=
+github.com/reF1nd/quic-go v0.66.0-sing-box-mod.1.0.20261126073502-d4615144fb01/go.mod h1:kLhxSpLBNhUxQc4aLAR4uuvLp6DMFz15QDlzE7y0hvY=
 github.com/sagernet/sing v0.9.0-beta.4 h1:DYoEzb3FeCZ9bA66hJmL0NFDXckZpa4oYF/VpbFJEkE=
 github.com/sagernet/sing v0.9.0-beta.4/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=

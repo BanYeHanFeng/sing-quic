@@ -200,10 +200,15 @@ func CreateTransport(conn net.Conn, quicConnPtr **quic.Conn, config aTLS.Config,
 	if err != nil {
 		return nil, err
 	}
+	var serverName string
+	if tlsConfig != nil {
+		serverName = tlsConfig.ServerName
+	}
 	return &http3.Transport{
 		TLSClientConfig: tlsConfig,
 		QUICConfig:      quicConfig,
 		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			tlsCfg.ServerName = serverName
 			cfg = quicConfigWithHandshakeTimeout(cfg, handshakeTimeout)
 			quicConn, err := quic.DialEarlyConn(ctx, conn, tlsCfg, cfg)
 			if err != nil {
@@ -228,10 +233,15 @@ func CreatePacketTransport(conn net.PacketConn, remoteAddr net.Addr, quicConnPtr
 	if err != nil {
 		return nil, err
 	}
+	var serverName string
+	if tlsConfig != nil {
+		serverName = tlsConfig.ServerName
+	}
 	return &http3.Transport{
 		TLSClientConfig: tlsConfig,
 		QUICConfig:      quicConfig,
 		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			tlsCfg.ServerName = serverName
 			cfg = quicConfigWithHandshakeTimeout(cfg, handshakeTimeout)
 			quicConn, err := quic.DialEarly(ctx, conn, remoteAddr, tlsCfg, cfg)
 			if err != nil {
