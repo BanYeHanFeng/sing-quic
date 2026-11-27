@@ -159,12 +159,16 @@ func (c *channelConn) input(message udpMessage) {
 func (c *channelConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.session.mu.Lock()
-		if c.session.channels[c.channel] == c {
+		registered := c.session.channels[c.channel] == c
+		if registered {
 			delete(c.session.channels, c.channel)
 		}
 		c.session.mu.Unlock()
-		c.session.conn.Trace("quicx:channel_closed", channelEvent{Channel: c.channel, Reason: "local"})
 		c.closeWithError(os.ErrClosed)
+		if !registered {
+			return
+		}
+		c.session.conn.Trace("quicx:channel_closed", channelEvent{Channel: c.channel, Reason: "local"})
 		_ = c.session.conn.SendDatagram(packChannel(c.channel, CommandDissociate))
 	})
 	return nil
