@@ -162,6 +162,7 @@ func (c *channelConn) Close() error {
 		registered := c.session.channels[c.channel] == c
 		if registered {
 			delete(c.session.channels, c.channel)
+			c.session.buryChannel(c.channel)
 		}
 		c.session.mu.Unlock()
 		c.closeWithError(os.ErrClosed)

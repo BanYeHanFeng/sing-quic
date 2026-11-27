@@ -171,8 +171,18 @@ func (s *serverSession[U]) onUnknownChannel(channel uint32, message udpMessage) 
 	if !message.destination.IsValid() {
 		return
 	}
+	if s.session.buried(channel) {
+		s.conn.Trace("quicx:message_dropped", channelEvent{
+			Channel:     channel,
+			Destination: message.destination.String(),
+			Length:      len(message.data),
+			Reason:      "dissociated",
+		})
+		return
+	}
 	conn := newChannelConn(s.requestCtx, s.session, channel)
 	if !s.session.addChannel(conn) {
+		conn.closeWithError(E.New("channel is unavailable"))
 		return
 	}
 	s.conn.Trace("quicx:channel_opened", channelEvent{Channel: channel, Destination: message.destination.String()})

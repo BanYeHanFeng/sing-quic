@@ -4,11 +4,51 @@ import (
 	"context"
 	"encoding/binary"
 	"sync"
+	"time"
 
 	"github.com/sagernet/sing-quic/udpx"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 )
+
+const channelTombstoneTTL = 30 * time.Second
+
+// channelTombstones 记住已关闭的通道号，防止关闭前发出的数据包乱序到达时把通道重新建出来。
+//
+// 记录按代保留：当前代至少留一个 TTL，最多两个 TTL，轮换时整代丢弃，不做逐条清理。
+type channelTombstones struct {
+	current  map[uint32]struct{}
+	previous map[uint32]struct{}
+	rotated  time.Time
+}
+
+func (t *channelTombstones) bury(id uint32, now time.Time) {
+	t.rotate(now)
+	if t.current == nil {
+		t.current = make(map[uint32]struct{})
+	}
+	t.current[id] = struct{}{}
+}
+
+func (t *channelTombstones) buried(id uint32, now time.Time) bool {
+	if _, loaded := t.current[id]; loaded {
+		return true
+	}
+	if now.Sub(t.rotated) >= channelTombstoneTTL {
+		return false
+	}
+	_, loaded := t.previous[id]
+	return loaded
+}
+
+func (t *channelTombstones) rotate(now time.Time) {
+	if !t.rotated.IsZero() && now.Sub(t.rotated) < channelTombstoneTTL {
+		return
+	}
+	t.previous = t.current
+	t.current = make(map[uint32]struct{})
+	t.rotated = now
+}
 
 // session 是一条连接上的 UDP 通道表，同时是 udpx 的事件接收方。
 type session struct {
@@ -19,6 +59,7 @@ type session struct {
 
 	mu          sync.Mutex
 	channels    map[uint32]*channelConn
+	tombstones  channelTombstones
 	nextChannel uint32
 	newChannel  func(channel uint32, message udpMessage) // 客户端为 nil：未知通道直接丢弃
 
@@ -91,11 +132,29 @@ func (s *session) addChannel(conn *channelConn) bool {
 		return false
 	default:
 	}
+	if s.tombstones.buried(conn.channel, time.Now()) {
+		return false
+	}
 	if _, loaded := s.channels[conn.channel]; loaded {
 		return false
 	}
 	s.channels[conn.channel] = conn
 	return true
+}
+
+// buried 报告通道是否已经关闭过：服务端据此拒绝为乱序到达的数据包重建通道。
+func (s *session) buried(id uint32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tombstones.buried(id, time.Now())
+}
+
+// buryChannel 记住刚关闭的通道号，须在持有 s.mu 时调用。
+func (s *session) buryChannel(id uint32) {
+	if s.newChannel == nil {
+		return
+	}
+	s.tombstones.bury(id, time.Now())
 }
 
 func (s *session) openChannel(ctx context.Context) (*channelConn, error) {
@@ -143,6 +202,7 @@ func (s *session) dissociate(id uint32) {
 	s.mu.Lock()
 	conn, loaded := s.channels[id]
 	delete(s.channels, id)
+	s.buryChannel(id)
 	s.mu.Unlock()
 	if loaded {
 		s.conn.Trace("quicx:channel_closed", channelEvent{Channel: id, Reason: "dissociate"})

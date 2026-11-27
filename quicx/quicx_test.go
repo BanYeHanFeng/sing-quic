@@ -320,6 +320,49 @@ func TestPacketConnections(t *testing.T) {
 	}
 }
 
+// 关闭前发出的数据包晚于 Dissociate 到达时，服务端不能再把通道建回来。
+func TestDissociatedChannelIsNotRebuilt(t *testing.T) {
+	client, handler := testSetup(t, "password")
+	ctx := testContext(t, 20*time.Second)
+	packetConn, err := client.ListenPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := packetConn.(*channelConn).channel
+	destination := M.ParseSocksaddr("1.1.1.1:53")
+	if _, err = packetConn.WriteTo([]byte("query"), destination); err != nil {
+		t.Fatal(err)
+	}
+	serverConn := handler.packetConnection(t, ctx)
+	request := buf.New()
+	defer request.Release()
+	if _, err = serverConn.conn.ReadPacket(request); err != nil {
+		t.Fatal(err)
+	}
+	if err = packetConn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-serverConn.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the dissociate never closed the channel")
+	}
+	_ = serverConn.conn.Close()
+	current, err := client.getSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	late := udpMessage{destination: destination, data: []byte("late")}
+	if err = current.conn.SendDatagram(late.pack(channel)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handler.packets:
+		t.Fatal("the service rebuilt a dissociated channel")
+	case <-time.After(time.Second):
+	}
+}
+
 func TestLargeTransfer(t *testing.T) {
 	client, handler := testSetup(t, "password")
 	ctx := testContext(t, 60*time.Second)

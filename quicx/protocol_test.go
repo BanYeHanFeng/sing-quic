@@ -147,6 +147,33 @@ func TestDissociateClosesTheChannel(t *testing.T) {
 	_ = packetConn.Close()
 }
 
+func TestChannelTombstones(t *testing.T) {
+	var tombstones channelTombstones
+	now := time.Now()
+	tombstones.bury(7, now)
+	if !tombstones.buried(7, now) {
+		t.Fatal("a buried channel came back")
+	}
+	if tombstones.buried(8, now) {
+		t.Fatal("an untouched channel was buried")
+	}
+	now = now.Add(channelTombstoneTTL + time.Second)
+	if !tombstones.buried(7, now) {
+		t.Fatal("a tombstone did not survive its rotation")
+	}
+	tombstones.bury(9, now)
+	if !tombstones.buried(7, now) {
+		t.Fatal("the previous tombstone was dropped too early")
+	}
+	now = now.Add(channelTombstoneTTL)
+	if tombstones.buried(7, now) {
+		t.Fatal("an expired tombstone outlived two rotations")
+	}
+	if !tombstones.buried(9, now) {
+		t.Fatal("the current tombstone was rotated away")
+	}
+}
+
 func TestNewClientRequiresOptions(t *testing.T) {
 	if _, err := NewClient(ClientOptions{}); err == nil {
 		t.Fatal("a client without a dialer was created")
