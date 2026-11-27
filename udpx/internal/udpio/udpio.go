@@ -32,7 +32,8 @@ func (p Packet) ForEach(fn func(datagram []byte)) {
 type Conn interface {
 	ReadPacket(buffer []byte) (Packet, error)
 
-	WritePackets(packets []Packet) error
+	// WritePackets 顺序写出整批包，返回出错前已经写出的包数。
+	WritePackets(packets []Packet) (written int, err error)
 
 	Offload() (gso, gro bool)
 }
@@ -60,14 +61,14 @@ func (c *plainConn) ReadPacket(buffer []byte) (Packet, error) {
 	return Packet{Data: buffer[:n], Addr: addr, Segments: 1}, nil
 }
 
-func (c *plainConn) WritePackets(packets []Packet) error {
-	for _, packet := range packets {
+func (c *plainConn) WritePackets(packets []Packet) (int, error) {
+	for index, packet := range packets {
 		_, err := c.WriteTo(packet.Data, packet.Addr)
 		if err != nil {
-			return err
+			return index, err
 		}
 	}
-	return nil
+	return len(packets), nil
 }
 
 func (c *plainConn) Offload() (bool, bool) { return false, false }

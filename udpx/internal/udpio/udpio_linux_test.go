@@ -187,7 +187,7 @@ func TestUnequalSend(t *testing.T) {
 			for _, payload := range payloads {
 				packets = append(packets, Packet{Data: payload, Addr: receiverAddr})
 			}
-			if err := senderConn.WritePackets(packets); err != nil {
+			if _, err := senderConn.WritePackets(packets); err != nil {
 				t.Fatalf("write: %v", err)
 			}
 			if err := receiver.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -237,7 +237,7 @@ func TestBatchToSeveralAddresses(t *testing.T) {
 		{Data: payloads[2], Addr: first.LocalAddr()},
 		{Data: payloads[3], Addr: second.LocalAddr()},
 	}
-	if err := senderConn.WritePackets(packets); err != nil {
+	if _, err := senderConn.WritePackets(packets); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	for _, testCase := range []struct {
@@ -282,7 +282,7 @@ func TestSegmentedSend(t *testing.T) {
 	for _, payload := range payloads {
 		packets = append(packets, Packet{Data: payload, Addr: receiverAddr})
 	}
-	if err := senderConn.WritePackets(packets); err != nil {
+	if _, err := senderConn.WritePackets(packets); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	if err := receiver.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {

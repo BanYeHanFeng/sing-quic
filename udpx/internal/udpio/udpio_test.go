@@ -3,12 +3,27 @@ package udpio
 import (
 	"bytes"
 	"net"
+	"os"
 	"testing"
 	"time"
 )
 
 type wrapper struct {
 	net.PacketConn
+}
+
+type failingPacketConn struct {
+	net.PacketConn
+	failAfter int
+	written   int
+}
+
+func (c *failingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if c.written >= c.failAfter {
+		return 0, os.ErrInvalid
+	}
+	c.written++
+	return c.PacketConn.WriteTo(p, addr)
 }
 
 func listenPacket(t *testing.T) net.PacketConn {
@@ -97,7 +112,7 @@ func TestRoundTrip(t *testing.T) {
 			for _, payload := range payloads {
 				packets = append(packets, Packet{Data: payload, Addr: receiverAddr})
 			}
-			if err := senderConn.WritePackets(packets); err != nil {
+			if _, err := senderConn.WritePackets(packets); err != nil {
 				t.Fatalf("write: %v", err)
 			}
 			if err := receiver.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -134,9 +149,26 @@ func TestRoundTrip(t *testing.T) {
 
 func TestWriteRejectsUnknownAddress(t *testing.T) {
 	conn := New(&wrapper{PacketConn: listenPacket(t)})
-	err := conn.WritePackets([]Packet{{Data: []byte("x"), Addr: nil}})
+	_, err := conn.WritePackets([]Packet{{Data: []byte("x"), Addr: nil}})
 	if err == nil {
 		t.Fatal("a packet without an address was written")
+	}
+}
+
+func TestWritePacketsReportsWrittenPrefix(t *testing.T) {
+	receiver := listenPacket(t)
+	sender := &failingPacketConn{PacketConn: listenPacket(t), failAfter: 2}
+	conn := New(sender)
+	packets := make([]Packet, 0, 4)
+	for range 4 {
+		packets = append(packets, Packet{Data: []byte("payload"), Addr: receiver.LocalAddr()})
+	}
+	written, err := conn.WritePackets(packets)
+	if err == nil {
+		t.Fatal("write did not fail")
+	}
+	if written != 2 {
+		t.Fatalf("written %d, want the two packets before the failure", written)
 	}
 }
 

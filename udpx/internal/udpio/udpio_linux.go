@@ -122,9 +122,9 @@ func receivedPacket(data []byte, oob []byte, from unix.Sockaddr) Packet {
 	return packet
 }
 
-func (c *batchedConn) WritePackets(packets []Packet) error {
+func (c *batchedConn) WritePackets(packets []Packet) (int, error) {
 	if len(packets) == 0 {
-		return nil
+		return 0, nil
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -137,16 +137,16 @@ func (c *batchedConn) WritePackets(packets []Packet) error {
 				continue
 			}
 			if !isGSOError(err) {
-				return err
+				return start, err
 			}
 			c.gso = false
 		}
 		if err := c.send(packets[start].Data, packets[start].Addr, 0); err != nil {
-			return err
+			return start, err
 		}
 		start++
 	}
-	return nil
+	return len(packets), nil
 }
 
 func (c *batchedConn) segmentCount(packets []Packet, start int) int {

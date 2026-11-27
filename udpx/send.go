@@ -67,14 +67,23 @@ func (c *Conn) sendLoop() {
 }
 
 // write 发出本批包。EMSGSIZE 说明路径装不下：丢弃探测候选或下调 MTU，帧放回队列重发。
+//
+// 整批写可能只写出一部分，回队只针对失败位置之后的包；已经发出的包不再重复。
 func (c *Conn) write(packets []udpio.Packet) error {
-	err := c.io.WritePackets(packets)
+	written, err := c.io.WritePackets(packets)
+	if err == nil {
+		return nil
+	}
 	if !isMessageTooLong(err) {
 		return err
 	}
 	c.sendMu.Lock()
 	s := &c.send
-	failed := append([]*sentPacket(nil), s.batch.sent...)
+	if written >= len(s.batch.sent) {
+		c.sendMu.Unlock()
+		return err
+	}
+	failed := append([]*sentPacket(nil), s.batch.sent[written:]...)
 	if slices.ContainsFunc(failed, func(packet *sentPacket) bool { return packet.mtu }) {
 		candidate := s.mtu.candidate
 		s.mtu.dropCandidate()
