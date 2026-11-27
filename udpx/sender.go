@@ -61,6 +61,11 @@ func (f outFrame) size() int {
 	return len(f.payload)
 }
 
+// isAck 说明这一帧是尚未发出的 ACK：后一次确认可以直接替换它，不必在同一个包里堆叠多帧。
+func (f outFrame) isAck() bool {
+	return len(f.payload) >= frameHeaderLen && f.payload[0]&frameTypeMask == frameTypeAck
+}
+
 func newStreamFrame(stream *Stream, offset uint64, fin bool, data []byte) outFrame {
 	buffer := frameBufferPool.Get().(*[]byte)
 	payload := appendStreamHeader((*buffer)[:0], stream.id, offset, fin, len(data))
@@ -289,14 +294,25 @@ func (s *sender) ptoDeadline() time.Time {
 	if base.IsZero() {
 		base = s.inFlight.oldest().sentAt
 	}
-	backoff := min(s.probes, maxProbeBackoff)
-	return base.Add(s.rtt.pto() << backoff)
+	deadline := base.Add(s.rtt.pto() << min(s.probes, maxProbeBackoff))
+	if s.probes > 0 {
+		// 探测重发会刷新 lastSentAt，退避只能拉长重发间隔，静默上限必须准时到期。
+		limit := s.probeSince.Add(maxProbeSilence)
+		if limit.Before(deadline) {
+			deadline = limit
+		}
+	}
+	return deadline
 }
 
 func (s *sender) enqueueAck(now time.Time) {
 	s.ackAt = time.Time{}
 	payload := s.ack.pack(now)
 	if len(payload) == 0 {
+		return
+	}
+	if prev := len(s.control) - 1; prev >= 0 && s.control[prev].isAck() {
+		s.control[prev].payload = payload
 		return
 	}
 	s.control = append(s.control, outFrame{payload: payload})
