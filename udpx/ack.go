@@ -15,6 +15,11 @@ const (
 
 	ackThreshold = 4
 
+	// ackRangeLifetime 是确认区间在列表里的最短寿命：比它更久没有新包落入的区间
+	// 已经不可能再被发送方当作在途包（发送方按时间阈值判丢只需要一个 RTT 量级），
+	// 继续报告只会让每一帧 ACK 都带上永远填不上的空洞。
+	ackRangeLifetime = time.Second
+
 	minAckDelay = 4 * time.Millisecond
 
 	maxAckDelay = 25 * time.Millisecond
@@ -31,21 +36,28 @@ type pnRange struct {
 	end   uint32
 }
 
-type pnRanges struct {
-	ranges []pnRange
+type receivedRange struct {
+	pnRange
+	at time.Time
 }
 
-func (r *pnRanges) add(pn uint32) bool {
-	if r.contains(pn) {
+type pnRanges struct {
+	ranges []receivedRange
+	// lowest 以下的包号已经退出记录：它们要么早已被对端判丢，要么被区间上限挤出。
+	lowest uint32
+}
+
+func (r *pnRanges) add(pn uint32, now time.Time) bool {
+	if pn < r.lowest || r.contains(pn) {
 		return false
 	}
 	index := 0
 	for index < len(r.ranges) && r.ranges[index].start > pn {
 		index++
 	}
-	r.ranges = append(r.ranges, pnRange{})
+	r.ranges = append(r.ranges, receivedRange{})
 	copy(r.ranges[index+1:], r.ranges[index:])
-	r.ranges[index] = pnRange{start: pn, end: pn}
+	r.ranges[index] = receivedRange{pnRange: pnRange{start: pn, end: pn}, at: now}
 	r.merge()
 	return true
 }
@@ -56,14 +68,37 @@ func (r *pnRanges) merge() {
 		previous := &kept[len(kept)-1]
 		if previous.start-current.end <= 1 {
 			previous.start = current.start
+			if current.at.After(previous.at) {
+				previous.at = current.at
+			}
 			continue
 		}
 		kept = append(kept, current)
 	}
 	r.ranges = kept
 	if len(r.ranges) > receivedRangeLimit {
+		r.lowest = r.ranges[receivedRangeLimit].end + 1
 		r.ranges = r.ranges[:receivedRangeLimit]
 	}
+}
+
+// expire 丢掉已经过期的低位区间：最新区间永远保留，其余区间一旦安静超过 lifetime
+// 就不再出现在 ACK 里，之后迟到的同号包也被忽略。
+func (r *pnRanges) expire(now time.Time, lifetime time.Duration) {
+	kept := r.ranges[:0]
+	for index, current := range r.ranges {
+		if index > 0 && now.Sub(current.at) > lifetime {
+			if current.end+1 > r.lowest {
+				r.lowest = current.end + 1
+			}
+			continue
+		}
+		kept = append(kept, current)
+	}
+	for index := len(kept); index < len(r.ranges); index++ {
+		r.ranges[index] = receivedRange{}
+	}
+	r.ranges = kept
 }
 
 func (r *pnRanges) contains(pn uint32) bool {
@@ -139,7 +174,7 @@ type ackScheduler struct {
 
 func (s *ackScheduler) received(pn uint32, now time.Time) bool {
 	previousLargest, hadLargest := s.ranges.largest()
-	if !s.ranges.add(pn) {
+	if !s.ranges.add(pn, now) {
 		return false
 	}
 	s.pending = true
@@ -151,7 +186,8 @@ func (s *ackScheduler) received(pn uint32, now time.Time) bool {
 	return true
 }
 
-func (s *ackScheduler) pack(now time.Time) []byte {
+func (s *ackScheduler) pack(now time.Time, lifetime time.Duration) []byte {
+	s.ranges.expire(now, lifetime)
 	if !s.pending || len(s.ranges.ranges) == 0 {
 		s.pending = false
 		return nil
@@ -159,7 +195,9 @@ func (s *ackScheduler) pack(now time.Time) []byte {
 	var packed ack
 	packed.largest = s.ranges.ranges[0].end
 	packed.count = min(len(s.ranges.ranges), maxAckRanges)
-	copy(packed.ranges[:], s.ranges.ranges[:packed.count])
+	for index := range packed.count {
+		packed.ranges[index] = s.ranges.ranges[index].pnRange
+	}
 	packed.delay = now.Sub(s.largestAt)
 	s.pending = false
 	s.elicited = 0

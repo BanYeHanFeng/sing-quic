@@ -6,20 +6,21 @@ import (
 )
 
 func TestPnRangesMerge(t *testing.T) {
+	now := time.Now()
 	var ranges pnRanges
 	for _, pn := range []uint32{4, 1, 2, 8, 3} {
-		ranges.add(pn)
+		ranges.add(pn, now)
 	}
 	if len(ranges.ranges) != 2 {
 		t.Fatalf("%d ranges", len(ranges.ranges))
 	}
-	if ranges.ranges[0] != (pnRange{start: 8, end: 8}) {
+	if ranges.ranges[0].pnRange != (pnRange{start: 8, end: 8}) {
 		t.Fatalf("first range %+v", ranges.ranges[0])
 	}
-	if ranges.ranges[1] != (pnRange{start: 1, end: 4}) {
+	if ranges.ranges[1].pnRange != (pnRange{start: 1, end: 4}) {
 		t.Fatalf("second range %+v", ranges.ranges[1])
 	}
-	if ranges.add(3) {
+	if ranges.add(3, now) {
 		t.Fatal("a duplicate was added")
 	}
 	if !ranges.contains(2) || ranges.contains(5) {
@@ -28,12 +29,40 @@ func TestPnRangesMerge(t *testing.T) {
 }
 
 func TestPnRangesLimit(t *testing.T) {
+	now := time.Now()
 	var ranges pnRanges
 	for index := range receivedRangeLimit + 8 {
-		ranges.add(uint32(index * 2))
+		ranges.add(uint32(index*2), now)
 	}
 	if len(ranges.ranges) > receivedRangeLimit {
 		t.Fatalf("%d ranges are remembered", len(ranges.ranges))
+	}
+	if ranges.add(0, now) {
+		t.Fatal("a range dropped by the limit was added back")
+	}
+}
+
+func TestPnRangesRetireQuietRanges(t *testing.T) {
+	now := time.Now()
+	var ranges pnRanges
+	for _, pn := range []uint32{1, 3, 5, 8} {
+		ranges.add(pn, now)
+	}
+	if len(ranges.ranges) != 4 {
+		t.Fatalf("%d ranges are remembered", len(ranges.ranges))
+	}
+	ranges.expire(now.Add(ackRangeLifetime+time.Millisecond), ackRangeLifetime)
+	if len(ranges.ranges) != 1 || ranges.ranges[0].pnRange != (pnRange{start: 8, end: 8}) {
+		t.Fatalf("ranges after retirement %+v", ranges.ranges)
+	}
+	if ranges.lowest != 6 {
+		t.Fatalf("lowest %d after retirement", ranges.lowest)
+	}
+	if ranges.add(5, now) {
+		t.Fatal("a retired packet was added back")
+	}
+	if !ranges.add(6, now) {
+		t.Fatal("a packet above the retired floor was refused")
 	}
 }
 
@@ -48,11 +77,11 @@ func TestAckScheduler(t *testing.T) {
 	if !scheduler.received(ackThreshold-1, now) {
 		t.Fatal("the threshold did not elicit an acknowledgement")
 	}
-	packed := scheduler.pack(now)
+	packed := scheduler.pack(now, ackRangeLifetime)
 	if packed == nil {
 		t.Fatal("nothing was packed")
 	}
-	if scheduler.pack(now) != nil {
+	if scheduler.pack(now, ackRangeLifetime) != nil {
 		t.Fatal("the same acknowledgement was packed twice")
 	}
 	parsed, err := parseAckFrame(packed[frameHeaderLen:])
@@ -120,5 +149,38 @@ func TestLossDelayNeverZero(t *testing.T) {
 	estimator.sample(time.Millisecond)
 	if delay := lossDelay(estimator); delay < maxAckDelay {
 		t.Fatalf("loss delay %v", delay)
+	}
+}
+
+func TestAcknowledgementsStaySmallUnderLoss(t *testing.T) {
+	now := time.Unix(0, 0)
+	var scheduler ackScheduler
+	seed := uint32(1)
+	packed, dropped := 0, 0
+	for pn := uint32(1); pn <= 6000; pn++ {
+		now = now.Add(10 * time.Millisecond)
+		seed = seed*1664525 + 1013904223
+		if (seed>>8)%100 == 0 {
+			dropped++
+			continue
+		}
+		if !scheduler.received(pn, now) {
+			continue
+		}
+		payload := scheduler.pack(now, ackRangeLifetime)
+		if payload == nil {
+			continue
+		}
+		parsed, err := parseAckFrame(payload[frameHeaderLen:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		packed++
+		if parsed.count > 8 {
+			t.Fatalf("acknowledgement of %d ranges with %d of %d packets dropped", parsed.count, dropped, packed)
+		}
+	}
+	if packed == 0 {
+		t.Fatal("nothing was acknowledged")
 	}
 }

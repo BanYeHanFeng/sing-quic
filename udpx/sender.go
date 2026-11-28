@@ -307,7 +307,7 @@ func (s *sender) ptoDeadline() time.Time {
 
 func (s *sender) enqueueAck(now time.Time) {
 	s.ackAt = time.Time{}
-	payload := s.ack.pack(now)
+	payload := s.ack.pack(now, s.ackRangeLifetime())
 	if len(payload) == 0 {
 		return
 	}
@@ -316,6 +316,12 @@ func (s *sender) enqueueAck(now time.Time) {
 		return
 	}
 	s.control = append(s.control, outFrame{payload: payload})
+}
+
+// ackRangeLifetime 让确认区间至少活过发送方判定丢包的时间尺度：低于 4 倍平滑 RTT
+// 的区间仍可能对应对端的在途包，过早遗忘会让它多一次无谓的重传。
+func (s *sender) ackRangeLifetime() time.Duration {
+	return max(ackRangeLifetime, 4*s.rtt.smoothed)
 }
 
 func (s *sender) rxPacket(packetNumber uint32, ackEliciting bool, now time.Time) {
