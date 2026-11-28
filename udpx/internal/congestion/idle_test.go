@@ -103,3 +103,31 @@ func TestBbrStartupEndsWhenTheApplicationStops(t *testing.T) {
 		t.Fatal("still in startup after twenty rounds the application did not fill")
 	}
 }
+
+func TestBbrLeavesProbeRttWithoutAcknowledgements(t *testing.T) {
+	simulation := newIdleSimulation()
+	for round := 0; round < 40; round++ {
+		simulation.send(int(simulation.controller.GetCongestionWindow()/testDatagramSize), testDatagramSize)
+		simulation.acknowledge()
+	}
+	stableWindow := simulation.controller.congestionWindow
+	simulation.now = simulation.now.Add(minRttExpiry + time.Second)
+	simulation.send(8, testDatagramSize)
+	simulation.acknowledge()
+	if mode := simulation.controller.mode; mode != bbrModeProbeRtt {
+		t.Fatalf("mode %s after the minimum rtt expired", mode)
+	}
+	if window := simulation.controller.GetCongestionWindow(); window != simulation.controller.minCongestionWindow {
+		t.Fatalf("window of %d while probing the minimum rtt", window)
+	}
+	for elapsed := time.Duration(0); elapsed <= probeRttMaxStay+probeRttTime; elapsed += 100 * time.Millisecond {
+		simulation.now = simulation.now.Add(100 * time.Millisecond)
+		simulation.controller.OnTimePassed(simulation.now)
+	}
+	if mode := simulation.controller.mode; mode == bbrModeProbeRtt {
+		t.Fatal("still probing the minimum rtt ten rounds later")
+	}
+	if window := simulation.controller.GetCongestionWindow(); window != stableWindow {
+		t.Fatalf("window of %d after leaving probe rtt, expected %d", window, stableWindow)
+	}
+}

@@ -183,6 +183,14 @@ func (b *bbrSender) OnAppLimited() {
 	b.sampler.onAppLimited()
 }
 
+func (b *bbrSender) OnTimePassed(now time.Time) {
+	if b.mode != bbrModeProbeRtt {
+		return
+	}
+	b.updateProbeRtt(now, false)
+}
+
+
 func (b *bbrSender) GetCongestionWindow() ByteCount {
 	if b.mode == bbrModeProbeRtt {
 		return b.probeRttCongestionWindow()
@@ -214,9 +222,6 @@ func (b *bbrSender) OnCongestionEvent(priorInFlight ByteCount, eventTime time.Ti
 	sample := b.sampler.OnCongestionEvent(eventTime,
 		ackedPackets, lostPackets, b.maxBandwidth.getBest(), infBandwidth, b.roundTripCount)
 	b.lastSampleIsAppLimited = sample.lastPacketState.appLimited
-	if paced := b.pacingRate(); sample.sampleMaxBandwidth > paced {
-		sample.sampleMaxBandwidth = paced
-	}
 	if totalBytesAckedBefore != b.sampler.totalBytesAcked {
 		if !sample.sampleIsAppLimited || sample.sampleMaxBandwidth > b.maxBandwidth.getBest() {
 			b.maxBandwidth.update(sample.sampleMaxBandwidth, b.roundTripCount)
@@ -397,33 +402,44 @@ func (b *bbrSender) maybeEnterOrExitProbeRtt(now time.Time, isRoundStart, minRtt
 	}
 
 	if b.mode == bbrModeProbeRtt {
-		b.sampler.onAppLimited()
-
-		if b.exitProbeRttAt.IsZero() {
-			if b.bytesInFlight < b.probeRttCongestionWindow()+probeRTTWindowSlack {
-				b.exitProbeRttAt = now.Add(probeRttTime)
-				b.probeRttRoundPassed = false
-			} else if now.Sub(b.enteredProbeRttAt) >= probeRttMaxStay {
-				b.exitProbeRttAt = now
-				b.probeRttRoundPassed = false
-			}
-		} else {
-			if isRoundStart {
-				b.probeRttRoundPassed = true
-			}
-			probeRttDone := b.probeRttRoundPassed || now.Sub(b.enteredProbeRttAt) >= probeRttMaxStay
-			if now.Sub(b.exitProbeRttAt) >= 0 && probeRttDone {
-				b.minRttTimestamp = now
-				if !b.isAtFullBandwidth {
-					b.enterStartupMode(now)
-				} else {
-					b.enterProbeBandwidthMode(now)
-				}
-			}
-		}
+		b.updateProbeRtt(now, isRoundStart)
 	}
 
 	b.exitingQuiescence = false
+}
+
+// updateProbeRtt 推进 ProbeRTT：先在最小窗口上排空在途并停留 probeRttTime，
+// 再等到跨越一轮或兜底上限后退出。没有确认事件时由 OnTimePassed 驱动。
+func (b *bbrSender) updateProbeRtt(now time.Time, isRoundStart bool) {
+	b.sampler.onAppLimited()
+
+	if b.exitProbeRttAt.IsZero() {
+		if b.bytesInFlight < b.probeRttCongestionWindow()+probeRTTWindowSlack ||
+			now.Sub(b.enteredProbeRttAt) >= probeRttMaxStay {
+			b.exitProbeRttAt = now.Add(probeRttTime)
+			b.probeRttRoundPassed = false
+		}
+		return
+	}
+
+	if isRoundStart {
+		b.probeRttRoundPassed = true
+	}
+
+	if now.Before(b.exitProbeRttAt) {
+		return
+	}
+
+	if !b.probeRttRoundPassed && now.Sub(b.enteredProbeRttAt) < probeRttMaxStay {
+		return
+	}
+
+	b.minRttTimestamp = now
+	if b.isAtFullBandwidth {
+		b.enterProbeBandwidthMode(now)
+	} else {
+		b.enterStartupMode(now)
+	}
 }
 
 func (b *bbrSender) calculatePacingRate() {

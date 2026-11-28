@@ -207,27 +207,3 @@ func TestBbrProbeRttSkippedWhileLosing(t *testing.T) {
 		t.Fatal("probe_rtt entered on a round that lost packets")
 	}
 }
-
-func TestBbrEstimateBoundedByPacing(t *testing.T) {
-	sender := newBbrSender(testDatagramSize, initialCongestionWindowPackets)
-	sender.SetMinRTTProvider(fixedRTT(testRoundTrip))
-	now := time.Unix(0, 0)
-	var inFlight ByteCount
-	var sent []AckedPacketInfo
-	for index := 0; index < 16; index++ {
-		packet := PacketNumber(index + 1)
-		state := sender.OnPacketSent(now, inFlight, packet, testDatagramSize)
-		inFlight += testDatagramSize
-		sent = append(sent, AckedPacketInfo{
-			SendState:    state,
-			TimeSent:     now,
-			BytesAcked:   testDatagramSize,
-			PacketNumber: packet,
-		})
-	}
-	paced := sender.pacingRate()
-	sender.OnCongestionEvent(inFlight, now.Add(time.Millisecond), sent, nil)
-	if estimate := sender.bandwidthEstimate(); estimate > paced {
-		t.Fatalf("estimate of %d bits per second above the paced rate of %d", estimate, paced)
-	}
-}

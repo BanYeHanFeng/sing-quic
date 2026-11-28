@@ -206,6 +206,7 @@ func (s *sender) runTimers(now time.Time) error {
 		}
 		s.idleAt = now.Add(c.options.IdleTimeout)
 	}
+	s.cc.OnTimePassed(now)
 	if !s.ackAt.IsZero() && !now.Before(s.ackAt) {
 		s.enqueueAck(now)
 	}

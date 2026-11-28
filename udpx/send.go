@@ -29,6 +29,9 @@ func (c *Conn) step(now time.Time) stepOutcome {
 		s.batch.reset()
 		s.planProbe()
 		s.take(now)
+		if len(s.data) == 0 {
+			s.cc.OnAppLimited()
+		}
 		outcome.packets = s.packets()
 	}
 	outcome.done = s.idle()
