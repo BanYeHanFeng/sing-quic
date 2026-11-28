@@ -99,12 +99,13 @@ type Conn struct {
 	sendCipher packetCipher
 	recvCipher packetCipher
 
-	ctx      context.Context
-	cancel   context.CancelCauseFunc
-	finishMu sync.Mutex
-	finished bool
-	sendDone chan struct{}
-	sendWake chan struct{}
+	ctx        context.Context
+	cancel     context.CancelCauseFunc
+	finishMu   sync.Mutex
+	finished   bool
+	finishDone chan struct{}
+	sendDone   chan struct{}
+	sendWake   chan struct{}
 
 	peerAddr     atomic.Pointer[net.Addr]
 	openStreams  atomic.Int32 // 供发送循环的空闲判定读取
@@ -144,6 +145,7 @@ func newConn(socket net.PacketConn, io udpio.Conn, result handshakeResult, peer 
 		recvCipher: result.recv,
 		ctx:        ctx,
 		cancel:     cancel,
+		finishDone: make(chan struct{}),
 		sendWake:   make(chan struct{}, 1),
 		sendDone:   make(chan struct{}),
 		streams:    make(map[uint32]*Stream),
@@ -237,11 +239,14 @@ func (c *Conn) cause() error {
 }
 
 // finish 取消 ctx、结束所有流、释放 socket、通知 handler，恰好执行一次。
-// handler 的 OnClose 里再调 CloseWithError 也不会自锁。
+// 后来的调用者会在收尾完成后再返回，OnClose 因此可能晚于 CloseWithError，
+// 但 OnClose 里再调 CloseWithError 也不会自锁。
 func (c *Conn) finish(cause error) {
 	c.finishMu.Lock()
 	if c.finished {
+		done := c.finishDone
 		c.finishMu.Unlock()
+		<-done
 		return
 	}
 	c.finished = true
@@ -269,10 +274,11 @@ func (c *Conn) finish(cause error) {
 	if c.onClose != nil {
 		c.onClose()
 	}
+	c.tracer.close()
+	close(c.finishDone)
 	if c.handler != nil {
 		c.handler.OnClose(c, cause)
 	}
-	c.tracer.close()
 }
 
 // finishFromLoop 发送循环排空自己的队列后收尾。
