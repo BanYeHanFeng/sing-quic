@@ -244,16 +244,46 @@ func (s *sender) handleAck(ack ack, now time.Time) {
 			})
 		}
 		s.cc.OnCongestionEvent(priorInFlight, now, ackedInfo, lostInfo)
-		s.conn.tracer.record("recovery:metrics_updated", traceMetrics{
-			MinRTT:           traceMillis(s.rtt.min),
-			SmoothedRTT:      traceMillis(s.rtt.smoothed),
-			LatestRTT:        traceMillis(s.rtt.latest),
-			RTTVariance:      traceMillis(s.rtt.rttvar),
-			CongestionWindow: uint64(s.cc.GetCongestionWindow()),
-			BytesInFlight:    uint64(s.inFlight.bytes),
-			PacketsInFlight:  s.inFlight.len(),
-			PTO:              traceMillis(s.rtt.pto()),
-			ProbeCount:       s.probes,
-		})
+		s.recordMetrics()
 	}
+}
+
+// recordMetrics 记录一次恢复与拥塞控制的完整快照，没有开启 qlog 时不做任何取数。
+func (s *sender) recordMetrics() {
+	if s.conn.tracer == nil {
+		return
+	}
+	state := s.cc.State()
+	s.conn.tracer.record("recovery:metrics_updated", traceMetrics{
+		MinRTT:               traceMillis(s.rtt.min),
+		SmoothedRTT:          traceMillis(s.rtt.smoothed),
+		LatestRTT:            traceMillis(s.rtt.latest),
+		RTTVariance:          traceMillis(s.rtt.rttvar),
+		CongestionWindow:     uint64(s.cc.GetCongestionWindow()),
+		BytesInFlight:        uint64(s.inFlight.bytes),
+		PacketsInFlight:      s.inFlight.len(),
+		PTO:                  traceMillis(s.rtt.pto()),
+		ProbeCount:           s.probes,
+		BandwidthEstimate:    uint64(state.BandwidthEstimate),
+		PacingRate:           uint64(state.PacingRate),
+		MaxAckHeight:         uint64(state.MaxAckHeight),
+		PacingGain:           state.PacingGain,
+		CongestionWindowGain: state.CongestionWindowGain,
+		AtFullBandwidth:      state.IsAtFullBandwidth,
+	})
+	if state.Mode == s.ccMode {
+		return
+	}
+	s.recordCongestionState(state.Mode)
+}
+
+func (s *sender) recordCongestionState(mode string) {
+	if s.conn.tracer == nil {
+		return
+	}
+	s.conn.tracer.record("recovery:congestion_state_updated", traceCongestionState{
+		Old: s.ccMode,
+		New: mode,
+	})
+	s.ccMode = mode
 }

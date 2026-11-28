@@ -95,6 +95,8 @@ type sender struct {
 	rtt rttEstimator
 	cc  congestion.Controller
 
+	ccMode string
+
 	sendPacket uint32
 	probes     int
 	probeSince time.Time
@@ -207,6 +209,9 @@ func (s *sender) runTimers(now time.Time) error {
 		s.idleAt = now.Add(c.options.IdleTimeout)
 	}
 	s.cc.OnTimePassed(now)
+	if s.conn.tracer != nil {
+		s.recordCongestionState(s.cc.State().Mode)
+	}
 	if !s.ackAt.IsZero() && !now.Before(s.ackAt) {
 		s.enqueueAck(now)
 	}

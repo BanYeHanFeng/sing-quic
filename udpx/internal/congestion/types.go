@@ -28,6 +28,17 @@ type LostPacketInfo struct {
 	PacketNumber PacketNumber
 }
 
+// State 是拥塞控制当前的可观测状态，供 qlog 与分析使用。
+type State struct {
+	Mode                 string
+	BandwidthEstimate    Bandwidth
+	PacingRate           Bandwidth
+	MaxAckHeight         ByteCount
+	IsAtFullBandwidth    bool
+	PacingGain           float64
+	CongestionWindowGain float64
+}
+
 type Controller interface {
 	OnPacketSent(sentTime time.Time, bytesInFlight ByteCount, packetNumber PacketNumber, bytes ByteCount) SendState
 	OnCongestionEvent(priorInFlight ByteCount, eventTime time.Time, ackedPackets []AckedPacketInfo, lostPackets []LostPacketInfo)
@@ -39,6 +50,7 @@ type Controller interface {
 	PacingWait(now time.Time) time.Duration
 	GetCongestionWindow() ByteCount
 	SetMinRTTProvider(provider MinRTTProvider)
+	State() State
 }
 
 type MinRTTProvider interface {

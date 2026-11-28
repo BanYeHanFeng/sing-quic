@@ -190,6 +190,17 @@ func (b *bbrSender) OnTimePassed(now time.Time) {
 	b.updateProbeRtt(now, false)
 }
 
+func (b *bbrSender) State() State {
+	return State{
+		Mode:                 b.mode.String(),
+		BandwidthEstimate:    b.bandwidthEstimate(),
+		PacingRate:           b.pacingRate(),
+		MaxAckHeight:         b.sampler.maxAckHeight(),
+		IsAtFullBandwidth:    b.isAtFullBandwidth,
+		PacingGain:           b.pacingGain,
+		CongestionWindowGain: b.congestionWindowGain,
+	}
+}
 
 func (b *bbrSender) GetCongestionWindow() ByteCount {
 	if b.mode == bbrModeProbeRtt {

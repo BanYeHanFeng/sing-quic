@@ -315,15 +315,26 @@ type traceFrame struct {
 }
 
 type traceMetrics struct {
-	MinRTT           float64 `json:"min_rtt,omitempty"`
-	SmoothedRTT      float64 `json:"smoothed_rtt,omitempty"`
-	LatestRTT        float64 `json:"latest_rtt,omitempty"`
-	RTTVariance      float64 `json:"rtt_variance,omitempty"`
-	CongestionWindow uint64  `json:"congestion_window,omitempty"`
-	BytesInFlight    uint64  `json:"bytes_in_flight,omitempty"`
-	PacketsInFlight  int     `json:"packets_in_flight,omitempty"`
-	PTO              float64 `json:"pto,omitempty"`
-	ProbeCount       int     `json:"probe_count,omitempty"`
+	MinRTT               float64 `json:"min_rtt,omitempty"`
+	SmoothedRTT          float64 `json:"smoothed_rtt,omitempty"`
+	LatestRTT            float64 `json:"latest_rtt,omitempty"`
+	RTTVariance          float64 `json:"rtt_variance,omitempty"`
+	CongestionWindow     uint64  `json:"congestion_window,omitempty"`
+	BytesInFlight        uint64  `json:"bytes_in_flight,omitempty"`
+	PacketsInFlight      int     `json:"packets_in_flight,omitempty"`
+	PTO                  float64 `json:"pto,omitempty"`
+	ProbeCount           int     `json:"probe_count,omitempty"`
+	BandwidthEstimate    uint64  `json:"bandwidth_estimate,omitempty"`
+	PacingRate           uint64  `json:"pacing_rate,omitempty"`
+	MaxAckHeight         uint64  `json:"max_ack_height,omitempty"`
+	PacingGain           float64 `json:"pacing_gain,omitempty"`
+	CongestionWindowGain float64 `json:"congestion_window_gain,omitempty"`
+	AtFullBandwidth      bool    `json:"is_at_full_bandwidth,omitempty"`
+}
+
+type traceCongestionState struct {
+	Old string `json:"old,omitempty"`
+	New string `json:"new"`
 }
 
 type traceMTU struct {
@@ -443,7 +454,7 @@ func traceFrameOf(payload []byte) traceFrame {
 }
 
 func traceAckFrame(body []byte) traceFrame {
-	frame := traceFrame{FrameType: "ack"}
+	frame := traceFrame{FrameType: "ack", Length: len(body)}
 	if len(body) < 7 {
 		return frame
 	}
